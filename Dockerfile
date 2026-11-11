@@ -38,7 +38,7 @@ RUN for d in crates/anvil crates/cctp crates/config crates/devnet crates/mainnet
     && for d in bins/diorama-ast-scope bins/diorama-cctp-bridge bins/diorama-mainnet-engine bins/diorama-venue-engine bins/diorama-venue-sim; do \
       mkdir -p "$d/src" && echo 'fn main() {}' > "$d/src/main.rs"; \
     done \
-    && cargo build --release --locked -p ${BIN} \
+    && cargo build --release --locked --workspace \
     && rm -rf crates bins
 
 # Source layer: real sources; touch them so cargo does not trust the stub
