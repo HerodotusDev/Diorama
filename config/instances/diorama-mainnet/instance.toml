@@ -33,9 +33,11 @@ target_url = "@anvil_t"
 # The follow's poll interval: 3 s against the remote Alchemy RPC (the cheap
 # deployment's rate budget; overrides config/defaults.toml's 1000 ms).
 poll_interval_ms = 3000
-# Chain-1 catch-up: the live gap is ~3.3k blocks; 10k stays below the
-# 10,064-block rebase bound and leaves margin for source advance.
-max_gap_blocks = 10000
+# Chain-1 catch-up: the live gap is ~3.3k blocks; the bound also sizes a
+# same-pin restart's replay (the fork pin ages ~15k blocks/day against the
+# archive source, and the replay walks it at apply speed) — 20k covers a
+# day-old pin with margin.
+max_gap_blocks = 20000
 # JSON-RPC batch items for source reads and local cheatcode writes. This is
 # the deployment's endpoint contract (the live value), not a global default.
 chunk_size = 500

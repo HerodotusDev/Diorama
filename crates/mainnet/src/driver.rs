@@ -106,7 +106,7 @@ async fn next_block(ctx: &Ctx) -> Result<Next> {
             tracing::error!(
                 gap,
                 start = ?start_kind,
-                "sync gap too large - paused; if anvil-t has ANVIL_FORK_PIN set, patch/unset it first, then run make mainnet-repin"
+                "sync gap too large - paused; the fork pin's replay exceeds the gap bound - run `make mainnet-repin` for a fresh epoch (clears the registry), or raise max_gap_blocks to the pin's age in blocks"
             );
         }
         return Ok(Next::Idle);
@@ -224,17 +224,21 @@ async fn on_rebase(rpc: &diorama_anvil::Rpc, head: u64, follow: u64, start: u64)
 
 /// Two regimes: normal operation pauses at the profile's gap
 /// (`max_gap_blocks`; 300 = the "> 300 -> pause and re-sync" rule), while a
-/// *rebased* cursor (a fresh pin after a restart/re-fork) is allowed to replay
-/// its whole pin window - bounded by reth's state window (10,064), the plan's
-/// own limit.
+/// *rebased* cursor (a re-forked chain, its cursor cleared) is allowed to
+/// replay its whole pin window. The replay bound is the source's replayable
+/// state window — reth's measured 10,064 — widened to the configured gap when
+/// the deployment's source serves deeper state: the remote archive serves any
+/// depth, so the replay width a restart must walk is the operator's sizing
+/// (`max_gap_blocks`), not reth's serving window.
 fn gap_within_limit(gap: u64, limit: Option<u64>, start_kind: state::Start) -> bool {
-    let limit = if start_kind == state::Start::Rebased {
-        diorama_config::RETH_STATE_WINDOW_BLOCKS
-    } else {
-        match limit {
+    let limit = match start_kind {
+        state::Start::Rebased => {
+            diorama_config::RETH_STATE_WINDOW_BLOCKS.max(limit.unwrap_or(0))
+        }
+        state::Start::Contiguous => match limit {
             Some(limit) => limit,
             None => return true,
-        }
+        },
     };
     gap <= limit
 }
@@ -415,8 +419,10 @@ mod tests {
     use super::{gap_within_limit, state};
 
     /// The gap guard: a configured limit applies, a rebased cursor gets the
-    /// plan's 10,064-block replay bound instead, and no limit means no guard
-    /// (the venue's `gap_within_limit` test pins its own column).
+    /// replay bound — reth's 10,064-block window, widened to a larger
+    /// configured gap (an archive source replays any depth) — and no limit
+    /// means no guard (the venue's `gap_within_limit` test pins its own
+    /// column).
     #[test]
     fn the_gap_guard_honors_its_limit() {
         assert!(gap_within_limit(0, Some(32), state::Start::Contiguous));
@@ -424,6 +430,9 @@ mod tests {
         assert!(!gap_within_limit(33, Some(32), state::Start::Contiguous));
         assert!(gap_within_limit(10_064, None, state::Start::Rebased));
         assert!(!gap_within_limit(10_065, None, state::Start::Rebased));
+        assert!(gap_within_limit(20_000, Some(20_000), state::Start::Rebased));
+        assert!(!gap_within_limit(20_001, Some(20_000), state::Start::Rebased));
+        assert!(gap_within_limit(10_064, Some(20_000), state::Start::Rebased));
         assert!(gap_within_limit(u64::MAX, None, state::Start::Contiguous));
     }
 }
