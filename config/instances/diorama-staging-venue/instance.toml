@@ -43,7 +43,13 @@ target_url = "@anvil_v"
 # timeout, so the wider window still respects the endpoint's request budget.
 [services.engine.loops]
 poll_interval_ms = 2000
-max_gap_blocks = 900
+# The gap guard's latch bound. The HyperEVM source produces blocks faster than
+# the free-RPC follow can apply them, so the mirror runs best-effort behind
+# head; the bound must therefore never latch during normal operation — a
+# latched guard pauses ALL block production on anvil-v (staging txs stop
+# landing) and it does not self-resume. The pin stays the restart anchor:
+# re-pin + restart anvil-v when the accumulated drift grows unacceptable.
+max_gap_blocks = 2000000
 # JSON-RPC batch items for source reads and local cheatcode writes. This is
 # the deployment's endpoint contract (the live value), not a global default.
 chunk_size = 500
