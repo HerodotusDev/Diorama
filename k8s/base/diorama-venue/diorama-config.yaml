@@ -9,25 +9,21 @@ metadata:
   labels:
     app.kubernetes.io/part-of: daloc-diorama-venue
 data:
-  # The one HyperEVM URL list. The engine's read pool starts at a random
-  # healthy entry, fails over on a transport/throttle/5xx fault, and cools a
-  # failed entry down for a later round. Anvil takes one `--fork-url`, so its
-  # entrypoint derives the primary as the first list entry — there is no
-  # second `HL_RPC_URL` definition to drift.
-  #
-  # Only endpoints that answer `eth_getSystemTxsByBlockNumber` are listed:
-  # dRPC and purroofgroup return -32601 for it, so including them would make
-  # the venue source audit disagree on `system_txs`. The official HyperEVM RPC
-  # is first; hypurrscan, stakely and onfinality are the fallbacks.
-  # The archive endpoint is first because anvil-v's fork source must serve
-  # historical storage, not only the head: the public free-plan endpoints
-  # rate-limit a storage read at the pin (measured 2026-11-01, CCTP wiring
-  # boot). The engine's read pool uses the rest as failover.
-  # Pool order matters: the first entry is anvil-v's fork source and the
-  # engine read pool's primary. Measured 2026-11-09: hyperlend/archive
-  # degraded (per-window compose 2.3s -> 8-13s, venue follow lag grew to
-  # ~4,800 blocks), so the fast official endpoint leads and the degraded
-  # one rides last as backup.
+  # Two HyperEVM planes, deliberately separate:
+  #   HL_RPC_URL  - anvil-v's fork source. One URL: anvil takes one
+  #                 `--fork-url`. The official endpoint serves historical
+  #                 storage at the deployment's pin depth (measured live:
+  #                 36 h of fork reads, zero faults, at ~200k blocks behind
+  #                 the head).
+  #   HL_RPC_URLS - the engine's read pool: random healthy start, failover on
+  #                 a transport/throttle/5xx fault, cool a failed entry down
+  #                 for a later round. Only endpoints that answer
+  #                 `eth_getSystemTxsByBlockNumber` usefully are listed
+  #                 first: the archive returns -32601 for it (the pool now
+  #                 fails over past that, but a refuser earns nothing), and
+  #                 it measured degraded (compose 2.3s -> 8-13s per window on
+  #                 2026-11-09), so it rides last as backup.
+  HL_RPC_URL: "https://rpc.hyperliquid.xyz/evm"
   HL_RPC_URLS: "https://rpc.hyperliquid.xyz/evm,https://rpc.hypurrscan.io,https://hyperliquid-json-rpc.stakely.io,https://hyperliquid.api.onfinality.io/evm/public,https://rpc.hyperlend.finance/archive"
 
   # The venue's market plane. Both are URL lists in the instance's

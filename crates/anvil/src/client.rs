@@ -69,16 +69,19 @@ pub fn call(method: &'static str, params: impl Serialize) -> Result<Call> {
     Ok(Request::new(method, Id::None, params))
 }
 
-/// The batch's sub-chunk concurrency: one request in flight. The batching's
-/// win is the request *count* (a wide window is a handful of bodies, not one
-/// per block), and the public HyperEVM RPC's burst limiter refused concurrent
-/// bodies while one-at-a-time traffic — the pre-batching era's own pattern —
-/// passed (measured live). The default stays sequential; a pool's endpoint
-/// can declare a wider budget (`max_batch_concurrency`) — the measured
-/// Alchemy gateway and the local anvil both take concurrent bodies, and a
-/// fork-mode anvil serializes every uncached slot behind a fork-source
-/// round-trip (~30 ms each), so a mirror block's reads never finish
-/// sequentially inside a 12 s slot.
+/// The batch's sub-chunk concurrency default: one body in flight. The
+/// batching's win is the request *count* (a wide window is a handful of
+/// bodies, not one per block). The public HyperEVM RPC's burst limiter once
+/// refused concurrent bodies while one-at-a-time traffic passed (measured
+/// live, pre-batching era); a later measurement (2026-11-10) found 2, 4 and 8
+/// concurrent bodies each completing in ~0.3–0.9 s against the same
+/// endpoints. Both measurements are of burst tolerance, not throughput: the
+/// pool's cooling and failover own the budget, so an endpoint declares its
+/// own width (`max_batch_concurrency` — the measured Alchemy gateway takes
+/// concurrent bodies) and the default stays sequential. A fork-mode anvil
+/// serializes every uncached slot behind a fork-source round-trip (~30 ms
+/// each), so a mirror block's reads never finish sequentially inside a 12 s
+/// slot either way.
 pub const DEFAULT_BATCH_CONCURRENCY: usize = 1;
 
 /// Whether a block read carries its transactions' bodies: the RPC's own
@@ -148,6 +151,12 @@ fn is_retryable(text: &str) -> bool {
                 && !message
                     .to_ascii_lowercase()
                     .contains("invalid block height"))
+            // The public HyperEVM RPC's transient server-side execution
+            // timeout (`-32000 execution aborted (timeout = 5s)`). It is an
+            // endpoint fault: another endpoint may answer, and the composer
+            // narrows the range. A deterministic `-32000` (a revert) is not
+            // matched.
+            || (code == -32000 && message.to_ascii_lowercase().contains("timeout"))
     };
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') {
@@ -255,34 +264,9 @@ fn endpoint_capability_refusal(text: &str) -> bool {
     };
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
-            .map(|items| {
-                items.iter().any(|item| {
-                    let Some(error) = item.get("error") else {
-                        return false;
-                    };
-                    let code = error
-                        .get("code")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or(0);
-                    let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    (code == -32000 && capability(message))
-                        // A batch whose items answer method-not-found is the
-                        // endpoint's per-method capability, not the node's
-                        // final answer: the pool must try an endpoint that
-                        // serves the method (measured live: the public
-                        // HyperEVM endpoints are split on
-                        // `eth_getSystemTxsByBlockNumber`, and a
-                        // no-failover batch turned every rotation onto a
-                        // refuser into a failed follow pass). Pool
-                        // exhaustion still fails closed — a declared
-                        // method no endpoint serves stays the
-                        // declaration/endpoint disagreement the boot
-                        // audit names.
-                        || code == -32601
-                })
-            })
-            .unwrap_or(false);
+        let items = serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
+            .unwrap_or_default();
+        return items.iter().any(|item| batch_refusal(item, &capability));
     }
     if !trimmed.starts_with('{') {
         return false;
@@ -299,6 +283,28 @@ fn endpoint_capability_refusal(text: &str) -> bool {
         .unwrap_or(0);
     let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
     code == -32000 && capability(message)
+}
+
+/// One batch item's capability refusal. A `-32601` item is the endpoint's
+/// per-method capability, not the node's final answer: the pool must try an
+/// endpoint that serves the method (measured live: the public HyperEVM
+/// endpoints are split on `eth_getSystemTxsByBlockNumber`, and a no-failover
+/// batch turned every rotation onto a refuser into a failed follow pass).
+/// Pool exhaustion still fails closed — a declared method no endpoint serves
+/// stays the declaration/endpoint disagreement the boot audit names.
+fn batch_refusal(
+    item: &serde_json::Value,
+    capability: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Some(error) = item.get("error") else {
+        return false;
+    };
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    (code == -32000 && capability(message)) || code == -32601
 }
 
 /// Whether an HTTP answer is an endpoint fault rather than the node's own
@@ -2186,6 +2192,42 @@ mod tests {
         assert!(!is_retryable(
             r#"[{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"invalid block height: 50047695"}}]"#
         ));
+    }
+
+    /// The public HyperEVM RPC's `-32000 execution aborted (timeout = 5s)`
+    /// is a transient endpoint fault: the pool must fail over instead of
+    /// surfacing the same endpoint's timeout on every pass. A deterministic
+    /// `-32000` remains the node's answer.
+    #[test]
+    fn an_execution_timeout_is_a_retryable_fault() {
+        assert!(is_retryable(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution aborted (timeout = 5s)"}}"#
+        ));
+        assert!(is_retryable(
+            r#"[{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"request timeout"}}]"#
+        ));
+        assert!(!is_retryable(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution reverted"}}"#
+        ));
+    }
+
+    /// A pool fails over past the transient execution timeout to the live
+    /// endpoint, so a loaded public RPC does not stall the follow.
+    #[tokio::test]
+    async fn a_pool_fails_over_past_an_execution_timeout() {
+        let (timed_out, first) = serve_once(
+            r#"{"id":1,"jsonrpc":"2.0","error":{"code":-32000,"message":"execution aborted (timeout = 5s)"}}"#,
+        );
+        let (live, second) = serve_once(r#"{"id":1,"jsonrpc":"2.0","result":"0x2a"}"#);
+        let pool =
+            Rpc::with_urls(&[timed_out, live], Duration::from_secs(2)).expect("a valid pool");
+        let value: U64 = pool
+            .call("eth_getLogs", NO_PARAMS)
+            .await
+            .expect("the live endpoint answers");
+        assert_eq!(value.to::<u64>(), 42);
+        first.join().expect("the timed-out server exits");
+        second.join().expect("the live server exits");
     }
 
     /// A batch body answering a single call is corrupt, not a transport fault.

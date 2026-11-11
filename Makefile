@@ -35,18 +35,11 @@ ns: ## Create the namespace (idempotent)
 	kubectl apply -f $(NS_MANIFEST)
 
 CCTP_NS      ?= daloc-diorama-cctp
+# The mirror namespaces the consolidated scripts address (their defaults are
+# the unprefixed names; the Capsule tenant requires the prefix).
+MAINNET_NS   ?= daloc-diorama-mainnet
+VENUE_NS     ?= daloc-diorama-venue
 CCTP_OVERLAY := k8s/overlays/diorama-cctp
-
-# The daloc-monorepo sibling owns the gateway stack and the end-to-end DOD
-# scripts. The portfolio DOD drives every user action through the gateway and
-# reads the deployed factories/registry directly; it needs the sibling checkout,
-# the deploy env, and a borrower key funded on chain 999.
-DALOC_REPO         ?= ../daloc-monorepo
-DALOC_OUT          ?= /tmp/opencode/daloc-out
-BORROWER_KEY_FILE  ?= /tmp/daloc-borrower.key
-DALOC_GATEWAY_URL  ?= http://127.0.0.1:32001
-DALOC_RPC_999      ?= http://127.0.0.1:31545
-ALLOW_TEST_POSTURE ?= 1
 
 venue-secrets: ## Create the venue-side secrets (no CCTP key: the bridge owns its own)
 	@NS=daloc-diorama-venue; \
@@ -167,9 +160,9 @@ test-engine: ## Run workspace unit tests on the host (cargo)
 	PATH="$$HOME/.cargo/bin:$$PATH" cargo test --workspace
 
 config-bootstrap: ## Copy each tracked project template to the gitignored live file when absent
-	@for f in config/instances/*/daloc.example.toml; do \
+	@for f in config/instances/*/specialization.example.toml; do \
 	  d=$${f%/*}; \
-	  if [ ! -f "$$d/daloc.toml" ]; then cp "$$f" "$$d/daloc.toml"; echo "created $$d/daloc.toml from template"; fi; \
+	  if [ ! -f "$$d/specialization.toml" ]; then cp "$$f" "$$d/specialization.toml"; echo "created $$d/specialization.toml from template"; fi; \
 	done
 
 config-check: ## Validate every instance file through the layered loader
@@ -178,6 +171,10 @@ config-check: ## Validate every instance file through the layered loader
 	done
 
 fitness: lint design-assertions config-check ast-scope ## Run the structural gates: lint, design assertions, config check, AST scope
+
+ci: ## Run the exact CI gates locally: workspace tests, then fitness
+	PATH="$$HOME/.cargo/bin:$$PATH" cargo test --workspace --locked
+	$(MAKE) fitness
 
 lint: ## lint-gate: clippy, all targets, warnings are errors
 	PATH="$$HOME/.cargo/bin:$$PATH" cargo clippy --workspace --all-targets -- -D warnings
@@ -206,10 +203,10 @@ logs-%: ## Tail logs of one component, e.g. make logs-engine / logs-reth / logs-
 # follow INSTANCE): a `mainnet-*` target is about the mainnet mirror, a
 # `venue-*` target about the venue's.
 mainnet-smoke: ## End-to-end smoke test (mainnet)
-	NS=daloc-diorama-mainnet ./scripts/mainnet-smoke.sh
+	NS=$(MAINNET_NS) ./scripts/smoke.sh --side mainnet
 
 venue-smoke: ## End-to-end smoke test of the Venue Mirror (V, engine, sim, bridge)
-	NS=daloc-diorama-venue ./scripts/venue-smoke.sh
+	NS=$(VENUE_NS) ./scripts/smoke.sh --side venue
 
 venue-bootstrap: ns venue-secrets ## First-time setup (venue): namespace, secrets, full stack
 	kubectl apply -f k8s/base/diorama-venue/pvcs.yaml
@@ -239,95 +236,11 @@ cctp-bootstrap: cctp-ns cctp-secrets ## First-time setup: namespace, secret, bri
 venue-repin: ## Re-pin V to the fork source's latest block (the engine's /admin/epoch)
 	kubectl -n daloc-diorama-venue exec deploy/engine -- curl -sf -m 90 -X POST localhost:8080/admin/epoch
 
-venue-scenario: ## The venue epoch scenario (same-pin restore, new-pin epoch, driver liveness)
-	NS=daloc-diorama-venue ./scripts/venue-scenario.sh
-
-venue-proof: ## The venue capability proof (mint, sim deal, crash⇒liquidation, bridge round-trip, block production)
-	NS=daloc-diorama-venue ./scripts/venue-proof.sh
-
-venue-order-proof: ## The venue order-lane proof (fills vs the real book, the market-impact invariants, hand-back)
-	NS=daloc-diorama-venue ./scripts/venue-order-proof.sh
-
 cctp-smoke: ## The CCTP bridge smoke (health, store coherence, metric set)
 	NS=$(CCTP_NS) ./scripts/cctp-smoke.sh
 
 cctp-roundtrip: ## The CCTP round trip (burn -> mint, exact delta; SOURCE/DESTINATION/AMOUNT env)
 	NS=$(CCTP_NS) ./scripts/cctp-roundtrip.sh
-
-cctp-margin-cycle: ## The crosschain unified-margin cycle (T mint -> CCTP -> venue collateral -> trade -> CCTP back)
-	NS=$(CCTP_NS) ./scripts/cctp-margin-cycle.sh
-
-daloc-portfolio-dod: ## The portfolio cardinality DOD on the live daloc stack (simple 1=1=1=1; unified 1 CM + 1 agent + N debts)
-	DALOC_REPO=$(abspath $(DALOC_REPO)) \
-	BORROWER_KEY_FILE=$(BORROWER_KEY_FILE) \
-	DALOC_OUT=$(DALOC_OUT) \
-	GATEWAY_URL=$(DALOC_GATEWAY_URL) \
-	RPC_999=$(DALOC_RPC_999) \
-	ALLOW_TEST_POSTURE=$(ALLOW_TEST_POSTURE) \
-	$(abspath $(DALOC_REPO))/tools/e2e/portfolio-dod.sh
-
-portfolio-sim: ## The portfolio simulation: a delta-neutral basis book across both mirrors (carry + shock + capital efficiency)
-	NS=daloc-diorama-venue ./scripts/portfolio-sim.sh
-
-basis-capture: ## The live T-vs-V basis series, traded: the capture + the live carry, the identity checked
-	NS=daloc-diorama-venue ./scripts/basis-capture.sh
-
-portfolio-reaction: ## A held portfolio vs another account's impact: both directions, the thresholds, the hedge
-	NS=daloc-diorama-venue ./scripts/portfolio-reaction.sh
-
-crosschain-margin: ## The crosschain margin book: bridged collateral, funding costs, served unrealized PnL, the loop closed
-	NS=daloc-diorama-venue ./scripts/crosschain-margin.sh
-
-crosschain-recovery: ## The deeper crosschain reads: the funding sign flip + the collateral's way back after a forced close
-	NS=daloc-diorama-venue ./scripts/crosschain-recovery.sh
-
-capital-frontier: ## The capital-efficiency frontier: the liquidation distance measured at each leverage
-	NS=daloc-diorama-venue ./scripts/capital-frontier.sh
-
-hedged-book: ## The hedged book: same collateral and gross exposure as the unhedged, flat through a 60% crash
-	NS=daloc-diorama-venue ./scripts/hedged-book.sh
-
-impact-scenarios: ## The impact ladder: a whale moves the book and the mark; the portfolio's reaction measured
-	NS=daloc-diorama-venue ./scripts/impact-scenarios.sh
-
-shadow-audit: ## The shadowing audit: deliberate anvil states vs the COW shadow, both mirrors
-	./scripts/shadow-audit.sh
-
-benchmark: ## The prime-brokerage benchmark session: the seven portfolio studies in sequence
-	@echo "== benchmark session: the seven portfolio studies =="
-	@$(MAKE) --no-print-directory portfolio-sim
-	@$(MAKE) --no-print-directory basis-capture
-	@$(MAKE) --no-print-directory portfolio-reaction
-	@$(MAKE) --no-print-directory crosschain-margin
-	@$(MAKE) --no-print-directory capital-frontier
-	@$(MAKE) --no-print-directory hedged-book
-	@$(MAKE) --no-print-directory impact-scenarios
-	@echo "== benchmark session: all seven studies green ==" 
-
-engine-symmetry: ## Both engines' shared HTTP verbs must answer identically (cross-mirror contract)
-	./scripts/engine-symmetry.sh
-
-log-surface: ## The symmetric log contract, attested against the running services
-	./scripts/log-surface.sh
-
-attest: ## The behavioral attestation: the pass over both mirrors, then the asserting suites
-	./scripts/attest.sh
-	./scripts/log-surface.sh
-	./scripts/engine-symmetry.sh
-
-
-mainnet-scenario: ## Scenario test: self-containment, live parity (T vs reth), devnet workflow
-	NS=daloc-diorama-mainnet ./scripts/mainnet-scenario.sh
-
-mainnet-proof: ## Capability proof: live fork, mint funds, real Aave/Uniswap/liquidation interaction
-	NS=daloc-diorama-mainnet ./scripts/mainnet-proof.sh
-
-mainnet-product-sim: ## Product simulation: levered position, live-data sampling, bot liquidation on T
-	NS=daloc-diorama-mainnet ./scripts/mainnet-product-sim.sh
-
-mainnet-closure-check: ## Audit the watchlist closure: every storage dep of every market-data view
-	NS=daloc-diorama-mainnet ./scripts/mainnet-closure-check.sh
-
 
 mainnet-selftest: ## Run the engine selftest Job (public RPC + scratch anvil; no reth needed)
 	kubectl -n daloc-diorama-mainnet delete job mainnet-selftest --ignore-not-found
@@ -359,6 +272,12 @@ venue-selftest: ## Run the venue selftest Job (public RPC + scratch anvil; no cl
 	done; \
 	echo "venue-selftest produced no verdict within 900s" >&2; exit 1
 
+	./scripts/mirror-freshness.sh
+
+substrate-attest: ## Read-only substrate invariants: cursors, pins, contract code, bridge, DB, host
+	./scripts/substrate-attest.sh
+
+
 logs-check: ## Deep log scan: warnings/errors per component (last 30 min, normalized)
 	@for c in anvil-t engine; do \
 	  printf "== %s\n" "$$c"; \
@@ -374,7 +293,14 @@ pin-show: ## Show the resolved fork pins of the instance's anvils
 	done
 
 mainnet-repin: ## Re-pin drill: wipe the pin, restart the anvil (engine auto-rebases; a new epoch starts)
-	kubectl -n daloc-diorama-mainnet scale deploy/anvil-t --replicas=0
+	@pin=$$(kubectl -n $(MAINNET_NS) get cm mainnet-instance -o jsonpath='{.data.specialization\.toml}' 2>/dev/null \
+	  | sed -n 's/^fork_pin[[:space:]]*=[[:space:]]*\([0-9_]*\).*/\1/p' | head -n1); \
+	if [ -n "$$pin" ]; then \
+	  echo "the deployment pins fork_pin=$$pin in its specialization; wiping /state/pin is a no-op." >&2; \
+	  echo "Remove fork_pin from the specialization first. The init container only re-resolves the pin when none is configured; a changed pin is a new epoch and clears the shadow registry." >&2; \
+	  exit 1; \
+	fi
+	kubectl -n $(MAINNET_NS) scale deploy/anvil-t --replicas=0
 	# Wait until the pod is really gone before wiping: the wipe must not
 	# race a container that is still shutting down (its init container
 	# re-resolves the pin on the next start).
@@ -395,11 +321,10 @@ help: ## Show this help
 		/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) }' $(MAKEFILE_LIST)
 	@echo
 
-.PHONY: fitness lint design-assertions config-check config-bootstrap ast-scope
+.PHONY: ci fitness lint design-assertions config-check config-bootstrap ast-scope
 .PHONY: ns venue-secrets apply diff delete \
 	mainnet-bootstrap venue-bootstrap \
 	images build venue-build mainnet-build cctp-build import deploy-engine test-engine \
-	status logs logs-check check-pins mainnet-smoke venue-smoke venue-repin venue-scenario \
-	venue-proof venue-order-proof venue-selftest cctp-smoke cctp-roundtrip cctp-margin-cycle daloc-portfolio-dod engine-symmetry \
-	mainnet-scenario mainnet-proof mainnet-product-sim mainnet-closure-check \
-	mainnet-selftest pin-show mainnet-repin help
+	status logs logs-check check-pins mainnet-smoke venue-smoke venue-repin \
+	venue-selftest cctp-smoke cctp-roundtrip \
+	mainnet-selftest pin-show mainnet-repin mirror-freshness substrate-attest help
