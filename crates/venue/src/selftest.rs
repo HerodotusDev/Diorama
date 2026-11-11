@@ -75,10 +75,23 @@ fn window_cap(windows: u64, max_windows: u64) -> u64 {
     }
 }
 
+/// A failed pass's retry budget and pause, matching the production driver's
+/// pass-retry shape (measured: a public pool keeps handing a method-refusing
+/// endpoint roughly one pass in five).
+const PASS_RETRIES: u32 = 4;
+const PASS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The window loop: `windows` windows at least, continuing while nothing has
 /// composed. `max_windows = 0` means no code-side cap: the operator's
 /// process deadline (the Job's) is the only bound. Returns
 /// `(windows, composed keys, ok)`.
+///
+/// A failed pass retries with the driver's own discipline instead of
+/// aborting: production's driver retries pass faults (a weighted-random
+/// pool keeps landing on endpoints that refuse a method the others serve —
+/// measured live: `-32601 eth_getSystemTxsByBlockNumber` from one public
+/// HyperEVM endpoint), so the self test must tolerate the same shape. A
+/// pass that still fails after the retry budget fails the run.
 async fn windows_loop(
     ctx: &Ctx,
     windows: u64,
@@ -89,6 +102,7 @@ async fn windows_loop(
     let mut done = 0u64;
     let mut writes = 0usize;
     let mut verdict = Verdict::Passed;
+    let mut retries = 0u32;
     while done < cap {
         if !wait_for_move(ctx, move_wait).await? {
             println!(
@@ -98,7 +112,20 @@ async fn windows_loop(
             verdict = Verdict::Failed;
             break;
         }
-        let Some(stats) = follow::step(ctx).await? else {
+        let stats = match follow::step(ctx).await {
+            Ok(stats) => {
+                retries = 0;
+                stats
+            }
+            Err(error) if retries < PASS_RETRIES => {
+                retries += 1;
+                println!("   · pass fault (will retry {retries}/{PASS_RETRIES}): {error}");
+                tokio::time::sleep(PASS_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(stats) = stats else {
             continue;
         };
         done += 1;
@@ -113,15 +140,21 @@ async fn windows_loop(
             stats.sampled_ok,
             stats.sampled
         );
-        if stats.sampled != stats.sampled_ok {
-            verdict = Verdict::Failed;
-            println!("   ✘ live parity failed");
-        }
+        record_window(&mut verdict, &stats);
         if done >= windows && writes > 0 {
             break;
         }
     }
     Ok((done, writes, verdict))
+}
+
+/// One window's verdict lines: the parity pair either passes or fails the
+/// run (the loop's only correctness signal).
+fn record_window(verdict: &mut Verdict, stats: &follow::FollowOutcome) {
+    if stats.sampled != stats.sampled_ok {
+        *verdict = Verdict::Failed;
+        println!("   ✘ live parity failed");
+    }
 }
 
 /// Wait (bounded) for the source head to move past the follow cursor: a
