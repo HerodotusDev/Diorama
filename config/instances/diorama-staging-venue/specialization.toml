@@ -33,7 +33,7 @@ http = ["${ENGINE_ADMIN_URL}"]
 # The explicit fork base. A configured pin preserves the deployment epoch
 # across restarts; omit it to resolve a fresh pin at start-up.
 [chains.venue]
-fork_pin = 50830000
+fork_pin = 50953800
 
 
 [services.engine]
