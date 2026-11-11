@@ -1,0 +1,94 @@
+# diorama-venue-sim — the simulator in STAGING: the live market plane (REST
+# snapshots + WS pushes from the venue's public API) and the COW account
+# plane, served as the daloc-facing info API (8090) beside the control API
+# (8091: deal/advance/crash/set_account/reset/epoch_new).
+#
+# cicd convention manifest (HerodotusDev/cicd build-and-deploy): `image` is
+# the literal `<IMAGE>` placeholder the pipeline substitutes. The wiring
+# ConfigMap, the instance ConfigMap and the PVC come from the staging
+# support layer (k8s/stg-anvil).
+#
+# ENGINE_ADMIN_URL in the merged staging wiring points at the venue engine's
+# Service (diorama-venue-engine:8080) — same namespace, short DNS.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diorama-venue-sim
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-venue-sim
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: diorama-venue-sim
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: diorama-venue-sim
+        app.kubernetes.io/part-of: daloc-diorama-stg
+    spec:
+      terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: venue-sim
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--config", "/etc/mirror/instance.toml"]
+          # The same `envFrom` mechanism as the engines: the merged staging
+          # ConfigMap carries every key (SIM_STATE_DIR, ANVIL_V_URL,
+          # ENGINE_ADMIN_URL, and the ${HL_RPC_URL} the instance's source_url
+          # names), the pod reads the ones its instance resolves.
+          envFrom:
+            - configMapRef: { name: diorama-config }
+          ports:
+            - { name: info, containerPort: 8090 }
+            - { name: control, containerPort: 8091 }
+          volumeMounts:
+            - { name: instance, mountPath: /etc/mirror, readOnly: true }
+            - { name: state, mountPath: /state }
+          # /readyz is the market-plane freshness gate (503 while warming up,
+          # exactly the readiness signal); the startupProbe suspends probes
+          # through the boot-wait.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8090 }
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8090 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8090 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "5m", memory: 32Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: instance
+          configMap: { name: venue-instance }
+        - name: state
+          persistentVolumeClaim: { claimName: venue-sim-state }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diorama-venue-sim
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-venue-sim
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  selector: { app.kubernetes.io/name: diorama-venue-sim }
+  ports:
+    - { name: info, port: 8090, targetPort: 8090 }
+    - { name: control, port: 8091, targetPort: 8091 }

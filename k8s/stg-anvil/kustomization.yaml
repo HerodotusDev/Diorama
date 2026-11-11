@@ -1,0 +1,45 @@
+# The staging support layer (daloc-diorama-stg): everything the cicd pipeline
+# does NOT apply. The reusable build-and-deploy workflow only applies
+# k8s/stg/<name>-deployment.yaml — this overlay carries the namespace, the
+# wiring ConfigMap, the instance ConfigMaps, all PVCs, and the two fork
+# anvils. It is applied by the `apply-anvil` job of
+# .github/workflows/build-and-deploy.yaml, which runs BEFORE the reusable
+# workflow (the engines wait for their anvils, and the deploy needs the
+# namespace to exist).
+#
+# Idempotency: plain `kubectl apply`. A pod is only replaced when its spec
+# changes — a no-op push touches nothing. The instance ConfigMaps are
+# generated with disableNameSuffixHash (the engines reference them by plain
+# name), so a config change updates the ConfigMap but does NOT restart the
+# pods: restart manually after changing an instance file,
+#   kubectl -n daloc-diorama-stg rollout restart deploy/anvil-t deploy/anvil-v
+# (both staging anvils pin an explicit fork_pin, so a restart preserves the
+# epoch; see docs/staging.md).
+#
+# Renames vs the manual per-namespace stack: the staging namespace hosts BOTH
+# mirrors, so names that were namespace-scoped before are disambiguated here:
+#   engine-state PVC     -> mainnet-engine-state / venue-engine-state
+#   engine Service/Deploy -> diorama-mainnet-engine / diorama-venue-engine
+#   diorama-config CM    -> one merged ConfigMap (both mirrors' keys)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: daloc-diorama-stg
+
+resources:
+  - namespace.yaml
+  - diorama-config.yaml
+  - pvcs.yaml
+  - anvil-t.yaml
+  - anvil-v.yaml
+  # The instance units (config/instances/diorama-staging-*): the ConfigMaps
+  # every pod mounts at /etc/mirror/. Committed files (no gitignored
+  # specialization dependency); each is its own kustomization with
+  # disableNameSuffixHash — k8s/stg/*-deployment.yaml (applied by the cicd
+  # pipeline outside kustomize) reference the plain names.
+  - ../../config/instances/diorama-staging-mainnet
+  - ../../config/instances/diorama-staging-venue
+  - ../../config/instances/diorama-staging-cctp
+
+generatorOptions:
+  disableNameSuffixHash: true

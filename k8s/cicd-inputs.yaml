@@ -1,0 +1,34 @@
+# Diorama staging pipeline (develop branch -> daloc-diorama-stg).
+# Every key becomes an env var for the reusable workflow; `namespace` is
+# rewritten to <namespace>-stg on develop (load-inputs), so the deploy target
+# is daloc-diorama-stg. `main` is intentionally NOT wired in this repo — the
+# workflow stub only triggers on develop + workflow_dispatch, so no prod path
+# exists (a -prod rewrite would need a main push, which cannot happen here).
+#
+# Diorama's images are amd64-only (see docker/Dockerfile.diorama and the
+# nodeSelector on every staging manifest): restrict each app to linux/amd64.
+# etcd lookups: Diorama keeps no config in etcd. etcd_root points at the
+# shared `daloc` root so any accidental per-app lookup resolves to
+# /daloc/stg/<app>/.env, which is absent and warn-skips (harmless).
+namespace: daloc-diorama
+version_file: ./Cargo.toml
+version_key: workspace.package.version
+etcd_root: daloc
+# One shared GHA cache scope: all four apps build from the same Dockerfile
+# DAG (the binary choice only parameterizes the final compile stage), so
+# per-app scopes would duplicate the workspace-compile layers 4x.
+cache_scope: diorama
+
+app_names:
+  - name: diorama-mainnet-engine
+    dockerfile: diorama
+    platforms: linux/amd64
+  - name: diorama-venue-engine
+    dockerfile: diorama
+    platforms: linux/amd64
+  - name: diorama-venue-sim
+    dockerfile: diorama
+    platforms: linux/amd64
+  - name: diorama-cctp-bridge
+    dockerfile: diorama
+    platforms: linux/amd64

@@ -1,0 +1,90 @@
+# All staging claims in one file (the cicd pipeline never applies PVCs, so
+# they live in the support layer beside the anvils). The cluster's default
+# `local-path` StorageClass (a tenant cannot create StorageClasses); claims
+# are dynamically provisioned.
+#
+# NOTE: local-path's reclaimPolicy is Delete - deleting a PVC deletes the
+# underlying data.
+#
+# Names: the manual stack had a per-namespace `engine-state` for each mirror;
+# staging hosts both engines in one namespace, so the claims are
+# disambiguated (mainnet-engine-state / venue-engine-state).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anvil-t-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: anvil-t }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      # T never executes mainnet txs (BAL diffs only), so its state stays
+      # small (measured ~2.5 GB with --prune-history 32; snapshots dominate).
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anvil-v-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: anvil-v }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      # V forks the source on demand and carries only the devnet's own
+      # writes; 10Gi is comfortable.
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mainnet-engine-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: diorama-mainnet-engine }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      # Cursor, journal, shadow registry, drift log.
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: venue-engine-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: diorama-venue-engine }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      # Driver cursor, shadow registry, journal.
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: venue-sim-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: diorama-venue-sim }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      # sim.json + feed.json: small JSON state, 2Gi is plenty.
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cctp-state
+  labels: { app.kubernetes.io/part-of: daloc-diorama-stg, app: diorama-cctp-bridge }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi

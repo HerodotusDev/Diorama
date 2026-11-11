@@ -1,0 +1,101 @@
+# diorama-mainnet-engine — the Mainnet Mirror engine in STAGING (the BAL
+# applier, the shadow scan, the state probes, the feed bridge, /admin/*).
+#
+# cicd convention manifest (HerodotusDev/cicd build-and-deploy): `image` is
+# the literal `<IMAGE>` placeholder the pipeline substitutes. Only this file
+# (+ an optional -ingress) is applied by the pipeline; the anvil it drives,
+# the wiring ConfigMap, the instance ConfigMap and the PVCs come from the
+# staging support layer (k8s/stg-anvil, applied by the apply-anvil job).
+#
+# Everything shares one namespace (daloc-diorama-stg), so the anvil is
+# reached by same-namespace short DNS via the diorama-config wiring
+# (ANVIL_T_URL=http://anvil-t:8545).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diorama-mainnet-engine
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-mainnet-engine
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: diorama-mainnet-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: diorama-mainnet-engine
+        app.kubernetes.io/part-of: daloc-diorama-stg
+    spec:
+      terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: engine
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--config", "/etc/mirror/instance.toml"]
+          # The wiring the instance TOML references as ${...} (RETH_URL,
+          # ANVIL_T_URL, STATE_DIR). The merged staging ConfigMap carries the
+          # union of the two mirrors' keys (they used to be per-namespace).
+          envFrom:
+            - configMapRef: { name: diorama-config }
+          env:
+            # The Alchemy key is deploy-time data (Secret `alchemy`, copied
+            # into the namespace by infra); the fork URL is composed from it.
+            # ALCHEMY_KEY must be listed BEFORE RETH_URL for the dependent
+            # $(...) expansion.
+            - name: ALCHEMY_KEY
+              valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } }
+            - name: RETH_URL
+              value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)"
+          ports:
+            - { name: http, containerPort: 8080 }
+          volumeMounts:
+            - { name: instance, mountPath: /etc/mirror, readOnly: true }
+            - { name: state, mountPath: /state }
+          # `/livez`, not `/healthz`: a gap-paused engine is still serving
+          # reads/writes and must stay in the Service and alive (see the base
+          # manifests for the full incident notes). The startupProbe suspends
+          # liveness/readiness through a slow anvil re-fork (up to ~15 min).
+          startupProbe:
+            httpGet: { path: /livez, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "5m", memory: 32Mi }
+            limits: { memory: 2Gi }
+      volumes:
+        - name: instance
+          configMap: { name: mainnet-instance }
+        - name: state
+          persistentVolumeClaim: { claimName: mainnet-engine-state }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diorama-mainnet-engine
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-mainnet-engine
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  selector: { app.kubernetes.io/name: diorama-mainnet-engine }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }

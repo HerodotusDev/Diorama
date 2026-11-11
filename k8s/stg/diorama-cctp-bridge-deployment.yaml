@@ -1,0 +1,103 @@
+# diorama-cctp-bridge — the cross-mirror CCTP V2 lane in STAGING: a burn on
+# the Ethereum fork (T), a local Iris-compatible attestation, and the mint on
+# V — plus the control surface for the devnet lanes. Ports: 8095 serves the
+# Iris-compatible API (daloc's cctp-relay points its IRIS_API_URL here; the
+# client appends /v2/messages/...), 8096 the control API.
+#
+# cicd convention manifest (HerodotusDev/cicd build-and-deploy): `image` is
+# the literal `<IMAGE>` placeholder the pipeline substitutes. The wiring
+# ConfigMap, the instance ConfigMap and the PVC come from the staging
+# support layer (k8s/stg-anvil).
+#
+# In staging the bridge and BOTH anvils share daloc-diorama-stg, so the
+# merged wiring resolves T_RPC_URL/ANVIL_V_URL to same-namespace short DNS.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diorama-cctp-bridge
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-cctp-bridge
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: diorama-cctp-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: diorama-cctp-bridge
+        app.kubernetes.io/part-of: daloc-diorama-stg
+    spec:
+      terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: cctp-bridge
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--config", "/etc/mirror/instance.toml"]
+          # The bridge's own wiring keys (CCTP_STATE_DIR, T_RPC_URL,
+          # ANVIL_V_URL) ride the merged staging ConfigMap, like the engines.
+          envFrom:
+            - configMapRef: { name: diorama-config }
+          env:
+            # The funded relay wallet's hex key: a Secret, never a manifest
+            # literal (the instance reads it as ${CCTP_RELAY_KEY}). Secret
+            # `cctp-relay-key` (key: relay-key) is copied into the namespace
+            # by infra — create it with `make cctp-secrets CCTP_RELAY_KEY=0x…`
+            # against the staging namespace.
+            - name: CCTP_RELAY_KEY
+              valueFrom: { secretKeyRef: { name: cctp-relay-key, key: relay-key } }
+          ports:
+            - { name: iris, containerPort: 8095 }
+            - { name: control, containerPort: 8096 }
+          volumeMounts:
+            - { name: instance, mountPath: /etc/mirror, readOnly: true }
+            - { name: state, mountPath: /state }
+          # /healthz is the Iris router's (8095); the control plane carries
+          # /health + /metrics on 8096. The startupProbe suspends probes
+          # through the two-chain boot verification.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8095 }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8095 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8095 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "5m", memory: 16Mi }
+            limits: { memory: 384Mi }
+      volumes:
+        - name: instance
+          # The bridge's own instance, not the venue's: one process = one
+          # profile.
+          configMap: { name: cctp-instance }
+        - name: state
+          persistentVolumeClaim: { claimName: cctp-state }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diorama-cctp-bridge
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-cctp-bridge
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  selector: { app.kubernetes.io/name: diorama-cctp-bridge }
+  ports:
+    - { name: iris, port: 8095, targetPort: 8095 }
+    - { name: control, port: 8096, targetPort: 8096 }

@@ -1,0 +1,52 @@
+# Shared runtime wiring for the whole staging stack: both mirrors' keys in
+# ONE ConfigMap. In the manual per-namespace stack each mirror carried its
+# own `diorama-config`; staging shares a single namespace, and the pod-level
+# envFrom is the only reader (each pod picks the keys its instance names), so
+# one merged map serves everyone.
+#
+# All cross-references are same-namespace short service DNS now: the bridge
+# no longer needs the cross-namespace FQDNs it used in daloc-diorama-cctp.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: diorama-config
+  labels:
+    app.kubernetes.io/part-of: daloc-diorama-stg
+data:
+  # --- mainnet mirror ---
+  # The chain endpoint the engine drives; the fork source is composed from
+  # the ALCHEMY_KEY Secret per-pod (see k8s/stg/diorama-mainnet-engine and
+  # the anvil-t deployment).
+  ANVIL_T_URL: "http://anvil-t:8545"
+
+  # --- venue mirror ---
+  # Two HyperEVM planes, deliberately separate:
+  #   HL_RPC_URL  - anvil-v's fork source. One URL: anvil takes one
+  #                 `--fork-url`.
+  #   HL_RPC_URLS - the engine's read pool: random healthy start, failover on
+  #                 a transport/throttle/5xx fault, cool a failed entry down
+  #                 for a later round. The archive rides last (it answers
+  #                 eth_getSystemTxsByBlockNumber with -32601 and measured
+  #                 degraded compose latency).
+  HL_RPC_URL: "https://rpc.hyperliquid.xyz/evm"
+  HL_RPC_URLS: "https://rpc.hyperliquid.xyz/evm,https://rpc.hypurrscan.io,https://hyperliquid-json-rpc.stakely.io,https://hyperliquid.api.onfinality.io/evm/public,https://rpc.hyperlend.finance/archive"
+
+  # The venue's market plane (URL lists in the instance's [endpoints] groups;
+  # the env carries the deployment values, never a second literal in the TOML).
+  HL_INFO_API_URL: "https://api.hyperliquid.xyz"
+  HL_WS_API_URL: "wss://api.hyperliquid.xyz/ws"
+
+  # The devnet chain and the engine's admin base. The engine's staging name
+  # is diorama-venue-engine (the venue-sim's instance references it).
+  ANVIL_V_URL: "http://anvil-v:8545"
+  ENGINE_ADMIN_URL: "http://diorama-venue-engine:8080"
+
+  # --- cctp bridge ---
+  # The Ethereum fork the bridge burns on: anvil-t is now same-namespace.
+  T_RPC_URL: "http://anvil-t:8545"
+
+  # --- shared ---
+  # State roots on the pods' own PVCs (paths, not claims).
+  STATE_DIR: "/state"
+  SIM_STATE_DIR: "/state"
+  CCTP_STATE_DIR: "/state"

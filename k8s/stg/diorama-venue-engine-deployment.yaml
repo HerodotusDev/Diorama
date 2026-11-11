@@ -1,0 +1,93 @@
+# diorama-venue-engine — the Venue Mirror engine in STAGING (the fork-driver
+# loop over V, the at-pin probes, the epoch rule, the Core<->EVM bridge scan,
+# /admin/*).
+#
+# cicd convention manifest (HerodotusDev/cicd build-and-deploy): `image` is
+# the literal `<IMAGE>` placeholder the pipeline substitutes. The anvil it
+# drives, the wiring ConfigMap, the instance ConfigMap and the PVC come from
+# the staging support layer (k8s/stg-anvil).
+#
+# Everything shares one namespace (daloc-diorama-stg), so the anvil is
+# reached by same-namespace short DNS via the diorama-config wiring
+# (ANVIL_V_URL=http://anvil-v:8545).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diorama-venue-engine
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-venue-engine
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: diorama-venue-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: diorama-venue-engine
+        app.kubernetes.io/part-of: daloc-diorama-stg
+    spec:
+      terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: engine
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          args: ["run", "--config", "/etc/mirror/instance.toml"]
+          # The same `envFrom` mechanism as the mainnet engine: the merged
+          # staging ConfigMap carries every key (HL_RPC_URLS, ANVIL_V_URL,
+          # STATE_DIR, ...), the pod reads the ones its instance names, and a
+          # new wiring var needs no edit here.
+          envFrom:
+            - configMapRef: { name: diorama-config }
+          ports:
+            - { name: http, containerPort: 8080 }
+          volumeMounts:
+            - { name: instance, mountPath: /etc/mirror, readOnly: true }
+            - { name: state, mountPath: /state }
+          # `/livez`, not `/healthz`: a gap-paused engine is still serving
+          # reads/writes and must stay in the Service and alive. The
+          # startupProbe suspends liveness/readiness through a slow anvil
+          # re-fork (up to ~15 min).
+          startupProbe:
+            httpGet: { path: /livez, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "5m", memory: 64Mi }
+            limits: { memory: 2Gi }
+      volumes:
+        - name: instance
+          configMap: { name: venue-instance }
+        - name: state
+          persistentVolumeClaim: { claimName: venue-engine-state }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diorama-venue-engine
+  namespace: daloc-diorama-stg
+  labels:
+    app.kubernetes.io/name: diorama-venue-engine
+    app.kubernetes.io/part-of: daloc-diorama-stg
+spec:
+  selector: { app.kubernetes.io/name: diorama-venue-engine }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
