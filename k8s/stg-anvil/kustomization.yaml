@@ -1,12 +1,13 @@
 # The staging support layer (daloc-diorama-stg): everything the cicd pipeline
 # does NOT apply. The reusable build-and-deploy workflow only applies
-# k8s/stg/<name>-deployment.yaml — this overlay carries the namespace, the
-# wiring ConfigMap, the instance ConfigMaps, all PVCs, and the two fork
-# anvils. It is applied by the `apply-anvil` job of
+# k8s/stg/<name>-deployment.yaml — this overlay carries the wiring ConfigMap,
+# the instance ConfigMaps, all PVCs, and the two fork anvils. The namespace
+# itself is NOT included: it is created by the tenant owner with the proper
+# Capsule tenant labels, and the Capsule webhook denies namespace patches
+# from tenant identities (a Namespace resource here would fail on apply).
 # .github/workflows/build-and-deploy.yaml, which runs BEFORE the reusable
 # workflow (the engines wait for their anvils, and the deploy needs the
 # namespace to exist).
-#
 # Idempotency: plain `kubectl apply`. A pod is only replaced when its spec
 # changes — a no-op push touches nothing. The instance ConfigMaps are
 # generated with disableNameSuffixHash (the engines reference them by plain
@@ -27,7 +28,6 @@ kind: Kustomization
 namespace: daloc-diorama-stg
 
 resources:
-  - namespace.yaml
   - diorama-config.yaml
   - pvcs.yaml
   - anvil-t.yaml
