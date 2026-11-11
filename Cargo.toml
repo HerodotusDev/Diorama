@@ -5,7 +5,10 @@ members = ["crates/*", "bins/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# The image tag the staging pipeline derives: ghcr.io/herodotusdev/<app>-stg:<version>.
+# Bump per deploy-worthy change set; the pipeline also creates the matching
+# git tag (plain `0.2.0`, distinct from the legacy `v0.1.0`).
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"

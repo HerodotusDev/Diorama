@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-anvil"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-eips",
  "alloy-json-rpc",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-ast-scope"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-cctp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-cctp-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diorama-cctp",
  "diorama-config",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-primitives",
  "clap",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-devnet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-mainnet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-eips",
  "alloy-json-rpc",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-mainnet-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diorama-config",
  "diorama-mainnet",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-venue"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-venue-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diorama-config",
  "diorama-venue",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "diorama-venue-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diorama-config",
  "diorama-venue",
