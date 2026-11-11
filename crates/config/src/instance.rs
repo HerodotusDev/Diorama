@@ -210,6 +210,12 @@ impl Instance {
                         max_log_range: group
                             .max_log_range
                             .unwrap_or(diorama_anvil::DEFAULT_MAX_LOG_RANGE_BLOCKS),
+                        max_batch_items: group
+                            .max_batch_items
+                            .unwrap_or(diorama_anvil::DEFAULT_MAX_BATCH_ITEMS as u64),
+                        max_batch_concurrency: group
+                            .max_batch_concurrency
+                            .unwrap_or(diorama_anvil::DEFAULT_BATCH_CONCURRENCY as u64),
                     },
                     None => diorama_anvil::EndpointSpec::url(url.clone()),
                 }
@@ -426,13 +432,12 @@ impl Instance {
     /// loader expands a URL list before the pool sees it, so a conflicting
     /// duplicate across groups would otherwise be resolved by group order.
     fn check_endpoint_groups(&self, issues: &mut Vec<String>) {
-        type Attributes = (
-            std::collections::BTreeSet<String>,
-            Option<u64>,
-            u32,
-            Option<u64>,
-        );
-        let mut seen: BTreeMap<String, Attributes> = BTreeMap::new();
+        self.check_group_attributes(issues);
+        self.check_group_url_conflicts(issues);
+    }
+
+    /// One group's own attributes.
+    fn check_group_attributes(&self, issues: &mut Vec<String>) {
         for (name, group) in &self.endpoints {
             let key = format!("endpoints.{name}");
             if group.weight == 0 {
@@ -441,11 +446,35 @@ impl Instance {
             if group.max_log_range == Some(0) {
                 issues.push(format!("{key}.max_log_range must be > 0"));
             }
+            if group.max_batch_items == Some(0) {
+                issues.push(format!("{key}.max_batch_items must be > 0"));
+            }
+            if group.max_batch_concurrency == Some(0) {
+                issues.push(format!("{key}.max_batch_concurrency must be > 0"));
+            }
+        }
+    }
+
+    /// One URL must carry the same attributes in every group that names it.
+    fn check_group_url_conflicts(&self, issues: &mut Vec<String>) {
+        type Attributes = (
+            std::collections::BTreeSet<String>,
+            Option<u64>,
+            u32,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+        );
+        let mut seen: BTreeMap<String, Attributes> = BTreeMap::new();
+        for (name, group) in &self.endpoints {
+            let key = format!("endpoints.{name}");
             let attributes = (
                 group.roles.iter().cloned().collect(),
                 group.chain_id,
                 group.weight,
                 group.max_log_range,
+                group.max_batch_items,
+                group.max_batch_concurrency,
             );
             for url in group.http.iter().chain(group.ws.iter()) {
                 for part in url.split(',') {
@@ -460,7 +489,8 @@ impl Instance {
                         Some(known) if known == &attributes => {}
                         Some(_) => issues.push(format!(
                             "{key}: {part:?} is also declared in another endpoint group with \
-                             different roles/chain_id/weight/max_log_range"
+                             different roles/chain_id/weight/max_log_range/max_batch_items/\
+                             max_batch_concurrency"
                         )),
                     }
                 }

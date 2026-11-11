@@ -252,10 +252,28 @@ pub fn build_clients(
     target_url: &str,
     timeout: std::time::Duration,
 ) -> diorama_anvil::Result<(std::sync::Arc<Rpc>, std::sync::Arc<Rpc>)> {
+    // The target is a **single** endpoint: writes must never fan out. It is
+    // the local devnet chain, so its reads ride the anvil shape — small
+    // concurrent chunks: a fork-mode anvil serves every uncached slot
+    // behind a fork-source round-trip (~30 ms, serialized inside one batch
+    // body), so one wide read body costs the sum of its slots; 64-item
+    // chunks riding 8-wide cut a block's key reads to ~one wave.
+    let target_pool = diorama_anvil::EndpointPool::from_specs(
+        [diorama_anvil::EndpointSpec {
+            url: target_url.to_string(),
+            max_batch_items: 64,
+            max_batch_concurrency: 8,
+            ..diorama_anvil::EndpointSpec::url(target_url)
+        }],
+        diorama_anvil::Scheme::Http,
+        diorama_anvil::PoolPolicy {
+            rounds: 1,
+            ..diorama_anvil::PoolPolicy::default()
+        },
+    )?;
     Ok((
         std::sync::Arc::new(Rpc::with_pool(source_pool, timeout)?),
-        // The target is a **single** endpoint: writes must never fan out.
-        std::sync::Arc::new(Rpc::new(target_url, timeout)?),
+        std::sync::Arc::new(Rpc::with_writable_pool(target_pool, timeout)?),
     ))
 }
 

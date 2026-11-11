@@ -50,13 +50,18 @@ impl RethSource {
     }
 
     /// The per-tx prestate traces of a block, merged (the fallback for nodes
-    /// without block-level tracing). The transaction count rides along so the
-    /// caller can tell an empty block from a populated block whose trace
-    /// composed nothing.
+    /// without block-level tracing). The transaction count and the block's
+    /// before-values ride along so the caller can tell an empty block from a
+    /// populated block whose trace composed nothing, and journal without a
+    /// read.
     async fn trace_block_per_tx(
         &self,
         n: u64,
-    ) -> diorama_anvil::Result<(usize, Vec<diorama_anvil::Write>)> {
+    ) -> diorama_anvil::Result<(
+        usize,
+        Vec<diorama_anvil::Write>,
+        Vec<(diorama_anvil::Key, diorama_anvil::Value)>,
+    )> {
         use alloy_network_primitives::TransactionResponse as _;
         let block = self
             .reth
@@ -65,11 +70,20 @@ impl RethSource {
         let txs = diorama_devnet::scan::block_txs(&block);
         let count = txs.len();
         let mut out = Vec::new();
+        let mut pres: std::collections::HashMap<
+            diorama_anvil::Key,
+            diorama_anvil::Value,
+        > = std::collections::HashMap::new();
         for tx in txs {
             let trace = self.reth.trace_tx_prestate(tx.tx_hash()).await?;
-            out.extend(diorama_anvil::flatten_trace(&trace));
+            let (writes, tx_pres) = diorama_anvil::flatten_trace_with_pre(&trace);
+            out.extend(writes);
+            for (key, value) in tx_pres {
+                pres.entry(key).or_insert(value);
+            }
         }
-        Ok((count, out))
+        let pres = pres.into_iter().collect();
+        Ok((count, out, pres))
     }
 }
 
@@ -117,6 +131,20 @@ impl Source for RethSource {
         block: u64,
     ) -> BoxFuture<'_, diorama_anvil::Result<B256>> {
         self.inner.storage_at(address, slot, block)
+    }
+
+    /// The read plan in one mixed body: the four key kinds map to their RPC
+    /// methods (the client owns the mapping and the decode). The default
+    /// composition is a sequential round-trip per key — 237 keys measured
+    /// ~14 s against a remote provider, every follow block — this rides the
+    /// client's batched form instead (one body per chunk).
+    fn read_keys(
+        &self,
+        keys: &[diorama_anvil::Key],
+        block: u64,
+    ) -> BoxFuture<'_, diorama_anvil::Result<Vec<diorama_anvil::Value>>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.inner.read_keys(&keys, block).await })
     }
 
     fn code_at(
@@ -170,20 +198,35 @@ impl Source for RethSource {
     /// silently apply zero writes over a block that changed state.
     fn touched(&self, from: u64, to: u64) -> BoxFuture<'_, diorama_anvil::Result<TouchedSet>> {
         Box::pin(async move {
-            let mut touched = TouchedSet::default();
+            // The prestate diff is the block's exhaustive change document:
+            // every state change is in `values` with its post-value, and
+            // `pres` carries every changed key's before-value — a key absent
+            // from the diff did not change, so the composer plans no
+            // freshness read for it.
+            let mut touched = TouchedSet {
+                exhaustive: true,
+                ..TouchedSet::default()
+            };
             for n in (from + 1)..=to {
                 let traces = self.reth.trace_block_prestate(n).await?;
                 if traces.is_empty() {
-                    let (txs, writes) = self.trace_block_per_tx(n).await?;
+                    let (txs, writes, pres) = self.trace_block_per_tx(n).await?;
                     if let Some(fault) = empty_populated_trace(n, txs, writes.is_empty()) {
                         return Err(fault);
                     }
                     for w in writes {
                         touched.value(w);
                     }
+                    for (key, value) in pres {
+                        touched.pre(key, value);
+                    }
                 } else {
-                    for w in diorama_anvil::flatten_trace_block(&traces) {
+                    let (writes, pres) = diorama_anvil::flatten_trace_block_with_pre(&traces);
+                    for w in writes {
                         touched.value(w);
+                    }
+                    for (key, value) in pres {
+                        touched.pre(key, value);
                     }
                 }
             }

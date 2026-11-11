@@ -80,6 +80,10 @@ pub struct WindowBal {
     pub to: u64,
     pub kind: DiffKind,
     pub bal: BlockAccessList,
+    /// The composed window's before-values (the trace rung's `pre` side;
+    /// first block wins per key across a multi-block window). Empty on the
+    /// BAL rung and the envelope rung.
+    pub pres: BTreeMap<Key, Value>,
 }
 
 impl WindowBal {
@@ -90,6 +94,7 @@ impl WindowBal {
             to,
             kind: DiffKind::None,
             bal: Vec::new(),
+            pres: BTreeMap::new(),
         }
     }
 }
@@ -151,6 +156,11 @@ pub struct WindowPlan {
     pub bal: BlockAccessList,
     /// The kept changes, flattened (what the engines apply and journal).
     pub writes: Vec<Write>,
+    /// The kept changes' before-values, where the source could derive them
+    /// (the trace rung's own `pre` side; the envelope rung's diff reads).
+    /// The journal consumes this document first and reads the target only
+    /// for keys it does not cover.
+    pub befores: BTreeMap<Key, Value>,
     pub filter: crate::cow::FilterStats,
     pub compose: ComposeStats,
 }
@@ -196,26 +206,25 @@ impl<'a> Composer<'a> {
         let mut acc: BTreeMap<Address, AccountChanges> = BTreeMap::new();
         let mut stats = ComposeStats::default();
         let mut kind = DiffKind::Bal;
+        let mut pres: BTreeMap<Key, Value> = BTreeMap::new();
         for n in (from + 1)..=to {
             if let Some(bal) = self.source.bal(n).await? {
                 merge_into(&mut acc, bal);
             } else {
-                let (bal, s) = self.synthesize(skip, Window::new(n - 1, n)).await?;
+                let (bal, s, block_pres) = self.synthesize(skip, Window::new(n - 1, n)).await?;
                 merge_into(&mut acc, bal);
                 stats.absorb(s);
                 kind = self.source.touched_kind();
+                // Across a multi-block window the first block's pre is the
+                // window's before-value; later blocks' pres for the same key
+                // are mid-window states.
+                for (key, value) in block_pres {
+                    pres.entry(key).or_insert(value);
+                }
             }
         }
         let bal: BlockAccessList = acc.into_values().collect();
-        Ok((
-            WindowBal {
-                from,
-                to,
-                kind,
-                bal,
-            },
-            stats,
-        ))
+        Ok((WindowBal { from, to, kind, bal, pres }, stats))
     }
 
     /// Rung 2: the source reports the window's touches; the declared scope
@@ -225,16 +234,50 @@ impl<'a> Composer<'a> {
         skip: &crate::cow::SkipSet,
         window: Window,
     ) -> Result<(WindowBal, ComposeStats)> {
-        let (bal, stats) = self.synthesize(skip, window).await?;
+        let (bal, stats, pres) = self.synthesize(skip, window).await?;
         Ok((
             WindowBal {
                 from: window.from,
                 to: window.to,
                 kind: self.source.touched_kind(),
                 bal,
+                pres,
             },
             stats,
         ))
+    }
+
+    /// The envelope rung's freshness reads: the source at the window's end
+    /// (reth serves that block; the public venue RPC serves its latest — the
+    /// block parameter is ignored, measured), the target at its own head
+    /// (the devnet chain's height is not the source's: a window end above it
+    /// is out of range). A key the two sides answer differently becomes a
+    /// write whose before-value is the target's own current state — already
+    /// in hand, never re-read.
+    async fn read_pending(
+        &self,
+        pending: &[Key],
+        to: u64,
+        writes: &mut Vec<Write>,
+        befores: &mut BTreeMap<Key, Value>,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let source_values = self.source.read_keys(pending, to).await?;
+        let target_at = self.target.head().await?;
+        let target_values = self.target.read_keys(pending, target_at).await?;
+        for ((key, source_value), target_value) in
+            pending.iter().zip(source_values).zip(target_values)
+        {
+            if source_value != target_value {
+                if let Some(w) = Write::new(*key, source_value.clone()) {
+                    befores.insert(*key, target_value.clone());
+                    writes.push(w);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The shared pipeline half: compose the window, COW it against the
@@ -260,11 +303,21 @@ impl<'a> Composer<'a> {
             crate::cow::filter_bal(self.scope.watch(), &shadow, composed.bal)
         };
         let writes = diorama_anvil::flatten_bal(&bal);
+        // The journal's before-values, narrowed to the kept writes: the
+        // composer only carries befores for keys it derived, and the filter
+        // may have dropped devnet-owned ones.
+        let kept: HashSet<Key> = writes.iter().map(Write::key).collect();
+        let befores: BTreeMap<Key, Value> = composed
+            .pres
+            .into_iter()
+            .filter(|(key, _)| kept.contains(key))
+            .collect();
         Ok(WindowPlan {
             kind: composed.kind,
             total,
             bal,
             writes,
+            befores,
             filter,
             compose,
         })
@@ -273,59 +326,79 @@ impl<'a> Composer<'a> {
     /// Rung 2's read side: touches → the declared scope's read plan →
     /// source/target reads → a BAL of the differing keys. Keys the touched
     /// set already carries values for (the trace rung) are not re-read.
+    ///
+    /// On an *exhaustive* touched set (the trace rung) the reads vanish
+    /// entirely: every state change the window carried is already in
+    /// `touched.values` with its post-value, and a key the trace does not
+    /// name is provably unchanged on both sides — the source kept it (the
+    /// trace is the complete change document) and the target kept it (only
+    /// this pipeline and the shadowed devnet writes touch it, and shadowed
+    /// keys never reach the plan). The journal's before-values ride the
+    /// trace's own `pre` side. Measured live: the freshness reads were
+    /// ~380 per block, each forwarded by the fork-mode anvil to its paid
+    /// source — the mirror's whole provider bill.
     async fn synthesize(
         &self,
         skip: &crate::cow::SkipSet,
         window: Window,
-    ) -> Result<(BlockAccessList, ComposeStats)> {
+    ) -> Result<(BlockAccessList, ComposeStats, BTreeMap<Key, Value>)> {
         let Window { from, to } = window;
+        let started = std::time::Instant::now();
         let mut touched = self.source.touched(from, to).await?;
-        // The watchlist's own freshness: every watched account's fields are
-        // planned every window, so a plain value transfer (which emits no
-        // log) cannot leave one stale — the envelopes read logs, not the
-        // receipts' from/to.
-        for address in self.scope.watch().accounts.iter() {
-            touched.touch(*address);
+        let after_touch = std::time::Instant::now();
+        // The watchlist's own freshness on the envelope rung: every watched
+        // account's fields are planned every window, so a plain value
+        // transfer (which emits no log) cannot leave one stale — the
+        // envelopes read logs, not the receipts' from/to.
+        if !touched.exhaustive {
+            for address in self.scope.watch().accounts.iter() {
+                touched.touch(*address);
+            }
         }
         let plan = plan_reads(self.scope.closures(), self.scope.watch(), &touched);
         let valued: HashSet<Key> = touched.values.iter().map(Write::key).collect();
         let mut writes: Vec<Write> = touched.values.clone();
-        // The read anchors: the source at the window's end (reth serves that
-        // block; the public venue RPC serves its latest — the block parameter
-        // is ignored, measured), the target at its own head (the devnet
-        // chain's height is not the source's: a window end above it is out of
-        // range).
-        let target_at = self.target.head().await?;
-        // The planned keys' reads ride batches (one mixed body per side): a
-        // wide window's plan reaches thousands of keys — every transfer's
-        // holder becomes a storage key — and the per-key form cost a
-        // round-trip per key against the public source (measured live: a
-        // 300-block catch-up window ground for minutes).
-        let pending: Vec<Key> = plan
-            .iter()
-            .copied()
-            .filter(|key| !valued.contains(key) && !skip.skips(key))
-            .collect();
-        if !pending.is_empty() {
-            let source_values = self.source.read_keys(&pending, to).await?;
-            let target_values = self.target.read_keys(&pending, target_at).await?;
-            for ((key, source_value), target_value) in
-                pending.iter().zip(source_values).zip(target_values)
-            {
-                if source_value != target_value {
-                    if let Some(w) = Write::new(*key, source_value) {
-                        writes.push(w);
-                    }
+        let mut befores: BTreeMap<Key, Value> = BTreeMap::new();
+        let pending: Vec<Key> = if touched.exhaustive {
+            // The trace is the window's complete change document: an unnamed
+            // key is provably unchanged on both sides — nothing to read,
+            // nothing to diff.
+            Vec::new()
+        } else {
+            plan.iter()
+                .copied()
+                .filter(|key| !valued.contains(key) && !skip.skips(key))
+                .collect()
+        };
+        let after_plan = std::time::Instant::now();
+        self.read_pending(&pending, to, &mut writes, &mut befores)
+            .await?;
+        // The journal's before-values from the trace's own `pre` side: one
+        // per trace write, the block's starting state.
+        if touched.exhaustive {
+            for w in &writes {
+                if let Some(before) = touched.pres.get(&w.key()) {
+                    befores.entry(w.key()).or_insert_with(|| before.clone());
                 }
             }
         }
+        tracing::debug!(
+            from,
+            to,
+            pending = pending.len(),
+            touched_values = touched.values.len(),
+            exhaustive = touched.exhaustive,
+            touch_ms = (after_touch - started).as_millis() as u64,
+            reads_ms = (after_plan.elapsed().as_millis()) as u64,
+            "compose phase timings"
+        );
         let stats = ComposeStats {
             touched: touched.addresses.len(),
             planned: plan.len(),
             changed: writes.len(),
             uncovered: uncovered_emitters(self.scope, &plan, &touched),
         };
-        Ok((diorama_anvil::bal_from_writes(&writes), stats))
+        Ok((diorama_anvil::bal_from_writes(&writes), stats, befores))
     }
 }
 
@@ -1094,6 +1167,111 @@ mod tests {
         assert!(
             verify_bal_commitment(None, &bal).is_ok(),
             "pre-fork: no commitment, nothing to check"
+        );
+    }
+
+    /// The exhaustive rung (the trace) plans no reads: an unnamed key is
+    /// provably unchanged on both sides, the write set is the trace's own,
+    /// and the journal's before-values ride the trace's `pre` side.
+    #[test]
+    fn the_exhaustive_rung_reads_nothing_and_journals_from_the_pre_side() {
+        let watched = address!("00000000000000000000000000000000000000aa");
+        let mut touched = TouchedSet {
+            exhaustive: true,
+            ..TouchedSet::default()
+        };
+        touched.value(Write::Balance {
+            address: watched,
+            value: U256::from(7),
+        });
+        touched.pre(Key::Balance(watched), Value::Balance(U256::from(6)));
+        let source = Fake {
+            caps: caps(NativeBal::Refused),
+            bal: None,
+            touched,
+            reads: HashMap::new(),
+            read_keys: std::sync::Mutex::new(Vec::new()),
+        };
+        let target = Fake {
+            caps: caps(NativeBal::Refused),
+            bal: None,
+            touched: TouchedSet::default(),
+            reads: HashMap::new(),
+            read_keys: std::sync::Mutex::new(Vec::new()),
+        };
+        let scope = Scope::new(WatchSet::new([watched].into_iter().collect()), Vec::new());
+        let shadow = crate::shared::Shared::new("test shadow", crate::shadow::Shadow::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let plan = rt
+            .block_on(
+                Composer {
+                    source: &source,
+                    target: &target,
+                    scope: &scope,
+                }
+                .plan(&shadow, Window::new(0, 1)),
+            )
+            .unwrap();
+        assert!(
+            source.read_keys.lock().unwrap().is_empty(),
+            "the exhaustive rung reads nothing from the source"
+        );
+        assert!(
+            target.read_keys.lock().unwrap().is_empty(),
+            "the exhaustive rung reads nothing from the target"
+        );
+        assert_eq!(plan.writes.len(), 1, "the trace's own write rides");
+        assert_eq!(
+            plan.befores.get(&Key::Balance(watched)),
+            Some(&Value::Balance(U256::from(6))),
+            "the journal's before-value is the trace's pre"
+        );
+    }
+
+    /// The envelope rung keeps the freshness reads (its touches are
+    /// log-shaped, a plain transfer emits no log) and captures the target's
+    /// own values as the diff writes' before-values.
+    #[test]
+    fn the_envelope_rung_captures_diff_befores_from_the_target() {
+        let watched = address!("00000000000000000000000000000000000000ff");
+        let mut touched = TouchedSet::default();
+        touched.touch(watched);
+        let mut source_reads = HashMap::new();
+        source_reads.insert(Key::Balance(watched), Value::Balance(U256::from(500)));
+        let mut target_reads = HashMap::new();
+        target_reads.insert(Key::Balance(watched), Value::Balance(U256::from(400)));
+        let source = Fake {
+            caps: caps(NativeBal::Refused),
+            bal: None,
+            touched,
+            reads: source_reads,
+            read_keys: std::sync::Mutex::new(Vec::new()),
+        };
+        let target = Fake {
+            caps: caps(NativeBal::Refused),
+            bal: None,
+            touched: TouchedSet::default(),
+            reads: target_reads,
+            read_keys: std::sync::Mutex::new(Vec::new()),
+        };
+        let scope = Scope::new(WatchSet::new([watched].into_iter().collect()), Vec::new());
+        let shadow = crate::shared::Shared::new("test shadow", crate::shadow::Shadow::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let plan = rt
+            .block_on(
+                Composer {
+                    source: &source,
+                    target: &target,
+                    scope: &scope,
+                }
+                .plan(&shadow, Window::new(0, 1)),
+            )
+            .unwrap();
+        assert_eq!(plan.writes.len(), 1, "the balance diff rides");
+        assert_eq!(
+            plan.befores.get(&Key::Balance(watched)),
+            Some(&Value::Balance(U256::from(400))),
+            "the diff write's before-value is the target's own state"
         );
     }
 }

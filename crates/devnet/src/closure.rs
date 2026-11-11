@@ -17,7 +17,7 @@
 //!   WETH (slot 3): holder `0x28C6…1d60` ⇒ slot `0xdca77c…a94e`, and the
 //!   storage word equals `balanceOf` exactly.
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
-use diorama_anvil::{Key, Write};
+use diorama_anvil::{Key, Value, Write};
 use std::collections::{HashMap, HashSet};
 
 /// The window's touches as a source can report them: the addresses and logs
@@ -32,6 +32,18 @@ pub struct TouchedSet {
     /// Changed keys the source already knows the post-values of (the trace
     /// rung): the synthesis does not re-read them.
     pub values: Vec<Write>,
+    /// The changed keys' before-values (the trace rung's own `pre` side;
+    /// first touching transaction wins per key). Empty on the envelope rung,
+    /// which has no pre-side document. This is the journal's before-value
+    /// document: the applier journals from it without a single read.
+    pub pres: HashMap<Key, Value>,
+    /// The touches are the window's *exhaustive* change document: every
+    /// state change the block(s) carried is in `values`, so a key absent
+    /// from them is provably unchanged — the synthesis plans no freshness
+    /// reads for it. True only for the trace rung; the envelope rung sees
+    /// log-shaped touches (a plain transfer emits no log) and must keep
+    /// reading.
+    pub exhaustive: bool,
 }
 
 impl TouchedSet {
@@ -57,6 +69,13 @@ impl TouchedSet {
     /// for the key, so the read plan must not re-read it.
     pub fn value(&mut self, write: Write) {
         self.values.push(write);
+    }
+
+    /// Record a changed key's before-value (the trace's `pre` side). First
+    /// insert wins: a later transaction's `pre` is a mid-block state, never
+    /// the block's before-value.
+    pub fn pre(&mut self, key: Key, value: Value) {
+        self.pres.entry(key).or_insert(value);
     }
 }
 

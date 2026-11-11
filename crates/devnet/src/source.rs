@@ -247,9 +247,10 @@ impl Capabilities {
     }
 }
 
-/// Did the method exist? Only two answers are definitive: a value (present)
-/// or `-32601` (absent). Every other fault is unknown and propagated — never
-/// read as presence.
+/// Did the method exist? Two answers are definitive: a value (present) or a
+/// method-absence refusal (absent — drpc's `-32601`; Alchemy's `-32600`
+/// `"Unsupported method: …"`). Every other fault is unknown and propagated —
+/// never read as presence.
 fn method_present<T>(r: diorama_anvil::Result<T>) -> diorama_anvil::Result<bool> {
     match r {
         Ok(_) => Ok(true),

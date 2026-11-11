@@ -11,13 +11,14 @@ use crate::error::{Error, Result};
 use alloy_primitives::{Address, Bytes, U256};
 use diorama_anvil::{Key, Rpc, Value, Write};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// The artifact's name in errors: one home.
 const ARTIFACT: &str = "journal entry";
 
 /// One recorded before-value, tagged by kind in the JSONL file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum JournalEntry {
     Storage {
@@ -279,28 +280,49 @@ pub struct JournalSink<'a> {
     pub at: u64,
 }
 
-/// The journal's read side: before-values for a batch of writes, read at the
-/// target's block `at` (the applied parent's head). A read that fails fails
-/// the apply — a journal with a missing before-value would let a later rewind
-/// report success while leaving that key un-restored.
-pub async fn read_before_values(
+/// The journal's read side: before-values for a plan's writes, the
+/// composer's own document first. The exhaustive rung (the trace) derives
+/// every before-value from its `pre` side — zero reads; the envelope rung
+/// derives the diff writes' from the target values it already read. Only
+/// keys neither covers fall back to reading the target at the applied
+/// parent's head (`at`, pre-write state). A read that fails fails the apply
+/// — a journal with a missing before-value would let a later rewind report
+/// success while leaving that key un-restored.
+pub async fn entries_for_writes(
     target: &Rpc,
     writes: &[Write],
+    befores: &BTreeMap<Key, Value>,
     at: u64,
 ) -> Result<Vec<JournalEntry>> {
-    // The before-values ride one read plan (≤20 keys per body — the client
-    // chunks transparently, order-preserving): the per-write form cost a
-    // round trip per write, and this runs on every applied block, for every
-    // write in it.
-    let keys: Vec<Key> = writes.iter().map(Write::key).collect();
-    // The target is the devnet chain (an anvil): its own 500-item contract,
-    // so a block's whole write set rides one body.
-    let values = target
-        .read_keys_limited(&keys, at, diorama_anvil::ANVIL_BATCH_MAX_ITEMS)
-        .await?;
+    // The fallback reads ride the target's own batch shape (the pool cap:
+    // 64-item chunks riding concurrent — a fork-mode anvil serializes every
+    // uncached slot behind a fork-source round-trip, so one wide body costs
+    // the sum of its slots).
+    let missing: Vec<Write> = writes
+        .iter()
+        .filter(|w| !befores.contains_key(&w.key()))
+        .cloned()
+        .collect();
+    let mut read: HashMap<Key, Value> = HashMap::new();
+    if !missing.is_empty() {
+        let keys: Vec<Key> = missing.iter().map(Write::key).collect();
+        let values = target.read_keys(&keys, at).await?;
+        for (key, value) in keys.into_iter().zip(values) {
+            read.insert(key, value);
+        }
+    }
     let mut entries = Vec::with_capacity(writes.len());
-    for (w, value) in writes.iter().zip(values) {
-        entries.push(entry_for_write(w, before_of(value))?);
+    for w in writes {
+        let value = befores
+            .get(&w.key())
+            .or_else(|| read.get(&w.key()))
+            .ok_or_else(|| diorama_anvil::Error::Corrupt {
+                what: "journal before-value",
+                detail: format!(
+                    "write key {w:?} has no composer before-value and no read answer"
+                ),
+            })?;
+        entries.push(entry_for_write(w, before_of(value.clone()))?);
     }
     Ok(entries)
 }
@@ -522,5 +544,66 @@ mod tests {
                 before_kind: "nonce"
             }
         ));
+    }
+
+    /// The composer's before-value document covers the trace rung: the
+    /// journal never reads. An uncovered key falls back to the target read.
+    #[test]
+    fn entries_come_from_the_composer_document_and_fall_back_to_reads() {
+        let a: Address = "0x00000000000000000000000000000000000000a1".parse().unwrap();
+        let b: Address = "0x00000000000000000000000000000000000000b2".parse().unwrap();
+        let writes = vec![
+            Write::Balance {
+                address: a,
+                value: U256::from(500),
+            },
+            Write::Balance {
+                address: b,
+                value: U256::from(700),
+            },
+        ];
+        // `a` rides the composer document; `b` is uncovered → target read.
+        let mut befores = BTreeMap::new();
+        befores.insert(Key::Balance(a), Value::Balance(U256::from(400)));
+        // A dead target: the covered key needs no read, the uncovered one
+        // fails the apply (a journal with a missing before-value would let a
+        // rewind lie).
+        let rpc = diorama_anvil::Rpc::new("http://127.0.0.1:1", std::time::Duration::from_secs(1))
+            .expect("a valid client");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let entries = rt
+            .block_on(entries_for_writes(&rpc, &writes, &befores, 10))
+            .expect_err("the uncovered key must ride the (dead) target read");
+        assert!(
+            entries.to_string().contains("journal before-value")
+                || matches!(entries, Error::Rpc(_)),
+            "the fallback surfaced: {entries}"
+        );
+    }
+
+    /// A fully covered composer document journals without touching the
+    /// target: the before-values are the document's, verbatim.
+    #[test]
+    fn a_covered_document_journals_without_a_read() {
+        let a: Address = "0x00000000000000000000000000000000000000a1".parse().unwrap();
+        let writes = vec![Write::Balance {
+            address: a,
+            value: U256::from(500),
+        }];
+        let mut befores = BTreeMap::new();
+        befores.insert(Key::Balance(a), Value::Balance(U256::from(400)));
+        let rpc = diorama_anvil::Rpc::new("http://127.0.0.1:1", std::time::Duration::from_secs(1))
+            .expect("a valid client");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let entries = rt
+            .block_on(entries_for_writes(&rpc, &writes, &befores, 10))
+            .expect("the document covers every key");
+        assert_eq!(
+            entries,
+            vec![JournalEntry::Balance {
+                address: a,
+                before: U256::from(400),
+            }]
+        );
     }
 }

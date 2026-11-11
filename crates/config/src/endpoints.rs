@@ -78,6 +78,19 @@ pub struct EndpointGroup {
     /// source uses 900).
     #[serde(default)]
     pub max_log_range: Option<u64>,
+    /// The widest JSON-RPC batch these endpoints answer in one body. Absent
+    /// keeps the client's conservative 20-item default; a provider that
+    /// answers wider bodies (the measured Alchemy gateway takes 300) pins it
+    /// here — the mirror's per-block key reads shrink from ~80 bodies to a
+    /// handful. The chunk concurrency stays at this group's declared budget.
+    #[serde(default)]
+    pub max_batch_items: Option<u64>,
+    /// How many batch chunk bodies may ride concurrently against these
+    /// endpoints. Absent keeps the sequential default (public endpoints
+    /// throttle concurrent bodies, measured); the local anvil and the
+    /// measured Alchemy gateway take concurrent bodies and declare more.
+    #[serde(default)]
+    pub max_batch_concurrency: Option<u64>,
 }
 
 const fn one() -> u32 {
@@ -447,6 +460,8 @@ mod tests {
                 chain_id: None,
                 weight: 1,
                 max_log_range: None,
+                max_batch_items: None,
+                max_batch_concurrency: None,
             },
         );
         let mut endpoints = one("@hyperevm");
