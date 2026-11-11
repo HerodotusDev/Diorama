@@ -225,34 +225,46 @@ impl Capabilities {
         let head = rpc.block_number().await?;
         let mut disagree = Vec::new();
 
-        let bal = rpc
-            .call::<serde_json::Value>("eth_getBlockAccessList", (U64::from(head),))
-            .await;
-        if self.has(Capability::NativeBal) != method_present(bal)? {
-            disagree.push("native_bal");
+        // Only declared capabilities are audited: an endpoint serving more
+        // than the declaration is spare capacity, not a disagreement
+        // (measured live: the official HyperEVM endpoint serves traces the
+        // venue profile does not use, and half the pool refuses them — an
+        // equality audit would warn on every boot of a healthy stack).
+
+        if self.has(Capability::NativeBal) {
+            let bal = rpc
+                .call::<serde_json::Value>("eth_getBlockAccessList", (U64::from(head),))
+                .await;
+            if !method_present(bal)? {
+                disagree.push("native_bal");
+            }
         }
 
-        let trace = rpc
-            .call::<serde_json::Value>(
-                diorama_anvil::TRACE_BLOCK_METHOD,
-                (
-                    U64::from(head),
-                    serde_json::json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}),
-                ),
-            )
-            .await;
-        if self.has(Capability::Traces) != method_present(trace)? {
-            disagree.push("traces");
+        if self.has(Capability::Traces) {
+            let trace = rpc
+                .call::<serde_json::Value>(
+                    diorama_anvil::TRACE_BLOCK_METHOD,
+                    (
+                        U64::from(head),
+                        serde_json::json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}),
+                    ),
+                )
+                .await;
+            if !method_present(trace)? {
+                disagree.push("traces");
+            }
         }
 
-        let system = rpc
-            .call::<serde_json::Value>(
-                "eth_getSystemTxsByBlockNumber",
-                (U64::from(head.saturating_sub(SYSTEM_TX_PROBE_LAG)),),
-            )
-            .await;
-        if self.has(Capability::SystemTxs) != method_present(system)? {
-            disagree.push("system_txs");
+        if self.has(Capability::SystemTxs) {
+            let system = rpc
+                .call::<serde_json::Value>(
+                    "eth_getSystemTxsByBlockNumber",
+                    (U64::from(head.saturating_sub(SYSTEM_TX_PROBE_LAG)),),
+                )
+                .await;
+            if !method_present(system)? {
+                disagree.push("system_txs");
+            }
         }
 
         Ok(disagree)

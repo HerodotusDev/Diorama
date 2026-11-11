@@ -14,11 +14,12 @@ use diorama_devnet::source::{Capabilities, Capability, RawSource, Source};
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
 
-/// What reth serves (measured): the native BAL rung, traces, a 10,064-block
-/// state window, WS heads; no system transactions (Ethereum has none).
+/// What the mainnet source serves (measured): traces (the exhaustive rung;
+/// the remote archive refuses the native BAL method, and the trace rung has
+/// been the serving one since the provider era), an archive-deep state
+/// window, WS heads; no system transactions (Ethereum has none).
 pub(crate) fn declared() -> Capabilities {
     Capabilities::of([
-        Capability::NativeBal,
         Capability::Traces,
         Capability::Historical,
         Capability::HeadsWs,
@@ -259,7 +260,6 @@ mod tests {
         assert_eq!(
             declared(),
             Capabilities::of([
-                Capability::NativeBal,
                 Capability::Traces,
                 Capability::Historical,
                 Capability::HeadsWs,

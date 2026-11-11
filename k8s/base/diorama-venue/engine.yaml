@@ -36,7 +36,7 @@ spec:
         - name: ghcr-diorama
       containers:
         - name: engine
-          image: ghcr.io/herodotusdev/diorama-venue-engine:v19
+          image: ghcr.io/herodotusdev/diorama-venue-engine:v20
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The wiring the instance TOML references as ${...} (HL_RPC_URLS,
