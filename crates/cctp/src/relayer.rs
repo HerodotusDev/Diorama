@@ -418,8 +418,18 @@ impl Relayer {
             // A deterministic hook failure parks the record (the burn is still unspent,
             // so an operator can fix the hook and `/v2/reattest`); a transport failure
             // retries without parking.
-            match crate::hook::simulate_relay(&chain.rpc, target, &record.message, &attestation)
-                .await
+            // The simulation lands as the relay wallet itself: the wrapper's
+            // `relay` is owner-gated, and the from-less eth_call form
+            // answers as `0x0` (measured live: every preflight reverted
+            // `Ownable: caller is not the owner`).
+            match crate::hook::simulate_relay(
+                &chain.rpc,
+                self.sender.address(),
+                target,
+                &record.message,
+                &attestation,
+            )
+            .await
             {
                 Ok((true, true, _)) => {}
                 Ok((relay_success, hook_success, data)) => {

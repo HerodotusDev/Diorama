@@ -101,11 +101,13 @@ pub(crate) fn relay_calldata(message: &[u8], attestation: &[u8]) -> Bytes {
 /// hookSuccess, hookReturnData)` is the wrapper's own report.
 pub async fn simulate_relay(
     rpc: &diorama_anvil::Rpc,
+    from: alloy_primitives::Address,
     wrapper: Address,
     message: &[u8],
     attestation: &[u8],
 ) -> Result<(bool, bool, Bytes)> {
-    rpc.call_decode(
+    rpc.call_decode_from(
+        from,
         wrapper,
         &ICCTPHookWrapper::relayCall {
             message: Bytes::copy_from_slice(message),

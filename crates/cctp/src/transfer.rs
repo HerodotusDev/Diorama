@@ -580,10 +580,15 @@ impl TxSender {
             request = request.to(to);
         }
         let estimate: U64 = rpc.call("eth_estimateGas", (request,)).await?;
-        // The node's estimate is the full transaction limit: it already
-        // includes the intrinsic gas and the call's own execution. A margin
-        // or an added 21,000 would be a number the node did not measure.
-        Ok(estimate.to::<u64>())
+        // The estimate is the execution's floor, not its ceiling: on a
+        // forked chain the state moves between the estimate and the send
+        // (the mirror applies blocks in between), and a tight limit lets
+        // the tx run dry mid-flow — measured live: a relay tx whose gas ==
+        // gasUsed minted to the hook wrapper and starved the hook, the
+        // wrapper's catch-all consuming the nonce. 20% rides the node's
+        // own measure; the tx pays only the gas it uses.
+        let estimate = estimate.to::<u64>() + estimate.to::<u64>() / 5;
+        Ok(estimate)
     }
 
     /// Whether the tx is still in the pool. `false` + no receipt = the tx was
