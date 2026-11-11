@@ -13,7 +13,7 @@ metadata:
   name: anvil-v
   labels:
     app.kubernetes.io/name: anvil-v
-    app.kubernetes.io/part-of: diorama-venue
+    app.kubernetes.io/part-of: daloc-diorama-venue
 spec:
   replicas: 1
   strategy:
@@ -25,10 +25,15 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: anvil-v
-        app.kubernetes.io/part-of: diorama-venue
+        app.kubernetes.io/part-of: daloc-diorama-venue
     spec:
       # Give anvil time to shut down cleanly on SIGTERM.
       terminationGracePeriodSeconds: 90
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       initContainers:
         # Resolve a *fresh* pin on every start, like T: the source serves
         # `latest` at archive depth, so a restart re-forks at a current block
@@ -199,7 +204,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: anvil-v
-  labels: { app.kubernetes.io/name: anvil-v, app.kubernetes.io/part-of: diorama-venue }
+  labels: { app.kubernetes.io/name: anvil-v, app.kubernetes.io/part-of: daloc-diorama-venue }
 spec:
   selector: { app.kubernetes.io/name: anvil-v }
   ports:

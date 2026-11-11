@@ -8,10 +8,10 @@
 #   direct  (BRIDGE_CTRL_URL set): the scratch stack's URLs — BRIDGE_CTRL_URL,
 #           BRIDGE_IRIS_URL, T_URL, V_URL, ENGINE_T_URL, ENGINE_V_URL,
 #           SIM_INFO, SIM_CTRL — no kubectl;
-#   cluster (default): the diorama-venue namespace, every call exec'd from the
+#   cluster (default): the daloc-diorama-venue namespace, every call exec'd from the
 #           cctp-bridge pod. From there the same-namespace services resolve by
 #           name (anvil-v, engine, venue-sim) and T resolves cross-namespace
-#           (anvil-t.diorama-mainnet.svc — the same value the venue's ConfigMap
+#           (anvil-t.daloc-diorama-mainnet.svc — the same value the venue's ConfigMap
 #           carries as T_RPC_URL). The engines are driven through `cget`/
 #           `cpost` with explicit URLs (the family must reach *two* engines);
 #           lib-venue's `eget`/`epost` doors are inert here.
@@ -19,7 +19,7 @@
 # lib-venue.sh (sourced below) owns the venue-shaped gates the family shares:
 # the counters, `json`, the simulator doors (`sipost`/`spost`/`smetrics`), the
 # served-identity check (`identity_ok`) and `flatten_coin`.
-NS="${NS:-diorama-cctp}"
+NS="${NS:-daloc-diorama-cctp}"
 CAST="${CAST:-cast}"
 
 # The venue lib picks its mode from ENGINE_URL; the bridge family keys on
@@ -62,16 +62,16 @@ else
   # The bridge now runs in its own namespace: every peer is addressed by its
   # fully-qualified Service name, never a short name that only worked when the
   # bridge shared the venue's namespace.
-  SRC_URL="http://anvil-t.diorama-mainnet.svc:8545"
-  DST_URL="http://anvil-v.diorama-venue.svc:8545"
-  SRC_ENGINE="http://engine.diorama-mainnet.svc:8080"
-  DST_ENGINE="http://engine.diorama-venue.svc:8080"
+  SRC_URL="http://anvil-t.daloc-diorama-mainnet.svc:8545"
+  DST_URL="http://anvil-v.daloc-diorama-venue.svc:8545"
+  SRC_ENGINE="http://engine.daloc-diorama-mainnet.svc:8080"
+  DST_ENGINE="http://engine.daloc-diorama-venue.svc:8080"
   # `lib-venue.sh`'s simulator doors use short names; rebind them to the
   # venue namespace so the CCTP scripts work from the bridge's namespace.
-  sget()   { exec_pod curl -s --fail-with-body -m 30 "http://venue-sim.diorama-venue.svc:8090$1"; }
-  sipost() { exec_pod curl -s --fail-with-body -m 30 -X POST "http://venue-sim.diorama-venue.svc:8090$1" -H 'Content-Type: application/json' -d "$2"; }
-  spost()  { exec_pod curl -s --fail-with-body -m 30 -X POST "http://venue-sim.diorama-venue.svc:8091$1" -H 'Content-Type: application/json' -d "$2"; }
-  smetrics() { exec_pod curl -s --fail-with-body -m 30 "http://venue-sim.diorama-venue.svc:8091/metrics"; }
+  sget()   { exec_pod curl -s --fail-with-body -m 30 "http://venue-sim.daloc-diorama-venue.svc:8090$1"; }
+  sipost() { exec_pod curl -s --fail-with-body -m 30 -X POST "http://venue-sim.daloc-diorama-venue.svc:8090$1" -H 'Content-Type: application/json' -d "$2"; }
+  spost()  { exec_pod curl -s --fail-with-body -m 30 -X POST "http://venue-sim.daloc-diorama-venue.svc:8091$1" -H 'Content-Type: application/json' -d "$2"; }
+  smetrics() { exec_pod curl -s --fail-with-body -m 30 "http://venue-sim.daloc-diorama-venue.svc:8091/metrics"; }
 fi
 
 # The bridge's own verbs, one home each. `AMOUNT` is the family's shared

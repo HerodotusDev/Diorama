@@ -7,7 +7,7 @@ kind: ConfigMap
 metadata:
   name: diorama-config
   labels:
-    app.kubernetes.io/part-of: diorama-venue
+    app.kubernetes.io/part-of: daloc-diorama-venue
 data:
   # The one HyperEVM URL list. The engine's read pool starts at a random
   # healthy entry, fails over on a transport/throttle/5xx fault, and cools a
@@ -23,7 +23,12 @@ data:
   # historical storage, not only the head: the public free-plan endpoints
   # rate-limit a storage read at the pin (measured 2026-11-01, CCTP wiring
   # boot). The engine's read pool uses the rest as failover.
-  HL_RPC_URLS: "https://rpc.hyperlend.finance/archive,https://rpc.hyperliquid.xyz/evm,https://rpc.hypurrscan.io,https://hyperliquid-json-rpc.stakely.io,https://hyperliquid.api.onfinality.io/evm/public"
+  # Pool order matters: the first entry is anvil-v's fork source and the
+  # engine read pool's primary. Measured 2026-11-09: hyperlend/archive
+  # degraded (per-window compose 2.3s -> 8-13s, venue follow lag grew to
+  # ~4,800 blocks), so the fast official endpoint leads and the degraded
+  # one rides last as backup.
+  HL_RPC_URLS: "https://rpc.hyperliquid.xyz/evm,https://rpc.hypurrscan.io,https://hyperliquid-json-rpc.stakely.io,https://hyperliquid.api.onfinality.io/evm/public,https://rpc.hyperlend.finance/archive"
 
   # The venue's market plane. Both are URL lists in the instance's
   # [endpoints] groups; the env carries the deployment values, never a second
@@ -36,9 +41,9 @@ data:
   ENGINE_ADMIN_URL: "http://engine:8080"
 
   # The Ethereum fork the CCTP bridge burns on: anvil-t lives in the
-  # diorama-mainnet namespace (the venue namespace has no T of its own), so the
-  # bridge reaches it over cross-namespace service DNS.
-  T_RPC_URL: "http://anvil-t.diorama-mainnet.svc.cluster.local:8545"
+  # daloc-diorama-mainnet namespace (the venue namespace has no T of its own),
+  # so the bridge reaches it over cross-namespace service DNS.
+  T_RPC_URL: "http://anvil-t.daloc-diorama-mainnet.svc.cluster.local:8545"
 
   # State roots on the pods' own PVCs (paths, not claims).
   STATE_DIR: "/state"

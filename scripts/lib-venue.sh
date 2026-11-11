@@ -9,7 +9,7 @@
 # script that supports it):
 #   direct  (ENGINE_URL set): the scratch stack's URLs — ENGINE_URL, V_URL,
 #           SIM_INFO, SIM_CTRL — no kubectl;
-#   cluster (default): the diorama-venue namespace, every call exec'd from the
+#   cluster (default): the daloc-diorama-venue namespace, every call exec'd from the
 #           venue engine pod (cluster-internal service names — the same
 #           transport the engine itself uses).
 #
@@ -21,7 +21,7 @@
 # eth_sendTransaction; the engine's admin reads are /status + /admin/*; the
 # simulator's info plane (8090) serves daloc's shapes and its control plane
 # (8091) the /control/* verbs.
-NS="${NS:-diorama-venue}"
+NS="${NS:-daloc-diorama-venue}"
 CAST="${CAST:-cast}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib-common.sh"

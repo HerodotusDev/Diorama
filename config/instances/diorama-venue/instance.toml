@@ -6,7 +6,7 @@
 # `@name` and are expanded from `[endpoints]` before validation.
 [instance]
 name = "diorama-venue"
-namespace = "diorama-venue"
+namespace = "daloc-diorama-venue"
 profile = "venue"
 project = "daloc"
 

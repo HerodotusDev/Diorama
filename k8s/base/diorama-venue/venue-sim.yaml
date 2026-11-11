@@ -14,7 +14,7 @@ metadata:
   name: venue-sim
   labels:
     app.kubernetes.io/name: venue-sim
-    app.kubernetes.io/part-of: diorama-venue
+    app.kubernetes.io/part-of: daloc-diorama-venue
 spec:
   replicas: 1
   strategy:
@@ -26,12 +26,17 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: venue-sim
-        app.kubernetes.io/part-of: diorama-venue
+        app.kubernetes.io/part-of: daloc-diorama-venue
     spec:
       terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       containers:
         - name: venue-sim
-          image: localhost/diorama-venue-sim:v19
+          image: ghcr.io/herodotusdev/diorama-venue-sim:v18
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The same `envFrom` mechanism as the engines: the ConfigMap carries
@@ -83,7 +88,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: venue-sim
-  labels: { app.kubernetes.io/name: venue-sim, app.kubernetes.io/part-of: diorama-venue }
+  labels: { app.kubernetes.io/name: venue-sim, app.kubernetes.io/part-of: daloc-diorama-venue }
 spec:
   selector: { app.kubernetes.io/name: venue-sim }
   ports:

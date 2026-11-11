@@ -3,7 +3,9 @@ SHELL := /bin/bash
 # INSTANCE selects the mirror: the namespace, the kustomize overlay, the
 # instance TOML and the engine image all follow from it.
 INSTANCE       ?= diorama-mainnet
-NS             := $(INSTANCE)
+# The cluster is a Capsule tenant: every namespace MUST carry the `daloc-`
+# prefix. The instance's directory/overlay names stay unprefixed.
+NS             := daloc-$(INSTANCE)
 OVERLAY        := k8s/overlays/$(INSTANCE)
 BOOTSTRAP      := k8s/bootstrap
 KUBECTL        := kubectl -n $(NS)
@@ -13,7 +15,7 @@ KUBECTL        := kubectl -n $(NS)
 # diorama-mainnet runs the ethereum engine, diorama-venue the venue engine: one
 # deployment shape per profile, one image per binary.
 ENGINE_MANIFEST := k8s/base/$(INSTANCE)/engine.yaml
-ENGINE_REF      := $(shell grep -ohE 'image: localhost/[^ ]+' $(ENGINE_MANIFEST) | head -1 | awk '{print $$2}')
+ENGINE_REF      := $(shell grep -ohE 'image: ghcr.io/herodotusdev/[^ ]+' $(ENGINE_MANIFEST) | head -1 | awk '{print $$2}')
 ENGINE_IMAGE    := $(word 1,$(subst :, ,$(ENGINE_REF)))
 ENGINE_TAG      := $(lastword $(subst :, ,$(ENGINE_REF)))
 ENGINE_BIN      := $(notdir $(ENGINE_IMAGE))
@@ -29,20 +31,10 @@ NS_MANIFEST := $(OVERLAY)/namespace.yaml
 
 ##@ Cluster
 
-ns: ## Create namespace + StorageClass (idempotent)
+ns: ## Create the namespace (idempotent)
 	kubectl apply -f $(NS_MANIFEST)
-	kubectl apply -f k8s/base/shared/storageclass.yaml
 
-mainnet-secrets: ## Create the reth<->lighthouse JWT secret if missing (mainnet namespace)
-	@NS=diorama-mainnet; \
-	if kubectl -n $$NS get secret reth-jwt >/dev/null 2>&1; then \
-	  echo "secret reth-jwt already exists in $$NS (left untouched)"; \
-	else \
-	  kubectl -n $$NS create secret generic reth-jwt --from-literal=jwt.hex="$$(openssl rand -hex 32)" >/dev/null; \
-	  echo "created secret reth-jwt in $$NS"; \
-	fi
-
-CCTP_NS      ?= diorama-cctp
+CCTP_NS      ?= daloc-diorama-cctp
 CCTP_OVERLAY := k8s/overlays/diorama-cctp
 
 # The daloc-monorepo sibling owns the gateway stack and the end-to-end DOD
@@ -57,7 +49,7 @@ DALOC_RPC_999      ?= http://127.0.0.1:31545
 ALLOW_TEST_POSTURE ?= 1
 
 venue-secrets: ## Create the venue-side secrets (no CCTP key: the bridge owns its own)
-	@NS=diorama-venue; \
+	@NS=daloc-diorama-venue; \
 	if kubectl -n $$NS get secret cctp-relay-key >/dev/null 2>&1; then \
 	  echo "legacy cctp-relay-key still exists in $$NS (the standalone bridge uses $(CCTP_NS))"; \
 	fi
@@ -78,30 +70,12 @@ apply: ## Apply the selected instance's stack (INSTANCE selects the overlay)
 diff: ## Show what `make apply` would change
 	kubectl diff -k $(OVERLAY) || true
 
-delete: ## Delete the namespace (data survives: StorageClass is reclaimPolicy Retain)
+delete: ## Delete the namespace
 	kubectl delete namespace $(NS) --ignore-not-found
 
 ##@ Bootstrap
 
-mainnet-snapshot: ## Download the reth snapshot into the reth PVC (scales reth down first)
-	kubectl -n diorama-mainnet scale deploy/reth --replicas=0 2>/dev/null || true
-	kubectl -n diorama-mainnet delete job reth-snapshot --ignore-not-found
-	kubectl apply -f $(BOOTSTRAP)/snapshot-job.yaml
-	@# The wait bound is the Job's own spec.activeDeadlineSeconds, not a second
-	@# hardcoded number: the manifest already owns how long the download may run.
-	@deadline=$$(kubectl -n diorama-mainnet get job reth-snapshot -o jsonpath='{.spec.activeDeadlineSeconds}'); \
-	 test -n "$$deadline" || { echo "reth-snapshot Job declares no activeDeadlineSeconds" >&2; exit 1; }; \
-	 echo "waiting for snapshot to finish (Job deadline $${deadline}s; resumable)..."; \
-	 kubectl -n diorama-mainnet wait --for=condition=complete job/reth-snapshot --timeout="$${deadline}s" || \
-		{ echo "not complete within the Job's own deadline ($${deadline}s) - check: make mainnet-snapshot-status"; exit 1; }
-
-mainnet-snapshot-status: ## Show snapshot job status + progress
-	@$(KUBECTL) get job reth-snapshot 2>/dev/null || echo "no snapshot job"
-	@$(KUBECTL) logs job/reth-snapshot --tail=3 2>/dev/null || true
-
-mainnet-bootstrap: ns mainnet-secrets images ## First-time setup (mainnet): namespace, secrets, images, snapshot, full stack
-	kubectl apply -f k8s/base/diorama-mainnet/pvcs.yaml
-	$(MAKE) mainnet-snapshot
+mainnet-bootstrap: ns ## First-time setup (mainnet): namespace, full stack
 	$(MAKE) apply
 	@echo "bootstrap complete. watch: make status"
 
@@ -232,19 +206,18 @@ logs-%: ## Tail logs of one component, e.g. make logs-engine / logs-reth / logs-
 # follow INSTANCE): a `mainnet-*` target is about the mainnet mirror, a
 # `venue-*` target about the venue's.
 mainnet-smoke: ## End-to-end smoke test (mainnet)
-	NS=diorama-mainnet ./scripts/mainnet-smoke.sh
+	NS=daloc-diorama-mainnet ./scripts/mainnet-smoke.sh
 
 venue-smoke: ## End-to-end smoke test of the Venue Mirror (V, engine, sim, bridge)
-	NS=diorama-venue ./scripts/venue-smoke.sh
+	NS=daloc-diorama-venue ./scripts/venue-smoke.sh
 
-venue-bootstrap: ns venue-secrets images ## First-time setup (venue): namespace, secrets, images, full stack
+venue-bootstrap: ns venue-secrets ## First-time setup (venue): namespace, secrets, full stack
 	kubectl apply -f k8s/base/diorama-venue/pvcs.yaml
 	$(MAKE) INSTANCE=diorama-venue apply
 	@echo "venue bootstrap complete. watch: make INSTANCE=diorama-venue status"
 
-cctp-ns: ## Create the bridge namespace + StorageClass
+cctp-ns: ## Create the bridge namespace
 	kubectl apply -f $(CCTP_OVERLAY)/namespace.yaml
-	kubectl apply -f k8s/base/shared/storageclass.yaml
 
 cctp-apply: ## Apply the standalone CCTP bridge instance
 	kubectl apply -k $(CCTP_OVERLAY)
@@ -259,21 +232,21 @@ cctp-status: ## Pods, PVC and health of the standalone bridge
 cctp-logs: ## Tail the standalone bridge's logs
 	kubectl -n $(CCTP_NS) logs -f deploy/cctp-bridge --tail=100
 
-cctp-bootstrap: cctp-ns cctp-secrets images ## First-time setup: namespace, secret, images, bridge
+cctp-bootstrap: cctp-ns cctp-secrets ## First-time setup: namespace, secret, bridge
 	$(MAKE) cctp-apply
 	@echo "cctp bootstrap complete. watch: make cctp-status"
 
 venue-repin: ## Re-pin V to the fork source's latest block (the engine's /admin/epoch)
-	kubectl -n diorama-venue exec deploy/engine -- curl -sf -m 90 -X POST localhost:8080/admin/epoch
+	kubectl -n daloc-diorama-venue exec deploy/engine -- curl -sf -m 90 -X POST localhost:8080/admin/epoch
 
 venue-scenario: ## The venue epoch scenario (same-pin restore, new-pin epoch, driver liveness)
-	NS=diorama-venue ./scripts/venue-scenario.sh
+	NS=daloc-diorama-venue ./scripts/venue-scenario.sh
 
 venue-proof: ## The venue capability proof (mint, sim deal, crash⇒liquidation, bridge round-trip, block production)
-	NS=diorama-venue ./scripts/venue-proof.sh
+	NS=daloc-diorama-venue ./scripts/venue-proof.sh
 
 venue-order-proof: ## The venue order-lane proof (fills vs the real book, the market-impact invariants, hand-back)
-	NS=diorama-venue ./scripts/venue-order-proof.sh
+	NS=daloc-diorama-venue ./scripts/venue-order-proof.sh
 
 cctp-smoke: ## The CCTP bridge smoke (health, store coherence, metric set)
 	NS=$(CCTP_NS) ./scripts/cctp-smoke.sh
@@ -294,28 +267,28 @@ daloc-portfolio-dod: ## The portfolio cardinality DOD on the live daloc stack (s
 	$(abspath $(DALOC_REPO))/tools/e2e/portfolio-dod.sh
 
 portfolio-sim: ## The portfolio simulation: a delta-neutral basis book across both mirrors (carry + shock + capital efficiency)
-	NS=diorama-venue ./scripts/portfolio-sim.sh
+	NS=daloc-diorama-venue ./scripts/portfolio-sim.sh
 
 basis-capture: ## The live T-vs-V basis series, traded: the capture + the live carry, the identity checked
-	NS=diorama-venue ./scripts/basis-capture.sh
+	NS=daloc-diorama-venue ./scripts/basis-capture.sh
 
 portfolio-reaction: ## A held portfolio vs another account's impact: both directions, the thresholds, the hedge
-	NS=diorama-venue ./scripts/portfolio-reaction.sh
+	NS=daloc-diorama-venue ./scripts/portfolio-reaction.sh
 
 crosschain-margin: ## The crosschain margin book: bridged collateral, funding costs, served unrealized PnL, the loop closed
-	NS=diorama-venue ./scripts/crosschain-margin.sh
+	NS=daloc-diorama-venue ./scripts/crosschain-margin.sh
 
 crosschain-recovery: ## The deeper crosschain reads: the funding sign flip + the collateral's way back after a forced close
-	NS=diorama-venue ./scripts/crosschain-recovery.sh
+	NS=daloc-diorama-venue ./scripts/crosschain-recovery.sh
 
 capital-frontier: ## The capital-efficiency frontier: the liquidation distance measured at each leverage
-	NS=diorama-venue ./scripts/capital-frontier.sh
+	NS=daloc-diorama-venue ./scripts/capital-frontier.sh
 
 hedged-book: ## The hedged book: same collateral and gross exposure as the unhedged, flat through a 60% crash
-	NS=diorama-venue ./scripts/hedged-book.sh
+	NS=daloc-diorama-venue ./scripts/hedged-book.sh
 
 impact-scenarios: ## The impact ladder: a whale moves the book and the mark; the portfolio's reaction measured
-	NS=diorama-venue ./scripts/impact-scenarios.sh
+	NS=daloc-diorama-venue ./scripts/impact-scenarios.sh
 
 shadow-audit: ## The shadowing audit: deliberate anvil states vs the COW shadow, both mirrors
 	./scripts/shadow-audit.sh
@@ -344,26 +317,26 @@ attest: ## The behavioral attestation: the pass over both mirrors, then the asse
 
 
 mainnet-scenario: ## Scenario test: self-containment, live parity (T vs reth), devnet workflow
-	NS=diorama-mainnet ./scripts/mainnet-scenario.sh
+	NS=daloc-diorama-mainnet ./scripts/mainnet-scenario.sh
 
 mainnet-proof: ## Capability proof: live fork, mint funds, real Aave/Uniswap/liquidation interaction
-	NS=diorama-mainnet ./scripts/mainnet-proof.sh
+	NS=daloc-diorama-mainnet ./scripts/mainnet-proof.sh
 
 mainnet-product-sim: ## Product simulation: levered position, live-data sampling, bot liquidation on T
-	NS=diorama-mainnet ./scripts/mainnet-product-sim.sh
+	NS=daloc-diorama-mainnet ./scripts/mainnet-product-sim.sh
 
 mainnet-closure-check: ## Audit the watchlist closure: every storage dep of every market-data view
-	NS=diorama-mainnet ./scripts/mainnet-closure-check.sh
+	NS=daloc-diorama-mainnet ./scripts/mainnet-closure-check.sh
 
 
 mainnet-selftest: ## Run the engine selftest Job (public RPC + scratch anvil; no reth needed)
-	kubectl -n diorama-mainnet delete job mainnet-selftest --ignore-not-found
+	kubectl -n daloc-diorama-mainnet delete job mainnet-selftest --ignore-not-found
 	kubectl apply -f $(BOOTSTRAP)/mainnet-selftest-job.yaml
 	@# The Job never reaches Complete: its anvil sidecar is a long-running
 	@# server. The engine container prints the verdict, so poll that container
 	@# and gate on `== selftest PASSED ==` instead of waiting on the Job.
 	@for _ in $$(seq 1 450); do \
-	  out=$$(kubectl -n diorama-mainnet logs job/mainnet-selftest -c engine 2>/dev/null || true); \
+	  out=$$(kubectl -n daloc-diorama-mainnet logs job/mainnet-selftest -c engine 2>/dev/null || true); \
 	  case "$$out" in \
 	    *"== selftest PASSED =="*) printf '%s\n' "$$out"; exit 0 ;; \
 	    *"== selftest FAILED =="*) printf '%s\n' "$$out"; exit 1 ;; \
@@ -373,11 +346,11 @@ mainnet-selftest: ## Run the engine selftest Job (public RPC + scratch anvil; no
 	echo "mainnet-selftest produced no verdict within 900s" >&2; exit 1
 
 venue-selftest: ## Run the venue selftest Job (public RPC + scratch anvil; no cluster stack needed)
-	kubectl -n diorama-venue delete job venue-selftest --ignore-not-found
+	kubectl -n daloc-diorama-venue delete job venue-selftest --ignore-not-found
 	kubectl apply -f $(BOOTSTRAP)/venue-selftest-job.yaml
 	@# Same shape as mainnet-selftest: poll the engine container's verdict.
 	@for _ in $$(seq 1 450); do \
-	  out=$$(kubectl -n diorama-venue logs job/venue-selftest -c engine 2>/dev/null || true); \
+	  out=$$(kubectl -n daloc-diorama-venue logs job/venue-selftest -c engine 2>/dev/null || true); \
 	  case "$$out" in \
 	    *"== selftest PASSED =="*) printf '%s\n' "$$out"; exit 0 ;; \
 	    *"== selftest FAILED =="*) printf '%s\n' "$$out"; exit 1 ;; \
@@ -387,7 +360,7 @@ venue-selftest: ## Run the venue selftest Job (public RPC + scratch anvil; no cl
 	echo "venue-selftest produced no verdict within 900s" >&2; exit 1
 
 logs-check: ## Deep log scan: warnings/errors per component (last 30 min, normalized)
-	@for c in reth lighthouse anvil-t engine; do \
+	@for c in anvil-t engine; do \
 	  printf "== %s\n" "$$c"; \
 	  kubectl -n $(NS) logs deploy/$$c --since=30m 2>/dev/null \
 	    | grep -aE "WARN|ERROR|\"level\":\"(WARN|ERROR)\"" \
@@ -395,40 +368,22 @@ logs-check: ## Deep log scan: warnings/errors per component (last 30 min, normal
 	    | sort | uniq -c | sort -rn | head -6; \
 	done
 
-mainnet-backfill: ## Show the CL backfill progress and the lighthouse datadir sizes
-	@$(KUBECTL) logs deploy/lighthouse --tail=200 2>/dev/null \
-	  | jq -r 'select(.msg != null and (.msg|test("historical";"i"))) | "backfill: distance=\(.distance // "?") speed=\(.speed // "?") est=\(.est_time // "?")"' 2>/dev/null | tail -1
-	@sudo sh -c 'du -sh /var/lib/rancher/k3s/storage/pvc-*_$(NS)_lighthouse-data/beacon/* 2>/dev/null | sort -h | tail -4'
-
-mainnet-prune-blobs: ## Reclaim backfilled blob storage (needs the CL stopped; safe for the mirror)
-	@echo "scaling lighthouse down (the prune needs the database lock)..."
-	kubectl -n $(NS) scale deploy/lighthouse --replicas=0
-	kubectl -n $(NS) wait --for=delete pod -l app.kubernetes.io/name=lighthouse --timeout=180s || true
-	kubectl -n $(NS) delete job lighthouse-prune-blobs --ignore-not-found
-	kubectl apply -f $(BOOTSTRAP)/prune-blobs-job.yaml
-	kubectl -n $(NS) wait --for=condition=complete job/lighthouse-prune-blobs --timeout=3600s || true
-	$(KUBECTL) logs job/lighthouse-prune-blobs --tail=20 || true
-	kubectl -n $(NS) delete job lighthouse-prune-blobs --ignore-not-found
-	kubectl -n $(NS) scale deploy/lighthouse --replicas=1
-	kubectl -n $(NS) rollout status deploy/lighthouse --timeout=300s
-	@$(MAKE) --no-print-directory mainnet-backfill
-
 pin-show: ## Show the resolved fork pins of the instance's anvils
 	@for c in $(ANVILS); do \
 		printf "%s pin: " $$c; $(KUBECTL) exec deploy/$$c -- cat /state/pin 2>/dev/null || echo "(not resolved yet)"; \
 	done
 
 mainnet-repin: ## Re-pin drill: wipe the pin, restart the anvil (engine auto-rebases; a new epoch starts)
-	kubectl -n diorama-mainnet scale deploy/anvil-t --replicas=0
+	kubectl -n daloc-diorama-mainnet scale deploy/anvil-t --replicas=0
 	# Wait until the pod is really gone before wiping: the wipe must not
 	# race a container that is still shutting down (its init container
 	# re-resolves the pin on the next start).
-	kubectl -n diorama-mainnet wait --for=delete pod -l app.kubernetes.io/name=anvil-t --timeout=180s || true
-	kubectl -n diorama-mainnet delete job repin-wipe --ignore-not-found
+	kubectl -n daloc-diorama-mainnet wait --for=delete pod -l app.kubernetes.io/name=anvil-t --timeout=180s || true
+	kubectl -n daloc-diorama-mainnet delete job repin-wipe --ignore-not-found
 	kubectl apply -f $(BOOTSTRAP)/repin-job.yaml
-	kubectl -n diorama-mainnet wait --for=condition=complete job/repin-wipe --timeout=300s
-	kubectl -n diorama-mainnet delete job repin-wipe --ignore-not-found
-	kubectl -n diorama-mainnet scale deploy/anvil-t --replicas=1
+	kubectl -n daloc-diorama-mainnet wait --for=condition=complete job/repin-wipe --timeout=300s
+	kubectl -n daloc-diorama-mainnet delete job repin-wipe --ignore-not-found
+	kubectl -n daloc-diorama-mainnet scale deploy/anvil-t --replicas=1
 	kubectl -n $(NS) rollout status deploy/anvil-t --timeout=600s
 	@echo "re-pinned. engine will rebase automatically on its next poll."
 
@@ -441,10 +396,10 @@ help: ## Show this help
 	@echo
 
 .PHONY: fitness lint design-assertions config-check config-bootstrap ast-scope
-.PHONY: ns mainnet-secrets venue-secrets apply diff delete \
-	mainnet-snapshot mainnet-snapshot-status mainnet-bootstrap venue-bootstrap \
+.PHONY: ns venue-secrets apply diff delete \
+	mainnet-bootstrap venue-bootstrap \
 	images build venue-build mainnet-build cctp-build import deploy-engine test-engine \
 	status logs logs-check check-pins mainnet-smoke venue-smoke venue-repin venue-scenario \
 	venue-proof venue-order-proof venue-selftest cctp-smoke cctp-roundtrip cctp-margin-cycle daloc-portfolio-dod engine-symmetry \
 	mainnet-scenario mainnet-proof mainnet-product-sim mainnet-closure-check \
-	mainnet-selftest mainnet-backfill mainnet-prune-blobs pin-show mainnet-repin help
+	mainnet-selftest pin-show mainnet-repin help

@@ -42,8 +42,8 @@
 set -euo pipefail
 
 CAST="${CAST:-cast}"
-NS_V="${NS_V:-diorama-venue}"
-NS_T="${NS_T:-diorama-mainnet}"
+NS_V="${NS_V:-daloc-diorama-venue}"
+NS_T="${NS_T:-daloc-diorama-mainnet}"
 PROBE_ACCOUNT="${PROBE_ACCOUNT:-0x0000000000000000000000000000000000000a11}"
 DEAL_AMOUNT="${DEAL_AMOUNT:-12345678}"
 COW_WAIT="${COW_WAIT:-50}"
@@ -72,7 +72,7 @@ PROBE_ACCOUNT_B="${PROBE_ACCOUNT_B:-0x0000000000000000000000000000000000000a12}"
 SCAN_SENDER="${SCAN_SENDER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 SCAN_VALUE_WEI="${SCAN_VALUE_WEI:-10000000000000000}"
 USDC_V="0xb88339CB7199b77E23DB6E890353E22632Ba630f"
-SRC_T="http://reth.diorama-mainnet.svc.cluster.local:8545"
+SRC_T="http://reth.daloc-diorama-mainnet.svc.cluster.local:8545"
 SRC_V="https://rpc.hyperliquid.xyz/evm"
 
 pass=0; fail=0

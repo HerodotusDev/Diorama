@@ -17,8 +17,8 @@
 #                                                # USDC); see the deal check.
 set -euo pipefail
 
-NS_T="${NS_T:-diorama-mainnet}"
-NS_V="${NS_V:-diorama-venue}"
+NS_T="${NS_T:-daloc-diorama-mainnet}"
+NS_V="${NS_V:-daloc-diorama-venue}"
 USDC_T="${USDC_T:-0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48}"
 USDC_V="${USDC_V:-0xb88339CB7199B77E23DB6E890353E22632Ba630f}"
 ACCT="${ACCT:-0x00000000000000000000000000000000000000f1}"

@@ -4,8 +4,8 @@
 #
 # The claim is deliberately portable (no `volumeName`): a standalone bridge in
 # a fresh namespace must be able to bind a volume through the StorageClass.
-# The local workshop's pre-bound claim is a deployment overlay concern, not a
-# property every bridge inherits.
+# The cluster's default `local-path` class (a tenant cannot create
+# StorageClasses).
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -14,7 +14,7 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-cctp, app: cctp-bridge }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: diorama-retain
+  storageClassName: local-path
   resources:
     requests:
-      storage: 5Gi
+      storage: 2Gi

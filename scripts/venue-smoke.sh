@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for the Venue Mirror stack. Run from the repo root:
-#   make venue-smoke        (or NS=diorama-venue ./scripts/venue-smoke.sh)
+#   make venue-smoke        (or NS=daloc-diorama-venue ./scripts/venue-smoke.sh)
 #
 # Executes curl+jq from inside the venue engine pod so every check talks to the
 # cluster-internal service names (the same way the engine does). The mainnet
@@ -10,7 +10,7 @@
 # parity.
 set -euo pipefail
 
-NS="${NS:-diorama-venue}"
+NS="${NS:-daloc-diorama-venue}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib-common.sh"
 

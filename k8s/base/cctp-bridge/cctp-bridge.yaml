@@ -17,7 +17,7 @@ metadata:
   name: cctp-bridge
   labels:
     app.kubernetes.io/name: cctp-bridge
-    app.kubernetes.io/part-of: diorama-cctp
+    app.kubernetes.io/part-of: daloc-diorama-cctp
 spec:
   replicas: 1
   strategy:
@@ -29,12 +29,17 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: cctp-bridge
-        app.kubernetes.io/part-of: diorama-cctp
+        app.kubernetes.io/part-of: daloc-diorama-cctp
     spec:
       terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       containers:
         - name: cctp-bridge
-          image: localhost/diorama-cctp-bridge:sweep3evt
+          image: ghcr.io/herodotusdev/diorama-cctp-bridge:v18
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The bridge's own wiring ConfigMap (cctp-config), not the venue's:
@@ -96,7 +101,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: cctp-bridge
-  labels: { app.kubernetes.io/name: cctp-bridge, app.kubernetes.io/part-of: diorama-cctp }
+  labels: { app.kubernetes.io/name: cctp-bridge, app.kubernetes.io/part-of: daloc-diorama-cctp }
 spec:
   selector: { app.kubernetes.io/name: cctp-bridge }
   ports:

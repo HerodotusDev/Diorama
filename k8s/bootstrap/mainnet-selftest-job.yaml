@@ -1,19 +1,18 @@
 # Engine self test: diff-applies real mainnet blocks onto one scratch Anvil
-# fork of a public RPC. Validates the apply pipeline before the local reth
-# fork source is synced (and on demand afterwards).
+# fork of a public RPC. Validates the apply pipeline against the same remote
+# source shape the deployed stack uses (Alchemy).
 #
-# Test-only external dependency: a public RPC. The deployed stack is
-# self-contained (see docs/ARCHITECTURE.md, "Source liveness").
+# Test-only external dependency: a public RPC.
 #
 #   make mainnet-selftest
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: mainnet-selftest
-  namespace: diorama-mainnet
+  namespace: daloc-diorama-mainnet
   labels:
     app.kubernetes.io/name: mainnet-selftest
-    app.kubernetes.io/part-of: diorama-mainnet
+    app.kubernetes.io/part-of: daloc-diorama-mainnet
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 7200
@@ -21,9 +20,14 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: mainnet-selftest
-        app.kubernetes.io/part-of: diorama-mainnet
+        app.kubernetes.io/part-of: daloc-diorama-mainnet
     spec:
       restartPolicy: Never
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       initContainers:
         - name: resolve-pin
           image: docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
@@ -45,15 +49,23 @@ spec:
               echo "selftest pin=$PIN (head=$HEAD offset=$OFFSET)"
           env:
             # Trace-capable endpoint: the self test's diff-apply step needs
-            # debug_traceBlockByNumber with prestateTracer (publicnode does not
-            # serve it; local reth does, which is what production uses).
-            - { name: MAINNET_RPC, value: "https://eth.drpc.org" }
+            # debug_traceBlockByNumber with prestateTracer, and its drift
+            # sample rides an 8-item batch — the production source (Alchemy)
+            # serves both; the free drpc plan refuses batches over 3
+            # (measured: sampled 0/8, selftest failed on it).
+            - { name: ALCHEMY_KEY, valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } } }
+            - { name: MAINNET_RPC, value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)" }
             # 16 blocks back: well inside finality, still forkable on any provider.
             - { name: OFFSET, value: "16" }
           volumeMounts:
             - { name: shared, mountPath: /shared }
-      containers:
+        # A native sidecar (init container, restartPolicy Always): it starts
+        # after resolve-pin, lives until the main container exits, and is
+        # terminated with the pod — without it the job can never reach
+        # `Complete` (the engine finishes in ~90s; a plain anvil container
+        # would run forever and hold the pod at 1/2, measured).
         - name: anvil-t
+          restartPolicy: Always
           image: ghcr.io/foundry-rs/foundry:v1.8.6@sha256:4a16a86f41d30418fbdca47ce2868121bbb0aeaa0a34bde2dd1e2911c4be2464
           command: ["/bin/sh", "-c"]
           args:
@@ -67,14 +79,16 @@ spec:
                 --disable-pool-balance-checks --order fifo --auto-impersonate \
                 --prune-history 1000 --no-rate-limit --no-request-size-limit --no-fork-node-info
           env:
-            - { name: MAINNET_RPC, value: "https://eth.drpc.org" }
+            - { name: ALCHEMY_KEY, valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } } }
+            - { name: MAINNET_RPC, value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)" }
           volumeMounts:
             - { name: shared, mountPath: /shared }
           resources:
             requests: { cpu: "250m", memory: 256Mi }
             limits: { memory: 2Gi }
+      containers:
         - name: engine
-          image: localhost/diorama-mainnet-engine:v1
+          image: ghcr.io/herodotusdev/diorama-mainnet-engine:v18
           imagePullPolicy: IfNotPresent
           args:
             - selftest
@@ -84,7 +98,8 @@ spec:
             - --blocks=2
             - --timeout-secs=300
           env:
-            - { name: MAINNET_RPC, value: "https://eth.drpc.org" }
+            - { name: ALCHEMY_KEY, valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } } }
+            - { name: MAINNET_RPC, value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)" }
           # The instance references ${STATE_DIR} and the rest of the stack's
           # wiring; the selftest only needs them *resolved* (the endpoints come
           # from the CLI), so the deployment's own env ConfigMap serves here —
@@ -99,4 +114,10 @@ spec:
             limits: { memory: 2Gi }
       volumes:
         - { name: shared, emptyDir: {} }
-        - { name: instance, configMap: { name: mainnet-instance } }
+        # The instance ConfigMap is kustomize-generated: its name is
+        # `<name>-<content hash>` and the hash rolls when instance.toml or
+        # the project file changes. After a config change, re-pin this name
+        # from the live deployment:
+        #   kubectl -n daloc-diorama-mainnet get deploy engine \
+        #     -o jsonpath='{.spec.template.spec.volumes[0].configMap.name}'
+        - { name: instance, configMap: { name: mainnet-instance-862dgbfmkm } }

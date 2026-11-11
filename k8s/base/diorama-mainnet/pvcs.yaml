@@ -1,43 +1,13 @@
-# Persistent volumes for the mirror. All use the diorama-retain StorageClass
-# (reclaimPolicy: Retain) so deleting a PVC never destroys the data.
+# Persistent volumes for the mirror. All use the cluster's default
+# `local-path` StorageClass (a tenant cannot create StorageClasses) and are
+# dynamically provisioned (no pre-bound volumeName).
 #
 # This file is the mainnet mirror's claims; the Venue Mirror's live in
 # diorama-venue/pvcs.yaml - one file per mirror, because a kustomize overlay
 # composes whole files and must not declare the other mirror's claims.
 #
-# LOCAL (workshop): re-bound to the volumes a previous run left behind
-# (Released PVs from the pre-rename namespaces). volumeName pre-binds each
-# claim to its existing volume; the StorageClass name is the one those PVs
-# carry (mirror-retain is the same local-path/Retain definition).
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: reth-data
-  labels: { app.kubernetes.io/part-of: diorama-mainnet, app: reth }
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-ba8c5267-0d07-4618-8986-005b66f8f239
-  resources:
-    requests:
-      storage: 400Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: lighthouse-data
-  labels: { app.kubernetes.io/part-of: diorama-mainnet, app: lighthouse }
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-01355a6c-d49c-4ba2-9eb6-a944f73e739a
-  resources:
-    requests:
-      # Data columns (PeerDAS semi-supernode, ~18 day availability window,
-      # ~100 GB) + retained execution payloads (backfill to the weak
-      # subjectivity point) + the beacon DB.
-      storage: 1500Gi
+# NOTE: local-path's reclaimPolicy is Delete - deleting a PVC deletes the
+# underlying data. Back up before destructive namespace surgery.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -46,11 +16,10 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-mainnet, app: anvil-t }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-29d893f7-61dc-42c5-8e31-0bd2adebcf8d
+  storageClassName: local-path
   resources:
     requests:
-      storage: 40Gi
+      storage: 20Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -59,8 +28,7 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-mainnet, app: engine }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-d7e4b239-b6ce-4824-977b-604f02c9321d
+  storageClassName: local-path
   resources:
     requests:
-      storage: 10Gi
+      storage: 5Gi

@@ -14,7 +14,7 @@ name = "diorama-cctp"
 # The bridge is a first-class instance: its own namespace, ConfigMap, Secret
 # and PVC. It reaches the mirror chains cross-namespace; it never rides the
 # venue's namespace or wiring.
-namespace = "diorama-cctp"
+namespace = "daloc-diorama-cctp"
 profile = "cctp"
 project = "daloc"
 

@@ -6,7 +6,7 @@
 # cluster-internal service names (the same way the engine does).
 set -euo pipefail
 
-NS="${NS:-diorama-mainnet}"
+NS="${NS:-daloc-diorama-mainnet}"
 ENGINE_POD_SELECTOR="app.kubernetes.io/name=engine"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib-common.sh"

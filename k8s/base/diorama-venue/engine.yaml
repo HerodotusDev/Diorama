@@ -14,7 +14,7 @@ metadata:
   name: engine
   labels:
     app.kubernetes.io/name: engine
-    app.kubernetes.io/part-of: diorama-venue
+    app.kubernetes.io/part-of: daloc-diorama-venue
 spec:
   replicas: 1
   strategy:
@@ -26,12 +26,17 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: engine
-        app.kubernetes.io/part-of: diorama-venue
+        app.kubernetes.io/part-of: daloc-diorama-venue
     spec:
       terminationGracePeriodSeconds: 30
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       containers:
         - name: engine
-          image: localhost/diorama-venue-engine:v9
+          image: ghcr.io/herodotusdev/diorama-venue-engine:v18
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The wiring the instance TOML references as ${...} (HL_RPC_URLS,
@@ -86,7 +91,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: engine
-  labels: { app.kubernetes.io/name: engine, app.kubernetes.io/part-of: diorama-venue }
+  labels: { app.kubernetes.io/name: engine, app.kubernetes.io/part-of: daloc-diorama-venue }
 spec:
   selector: { app.kubernetes.io/name: engine }
   ports:

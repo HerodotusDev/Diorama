@@ -1,11 +1,10 @@
 # The Venue Mirror instance overlay: the venue base + the instance ConfigMap +
 # the harness NodePorts. The diorama-mainnet overlay is untouched: the two
-# mirrors share the cluster and the diorama-retain StorageClass, not a
-# namespace.
+# mirrors share the cluster, not a namespace.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: diorama-venue
+namespace: daloc-diorama-venue
 
 resources:
   - namespace.yaml

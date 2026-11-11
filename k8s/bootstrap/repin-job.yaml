@@ -12,10 +12,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: repin-wipe
-  namespace: diorama-mainnet
+  namespace: daloc-diorama-mainnet
   labels:
     app.kubernetes.io/name: repin-wipe
-    app.kubernetes.io/part-of: diorama-mainnet
+    app.kubernetes.io/part-of: daloc-diorama-mainnet
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 600
@@ -23,9 +23,12 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: repin-wipe
-        app.kubernetes.io/part-of: diorama-mainnet
+        app.kubernetes.io/part-of: daloc-diorama-mainnet
     spec:
       restartPolicy: Never
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: wipe
           image: docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6

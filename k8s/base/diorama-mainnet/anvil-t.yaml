@@ -13,7 +13,7 @@ metadata:
   name: anvil-t
   labels:
     app.kubernetes.io/name: anvil-t
-    app.kubernetes.io/part-of: diorama-mainnet
+    app.kubernetes.io/part-of: daloc-diorama-mainnet
 spec:
   replicas: 1
   strategy:
@@ -25,10 +25,15 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: anvil-t
-        app.kubernetes.io/part-of: diorama-mainnet
+        app.kubernetes.io/part-of: daloc-diorama-mainnet
     spec:
       # Give anvil time to shut down cleanly on SIGTERM.
       terminationGracePeriodSeconds: 90
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       initContainers:
         # Resolve a *fresh* fork pin on every start. That bounds the
         # post-restart re-fork to FORK_OFFSET (~128 blocks, minutes) instead
@@ -43,9 +48,10 @@ spec:
           args:
             - |
               set -eu
-              # Always wait for reth first, even when the pin is persisted:
-              # anvil forks at start-up, so restarting while reth is restarting
-              # would crash-loop (measured: "failed to fetch network chain ID").
+              # Always probe the fork source first, even when the pin is
+              # persisted: anvil forks at start-up, so restarting while the
+              # source is unreachable would crash-loop (measured: "failed to
+              # fetch network chain ID").
               i=0; HEAD=""
               while [ -z "$HEAD" ] && [ "$i" -lt 240 ]; do
                 HEAD=$(wget -qO- --header='Content-Type: application/json' \
@@ -54,7 +60,7 @@ spec:
                   | sed -n 's/.*"result":"\(0x[0-9a-fA-F]*\)".*/\1/p')
                 [ -n "$HEAD" ] || { i=$((i+1)); sleep 5; }
               done
-              [ -n "$HEAD" ] || { echo "ERROR: reth unreachable at $RETH_URL"; exit 1; }
+              [ -n "$HEAD" ] || { echo "ERROR: fork source unreachable at $RETH_URL"; exit 1; }
               # An explicit pin preserves the Daloc deployment epoch. The
               # chain-1 mirror carries the only Daloc contract deployment;
               # re-resolving a fresh base on every restart makes the engine
@@ -66,7 +72,7 @@ spec:
               if [ -n "${ANVIL_FORK_PIN:-}" ]; then
                 PIN="$ANVIL_FORK_PIN"
                 echo "$PIN" > /state/pin
-                echo "using explicit fork pin=$PIN (reth head not re-resolved)"
+                echo "using explicit fork pin=$PIN (source head not re-resolved)"
                 chmod 0777 /state 2>/dev/null || true
                 chmod 0666 /state/pin 2>/dev/null || true
                 exit 0
@@ -85,10 +91,15 @@ spec:
               # aged with the pod (measured).
               chmod 0777 /state 2>/dev/null || true
               chmod 0666 /state/pin 2>/dev/null || true
-              echo "resolved pin=$PIN (reth head=$HEAD)"
+              echo "resolved pin=$PIN (source head=$HEAD)"
           env:
+            # The fork source is the remote Alchemy RPC. The key is deploy-time
+            # data (Secret `alchemy`); ALCHEMY_KEY must be listed BEFORE
+            # RETH_URL for the dependent $(...) expansion.
+            - name: ALCHEMY_KEY
+              valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } }
             - name: RETH_URL
-              valueFrom: { configMapKeyRef: { name: diorama-config, key: RETH_URL } }
+              value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)"
             # Optional explicit epoch pin. Empty = resolve `reth head - offset`
             # as before. A deployment that must preserve its Daloc contracts
             # sets this to the persisted /state/pin.
@@ -127,7 +138,7 @@ spec:
                   echo "$PIN" > /state/pin
                 else
                   PIN=$(cat /state/pin 2>/dev/null || echo 0)
-                  echo "reth unreachable; keeping persisted pin $PIN" >&2
+                  echo "fork source unreachable; keeping persisted pin $PIN" >&2
                 fi
               fi
               echo "anvil-t: fork-url=$RETH_URL pin=$PIN"
@@ -164,8 +175,13 @@ spec:
                 --no-request-size-limit \
                 --no-fork-node-info \
           env:
+            # The fork source is the remote Alchemy RPC (see the init
+            # container): ALCHEMY_KEY must be listed BEFORE RETH_URL for the
+            # dependent $(...) expansion.
+            - name: ALCHEMY_KEY
+              valueFrom: { secretKeyRef: { name: alchemy, key: ALCHEMY_KEY } }
             - name: RETH_URL
-              valueFrom: { configMapKeyRef: { name: diorama-config, key: RETH_URL } }
+              value: "https://eth-mainnet.g.alchemy.com/v2/$(ALCHEMY_KEY)"
             # Optional explicit epoch pin (see the init container's comment).
             - { name: ANVIL_FORK_PIN, value: "" }
             # Fork RPC cache (~/.foundry/cache/rpc/...) lands on the PVC and is
@@ -209,7 +225,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: anvil-t
-  labels: { app.kubernetes.io/name: anvil-t, app.kubernetes.io/part-of: diorama-mainnet }
+  labels: { app.kubernetes.io/name: anvil-t, app.kubernetes.io/part-of: daloc-diorama-mainnet }
 spec:
   selector: { app.kubernetes.io/name: anvil-t }
   ports:

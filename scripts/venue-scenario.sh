@@ -4,12 +4,12 @@
 # COW restore), and a new-pin epoch clears it (fresh base = fresh epoch).
 #
 # Run from the repo root:
-#   make venue-scenario              # against the deployed diorama-venue
+#   make venue-scenario              # against the deployed daloc-diorama-venue
 #   ENGINE_URL=http://127.0.0.1:18681 V_URL=http://127.0.0.1:18610 \
 #     ./scripts/venue-scenario.sh    # direct mode: a scratch stack, no kubectl
 set -euo pipefail
 
-NS="${NS:-diorama-venue}"
+NS="${NS:-daloc-diorama-venue}"
 USDC="${USDC:-0xb88339CB7199b77E23DB6E890353E22632Ba630f}"   # HyperEVM native USDC
 ACCT="${ACCT:-0x00000000000000000000000000000000000000d1}"   # a scratch account
 AMOUNT="${AMOUNT:-100000000}"                                 # 100 USDC (6-dec ERC20)

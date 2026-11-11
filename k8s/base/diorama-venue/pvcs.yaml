@@ -1,10 +1,11 @@
-# Persistent volumes for the Venue Mirror. Same diorama-retain StorageClass
-# (Retain) as the mainnet mirror's pvcs.yaml - one file per mirror's claims,
+# Persistent volumes for the Venue Mirror. One file per mirror's claims,
 # because a kustomize overlay composes whole files and the venue overlay must
-# not declare the mainnet claims (reth-data is 400Gi, lighthouse-data 1500Gi).
+# not declare the mainnet claims.
 #
-# LOCAL (workshop): re-bound to the volumes a previous run left behind
-# (Released PVs from the pre-rename namespaces); see the mainnet pvcs.yaml.
+# The cluster's default `local-path` StorageClass (a tenant cannot create
+# StorageClasses); claims are dynamically provisioned (no pre-bound
+# volumeName). local-path's reclaimPolicy is Delete - deleting a PVC deletes
+# the underlying data.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -13,14 +14,12 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-venue, app: anvil-v }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-1be79fd4-d9d1-4df2-aca0-cdd156541e01
+  storageClassName: local-path
   resources:
     requests:
       # V forks the source on demand and carries only the devnet's own writes
-      # (T's measured working set is ~2.5 GB); 20Gi is comfortable, the plan's
-      # range is 10-40Gi.
-      storage: 20Gi
+      # (T's measured working set is ~2.5 GB); 10Gi is comfortable.
+      storage: 10Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -29,12 +28,11 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-venue, app: venue-sim }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-2eecf992-8ee7-4fc8-9083-2f5aca31d221
+  storageClassName: local-path
   resources:
     requests:
-      # sim.json + feed.json: small JSON state, 5Gi is plenty.
-      storage: 5Gi
+      # sim.json + feed.json: small JSON state, 2Gi is plenty.
+      storage: 2Gi
 ---
 # Shared by profiles: PVCs are namespaced, so the venue instance
 # carries its own claim of the same name/shape as the mainnet mirror's.
@@ -45,8 +43,7 @@ metadata:
   labels: { app.kubernetes.io/part-of: diorama-venue, app: engine }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: mirror-retain
-  volumeName: pvc-729524d3-a3fb-412e-a7c0-36954a26f3af
+  storageClassName: local-path
   resources:
     requests:
-      storage: 10Gi
+      storage: 5Gi

@@ -13,7 +13,7 @@ set -uo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib-mainnet.sh"
 
-# The probes mirror config/instances/diorama-mainnet/instance.toml:probes (all watched
+# The probes mirror config/instances/daloc-diorama-mainnet/instance.toml:probes (all watched
 # accounts, so T must match reth exactly; none is blockhash-dependent either
 # (the engine's convergence repair is what makes that true).
 probe() { # probe <rpc-url> <block-hex> <to> <data>

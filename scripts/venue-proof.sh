@@ -19,13 +19,13 @@
 #                        time (the COW overlay's split, measured)
 #
 # Run from the repo root:
-#   make venue-proof                    # against the deployed diorama-venue
+#   make venue-proof                    # against the deployed daloc-diorama-venue
 #   ENGINE_URL=http://127.0.0.1:18681 V_URL=http://127.0.0.1:18610 \
 #     SIM_INFO=http://127.0.0.1:18790 SIM_CTRL=http://127.0.0.1:18791 \
 #     ./scripts/venue-proof.sh          # direct mode: a scratch stack
 set -euo pipefail
 
-NS="${NS:-diorama-venue}"
+NS="${NS:-daloc-diorama-venue}"
 USDC="${USDC:-0xb88339CB7199b77E23DB6E890353E22632Ba630f}"    # HyperEVM native USDC
 # The bridge leg uses PURR (spot index 1): Circle's USDC blacklists the system
 # addresses (measured live: `isBlacklisted(0x2000…0000) == true`) and its

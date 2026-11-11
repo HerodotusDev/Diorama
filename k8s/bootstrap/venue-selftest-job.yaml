@@ -7,14 +7,22 @@
 # self-contained (its own HL_RPC_URL is the deployment's fork source).
 #
 #   make venue-selftest
+#
+# KNOWN GAP (measured 2026-11-09, three runs): the run completes its window
+# budget cleanly but fails the activity gate — "no window composed a change".
+# The venue's watchlist only sees activity when the simulator's bridge writes
+# the market/account state to the scratch anvil, and this job carries no sim
+# container, so a quiet watchlist is structural, not a pipeline fault (the
+# deployed follow pipeline is verified live). Wiring a venue-sim sidecar
+# pointing its bridge at this job's anvil-v is the fix.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: venue-selftest
-  namespace: diorama-venue
+  namespace: daloc-diorama-venue
   labels:
     app.kubernetes.io/name: venue-selftest
-    app.kubernetes.io/part-of: diorama-venue
+    app.kubernetes.io/part-of: daloc-diorama-venue
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 7200
@@ -22,9 +30,14 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: venue-selftest
-        app.kubernetes.io/part-of: diorama-venue
+        app.kubernetes.io/part-of: daloc-diorama-venue
     spec:
       restartPolicy: Never
+      # amd64-only images; the cluster carries arm64 nodes too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      imagePullSecrets:
+        - name: ghcr-diorama
       initContainers:
         - name: resolve-pin
           image: docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
@@ -45,14 +58,23 @@ spec:
               echo "$PIN" > /shared/pin
               echo "selftest pin=$PIN (head=$HEAD offset=$OFFSET)"
           env:
-            # The public endpoint the deployed stack's HL_RPC_URL also uses.
+            # The deployed stack's own HyperEVM pool: the selftest drives one
+            # endpoint far harder than production traffic does, and a single
+            # public RPC throttles it deterministically (measured: batch
+            # -32005 rate-limited at ~15 windows, three runs). The pool's
+            # failover spreads the load exactly as production does.
             - { name: HL_RPC, value: "https://rpc.hyperliquid.xyz/evm" }
             # 16 blocks back: well inside BFT finality, still forkable.
             - { name: OFFSET, value: "16" }
           volumeMounts:
             - { name: shared, mountPath: /shared }
-      containers:
+        # A native sidecar (init container, restartPolicy Always): it starts
+        # after resolve-pin, lives until the main container exits, and is
+        # terminated with the pod — without it the job can never reach
+        # `Complete` (measured: the engine finished, the plain anvil
+        # container held the pod at 1/2 forever).
         - name: anvil-v
+          restartPolicy: Always
           image: ghcr.io/foundry-rs/foundry:v1.8.6@sha256:4a16a86f41d30418fbdca47ce2868121bbb0aeaa0a34bde2dd1e2911c4be2464
           command: ["/bin/sh", "-c"]
           args:
@@ -73,12 +95,13 @@ spec:
           resources:
             requests: { cpu: "250m", memory: 256Mi }
             limits: { memory: 2Gi }
+      containers:
         - name: engine
-          image: localhost/diorama-venue-engine:v1
+          image: ghcr.io/herodotusdev/diorama-venue-engine:v18
           imagePullPolicy: IfNotPresent
           args:
             - selftest
-            - --rpc=$(HL_RPC)
+            - --rpc=$(HL_RPC_POOL)
             - --anvil-v=http://127.0.0.1:8545
             - --config=/etc/mirror/instance.toml
             - --windows=5
@@ -88,7 +111,7 @@ spec:
             - --move-wait-secs=120
             - --max-windows=30
           env:
-            - { name: HL_RPC, value: "https://rpc.hyperliquid.xyz/evm" }
+            - { name: HL_RPC_POOL, value: "https://rpc.hyperlend.finance/archive,https://rpc.hyperliquid.xyz/evm,https://rpc.hypurrscan.io,https://hyperliquid-json-rpc.stakely.io,https://hyperliquid.api.onfinality.io/evm/public" }
           # The instance references ${STATE_DIR} and the rest of the stack's
           # wiring; the selftest only needs them *resolved* (the endpoints come
           # from the CLI), so the deployment's own env ConfigMap serves here —
@@ -103,4 +126,10 @@ spec:
             limits: { memory: 2Gi }
       volumes:
         - { name: shared, emptyDir: {} }
-        - { name: instance, configMap: { name: venue-instance } }
+        # The instance ConfigMap is kustomize-generated: its name is
+        # `<name>-<content hash>` and the hash rolls when instance.toml or
+        # the project file changes. After a config change, re-pin this name
+        # from the live deployment:
+        #   kubectl -n daloc-diorama-venue get deploy engine \
+        #     -o jsonpath='{.spec.template.spec.volumes[0].configMap.name}'
+        - { name: instance, configMap: { name: venue-instance-5f89t974dh } }

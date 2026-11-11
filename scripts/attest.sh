@@ -30,7 +30,7 @@ echo "== the behavioral attestation ($(date -u +%H:%M:%S) UTC) =="
 
 # Every pod once: running, ready, and no in-pod restarts (a restart is an
 # anomaly even when the service recovered).
-for ns in diorama-mainnet diorama-venue; do
+for ns in daloc-diorama-mainnet daloc-diorama-venue; do
   while read -r name ready status restarts _; do
     [ -z "${name:-}" ] && continue
     if [ "$ready" = "1/1" ] && [ "$status" = "Running" ] && [ "$restarts" = "0" ]; then
@@ -67,7 +67,7 @@ pick http://localhost:31096 cctp_messages_seen_total cctp_messages_pending cctp_
   cctp_scan_errors_total cctp_last_scan_block cctp_gas_low_total cctp_gas_critical_total
 
 echo "-- WARN/ERROR (last $WIN, deduped; deliberate study/drill facts appear here too)"
-for ns in diorama-mainnet diorama-venue; do
+for ns in daloc-diorama-mainnet daloc-diorama-venue; do
   for d in $(timeout 20 kubectl -n "$ns" get deploy -o name 2>/dev/null | sed 's|deployment.apps/||'); do
     timeout 25 kubectl -n "$ns" logs "deploy/$d" --since="$WIN" 2>/dev/null | python3 -c "
 import json, sys, collections
