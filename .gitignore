@@ -8,7 +8,11 @@
 
 # Per-deployment project specialization. The tracked template is
 # `config/instances/*/specialization.example.toml`; the live file is deployment data.
+# Exception: the staging instances (config/instances/diorama-staging-*) are
+# fully committed — staging must boot from git alone (k8s/stg-anvil mounts
+# their files).
 config/instances/*/specialization.toml
+!config/instances/diorama-staging-*/specialization.toml
 
 # Never commit secret material (JWT is created by scripts/gen-secret.sh)
 k8s/**/secret-*.yaml

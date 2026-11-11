@@ -1,15 +1,20 @@
 # Diorama images: multi-stage build, slim runtime with curl for smoke tests.
 #
-# One Dockerfile, one binary per image: `--build-arg BIN=<package>` selects
-# which workspace binary to build (diorama-mainnet-engine,
-# diorama-venue-engine, diorama-venue-sim and diorama-cctp-bridge). The runtime
-# entrypoint is a symlink to it. `diorama-ast-scope` (the AST gate) ships no image, but its manifest is still copied: cargo resolves
-# the whole workspace before building one package.
+# One Dockerfile, one binary per image. Which binary is selected by either
+# build-arg:
+#   - `BIN=<package>`      the manual podman path (`make images`, `make build`)
+#   - `APP_NAME=app-<bin>` the cicd pipeline (build-and-deploy passes
+#                          APP_NAME=app-<name>; the `app-` prefix is stripped)
+# `BIN` wins when both are set. The runtime entrypoint is a symlink to the
+# selected binary. `diorama-ast-scope` (the AST gate) ships no image, but its
+# manifest is still copied: cargo resolves the whole workspace before building
+# one package.
 #
 # Base images are pinned to the latest stable releases by tag *and* digest, so a
 # rebuilt image is reproducible and no tag can silently move under us.
 FROM docker.io/library/rust:1.99.1-slim-trixie@sha256:e6cd1d294a300601eaaa4a294b337e5f0826f427fb2d481e9f76e69e7981e244 AS builder
 ARG BIN=diorama-mainnet-engine
+ARG APP_NAME=
 # Hosts without an IPv6 route (this one): crates.io resolves AAAA first and
 # cargo's libcurl fails instantly on the unreachable v6 address. Prefer IPv4.
 RUN echo 'precedence ::ffff:0:0/96 100' >> /etc/gai.conf
@@ -49,16 +54,27 @@ COPY bins ./bins
 # build needs it beside the sources (found by a local podman build: every
 # image failed here — `config/defaults.toml` was never copied).
 COPY config ./config
+# Dockerfile ARG defaults do not expand `${VAR#prefix}`, so the BIN-from-
+# APP_NAME derivation happens here in the shell (Dockerfile arg substitution
+# is plain substitution only).
 RUN find crates bins -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked -p ${BIN}
+    && BIN_EFF="${BIN:-${APP_NAME#app-}}" \
+    && [ -n "$BIN_EFF" ] || { echo "ERROR: neither BIN nor APP_NAME set" >&2; exit 1; } \
+    && cargo build --release --locked -p "$BIN_EFF" \
+    && mkdir -p /out \
+    && cp "target/release/$BIN_EFF" /out/diorama-bin \
+    && echo "$BIN_EFF" > /out/bin-name
 
 FROM docker.io/library/debian:13.7-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-ARG BIN=diorama-mainnet-engine
+# The binary keeps its real workspace name on the runtime path (deploy
+# manifests and smoke scripts exec it by name); `entrypoint` is the stable
+# symlink the image's ENTRYPOINT points at.
+COPY --from=builder /out/ /out/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl jq \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/${BIN} /usr/local/bin/${BIN}
-RUN ln -s /usr/local/bin/${BIN} /usr/local/bin/entrypoint
+    && rm -rf /var/lib/apt/lists/* \
+    && cp /out/diorama-bin "/usr/local/bin/$(cat /out/bin-name)" \
+    && ln -s "/usr/local/bin/$(cat /out/bin-name)" /usr/local/bin/entrypoint
 # JSON logs by default in-cluster (kubectl-friendly, one line per event).
 ENV DIORAMA_LOG_JSON=1
 ENTRYPOINT ["/usr/local/bin/entrypoint"]

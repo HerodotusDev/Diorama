@@ -113,7 +113,7 @@ images: ## Build + import the local images, then pull + import the pinned third-
 	    printf "  %-62s manifest only (bins/%s has no source yet)\n" "$$ref" "$$bin"; continue; \
 	  fi; \
 	  printf "== %s (build)\n" "$$ref"; \
-	  podman build -q -f Dockerfile --build-arg BIN=$$bin -t "$$ref" . || exit 1; \
+	  podman build -q -f docker/Dockerfile.diorama --build-arg BIN=$$bin -t "$$ref" . || exit 1; \
 	  rm -f /tmp/diorama-img.tar; \
 	  podman save -o /tmp/diorama-img.tar "$$ref" || exit 1; \
 	  sudo k3s ctr images import /tmp/diorama-img.tar >/dev/null || exit 1; \
@@ -132,8 +132,8 @@ images: ## Build + import the local images, then pull + import the pinned third-
 
 ##@ Engine
 
-build: ## Build the selected instance's engine image with podman (Dockerfile at the workspace root)
-	podman build -f Dockerfile --build-arg BIN=$(ENGINE_BIN) -t $(ENGINE_IMAGE):$(ENGINE_TAG) .
+build: ## Build the selected instance's engine image with podman (docker/Dockerfile.diorama)
+	podman build -f docker/Dockerfile.diorama --build-arg BIN=$(ENGINE_BIN) -t $(ENGINE_IMAGE):$(ENGINE_TAG) .
 
 import: build ## Import the engine image into the k3s containerd store
 	podman save -o /tmp/engine-image.tar $(ENGINE_IMAGE):$(ENGINE_TAG)
