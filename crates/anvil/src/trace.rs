@@ -12,7 +12,7 @@
 //! type's, not ours.
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_trace::geth::{AccountState, GethTrace, PreStateFrame, TraceResult};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// One state write a trace diff reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +77,7 @@ impl Write {
 /// A state key: `Write` without its value. `Key` is what a read asks for
 /// (the read plan asks keys) and what a mark names (the shadow
 /// registry's marks are keyed by it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Key {
     Storage { address: Address, slot: U256 },
     Balance(Address),
@@ -137,10 +137,24 @@ impl Write {
 /// stale non-zero value, and a same-pin restore resurrects it (measured: a
 /// drained balance came back after a reset).
 pub(crate) fn flatten_trace_diff(frame: &PreStateFrame) -> Vec<Write> {
+    flatten_trace_diff_with_pre(frame).0
+}
+
+/// The diff flattening plus the trace's own `pre` side: for every changed
+/// key, the value it held at the block's start (the first transaction's
+/// `pre` wins for a key several transactions touch — later pres are
+/// mid-block states, never the block's before-value). A key whose `pre`
+/// side is absent reads as zero (measured: a 0→v write lives in `post`
+/// alone). This is the journal's before-value document — the applier
+/// journals it without a single read.
+pub(crate) fn flatten_trace_diff_with_pre(
+    frame: &PreStateFrame,
+) -> (Vec<Write>, Vec<(Key, Value)>) {
     let Some(diff) = frame.as_diff() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
+    let mut pres = Vec::new();
     // The union of both sides: an account can appear in `post` only (anvil
     // omits an unchanged-zero pre-state's storage, so a 0→v write lives in
     // `post.storage` alone) and in `pre` only (a v→0 write, which `post`
@@ -150,18 +164,19 @@ pub(crate) fn flatten_trace_diff(frame: &PreStateFrame) -> Vec<Write> {
     for address in addresses {
         let pre = diff.pre.get(&address);
         let post = diff.post.get(&address);
-        push_storage(&mut out, address, pre, post);
+        push_storage(&mut out, &mut pres, address, pre, post);
         if let Some(post) = post {
-            push_balance(&mut out, address, pre, post);
-            push_nonce(&mut out, address, pre, post);
-            push_code(&mut out, address, pre, post);
+            push_balance(&mut out, &mut pres, address, pre, post);
+            push_nonce(&mut out, &mut pres, address, pre, post);
+            push_code(&mut out, &mut pres, address, pre, post);
         }
     }
-    out
+    (out, pres)
 }
 
 fn push_balance(
     out: &mut Vec<Write>,
+    pres: &mut Vec<(Key, Value)>,
     address: Address,
     pre: Option<&AccountState>,
     post: &AccountState,
@@ -169,12 +184,15 @@ fn push_balance(
     if let Some(value) = post.balance {
         if pre.and_then(|p| p.balance) != Some(value) {
             out.push(Write::Balance { address, value });
+            let before = pre.and_then(|p| p.balance).unwrap_or(U256::ZERO);
+            pres.push((Key::Balance(address), Value::Balance(before)));
         }
     }
 }
 
 fn push_nonce(
     out: &mut Vec<Write>,
+    pres: &mut Vec<(Key, Value)>,
     address: Address,
     pre: Option<&AccountState>,
     post: &AccountState,
@@ -182,12 +200,15 @@ fn push_nonce(
     if let Some(value) = post.nonce {
         if pre.and_then(|p| p.nonce) != Some(value) {
             out.push(Write::Nonce { address, value });
+            let before = pre.and_then(|p| p.nonce).unwrap_or(0);
+            pres.push((Key::Nonce(address), Value::Nonce(before)));
         }
     }
 }
 
 fn push_code(
     out: &mut Vec<Write>,
+    pres: &mut Vec<(Key, Value)>,
     address: Address,
     pre: Option<&AccountState>,
     post: &AccountState,
@@ -198,6 +219,11 @@ fn push_code(
                 address,
                 value: value.clone(),
             });
+            let before = pre
+                .and_then(|p| p.code.as_ref())
+                .cloned()
+                .unwrap_or_else(Bytes::new);
+            pres.push((Key::Code(address), Value::Code(before)));
         }
     }
 }
@@ -209,6 +235,7 @@ fn push_code(
 /// a slot present on one side only reads the missing side as zero.
 fn push_storage(
     out: &mut Vec<Write>,
+    pres: &mut Vec<(Key, Value)>,
     address: Address,
     pre: Option<&AccountState>,
     post: Option<&AccountState>,
@@ -228,11 +255,13 @@ fn push_storage(
             .map(|v| U256::from_be_bytes(v.0))
             .unwrap_or(U256::ZERO);
         if pre_value != post_value {
+            let slot = U256::from_be_bytes(slot.0);
             out.push(Write::Storage {
                 address,
-                slot: U256::from_be_bytes(slot.0),
+                slot,
                 value: post_value,
             });
+            pres.push((Key::Storage { address, slot }, Value::Storage(pre_value)));
         }
     }
 }
@@ -247,6 +276,15 @@ pub fn flatten_trace(trace: &GethTrace) -> Vec<Write> {
     }
 }
 
+/// [`Self::flatten_trace`] plus the frame's `pre` side (the same first-wins
+/// rule at single-transaction scope).
+pub fn flatten_trace_with_pre(trace: &GethTrace) -> (Vec<Write>, Vec<(Key, Value)>) {
+    match trace {
+        GethTrace::PreStateTracer(frame) => flatten_trace_diff_with_pre(frame),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
 /// Flatten a `debug_traceBlockByNumber` answer (`[{txHash, result}]`):
 /// the prestate frames of every successfully traced transaction, in order.
 /// A transaction the tracer could not process contributes no writes — the
@@ -257,6 +295,24 @@ pub fn flatten_trace_block(traces: &[TraceResult]) -> Vec<Write> {
         .filter_map(TraceResult::success)
         .flat_map(flatten_trace)
         .collect()
+}
+
+/// [`Self::flatten_trace_block`] plus the block's before-values: per key,
+/// the *first* touching transaction's `pre` (in tx order) — the block's own
+/// starting state, never a mid-block value.
+pub fn flatten_trace_block_with_pre(
+    traces: &[TraceResult],
+) -> (Vec<Write>, HashMap<Key, Value>) {
+    let mut writes = Vec::new();
+    let mut pres: HashMap<Key, Value> = HashMap::new();
+    for trace in traces.iter().filter_map(TraceResult::success) {
+        let (tx_writes, tx_pres) = flatten_trace_with_pre(trace);
+        writes.extend(tx_writes);
+        for (key, value) in tx_pres {
+            pres.entry(key).or_insert(value);
+        }
+    }
+    (writes, pres)
 }
 
 #[cfg(test)]
@@ -427,5 +483,85 @@ mod tests {
                 value: U256::ZERO,
             }
         );
+    }
+
+    /// The `pre` side is the journal's before-value document: every changed
+    /// key carries the value it held at the block's start. A `post`-only key
+    /// (measured: a 0→v write) reads as zero; a field that did not change
+    /// carries no pre at all.
+    #[test]
+    fn the_pre_side_is_the_before_value_document() {
+        let frame: PreStateFrame = serde_json::from_str(MEASURED_FRAME).expect("measured frame");
+        let (writes, pres) = flatten_trace_diff_with_pre(&frame);
+        let pres: HashMap<Key, Value> = pres.into_iter().collect();
+        let before = |w: &Write| pres.get(&w.key()).expect("every write has a pre");
+        // Storage: pre slot 3 = ...8b79 (post ...8b7a); pre c008... = ...54b7.
+        assert_eq!(
+            before(&writes[0]),
+            &Value::Storage(U256::from_str_radix(
+                "4be6a279be925c8183c6ab0b5b60554bc7adbacf0000000001908b79",
+                16
+            )
+            .unwrap())
+        );
+        assert_eq!(
+            before(&writes[1]),
+            &Value::Storage(U256::from_str_radix("1cf99154b7", 16).unwrap())
+        );
+        // Balance: pre 0xbdc860812f71543; nonce: pre 172448.
+        assert_eq!(
+            before(&writes[2]),
+            &Value::Balance(U256::from(0x0bdc_8608_12f7_1543_u64))
+        );
+        assert_eq!(before(&writes[3]), &Value::Nonce(172_448));
+    }
+
+    /// A `post`-only write's before-value is zero: the account had no
+    /// non-zero pre-state for it (measured shape — the slot was absent from
+    /// `pre` because it was zero).
+    #[test]
+    fn a_post_only_write_reads_a_zero_before() {
+        let frame: PreStateFrame = serde_json::from_str(
+            r#"{"post":{"0x000000000000000000000000000000000000c0de":{
+                    "storage":{"0x0000000000000000000000000000000000000000000000000000000000000000":"0x0000000000000000000000000000000000000000000000000000000000000001"}}},
+                "pre":{"0x000000000000000000000000000000000000c0de":{"balance":"0x0","code":"0x60016000556000"}}}"#,
+        )
+        .expect("frame");
+        let (writes, pres) = flatten_trace_diff_with_pre(&frame);
+        let pres: HashMap<Key, Value> = pres.into_iter().collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(pres.get(&writes[0].key()), Some(&Value::Storage(U256::ZERO)));
+    }
+
+    /// A key two transactions touch carries the FIRST transaction's `pre` —
+    /// the block's starting state, never a mid-block value.
+    #[test]
+    fn block_pres_keep_the_first_touching_txs_pre() {
+        let frame = |pre: &str, post: &str| {
+            serde_json::from_str::<PreStateFrame>(&format!(
+                r#"{{"pre":{{"0x00000000000000000000000000000000000000a1":{{"balance":"{pre}"}}}},
+                    "post":{{"0x00000000000000000000000000000000000000a1":{{"balance":"{post}"}}}}}}"#
+            ))
+            .expect("frame")
+        };
+        let traces = vec![
+            TraceResult::Success {
+                result: GethTrace::PreStateTracer(
+                    frame("0x64", "0xc8"), // tx1: 100 -> 200 (pre = 100)
+                ),
+                tx_hash: None,
+            },
+            TraceResult::Success {
+                result: GethTrace::PreStateTracer(
+                    frame("0xc8", "0x12c"), // tx2: 200 -> 300 (pre = 200, mid-block)
+                ),
+                tx_hash: None,
+            },
+        ];
+        let (writes, pres) = flatten_trace_block_with_pre(&traces);
+        // Both writes ride (the applier lands both, in order).
+        assert_eq!(writes.len(), 2);
+        let a1: Address = "0x00000000000000000000000000000000000000a1".parse().unwrap();
+        assert_eq!(pres.get(&Key::Balance(a1)), Some(&Value::Balance(U256::from(100))));
     }
 }
