@@ -13,7 +13,11 @@
 # Base images are pinned to the latest stable releases by tag *and* digest, so a
 # rebuilt image is reproducible and no tag can silently move under us.
 FROM docker.io/library/rust:1.99.1-slim-trixie@sha256:e6cd1d294a300601eaaa4a294b337e5f0826f427fb2d481e9f76e69e7981e244 AS builder
-ARG BIN=diorama-mainnet-engine
+# Empty default: BIN must fall through to APP_NAME when the cicd pipeline
+# passes only APP_NAME (a non-empty default would always win). The manual
+# podman path (make images / make build) always passes BIN explicitly; if
+# neither arg reaches the build, the compile RUN fails loudly.
+ARG BIN=
 ARG APP_NAME=
 # Hosts without an IPv6 route (this one): crates.io resolves AAAA first and
 # cargo's libcurl fails instantly on the unreachable v6 address. Prefer IPv4.
