@@ -12,6 +12,9 @@ config/instances/*/specialization.toml
 
 # Never commit secret material (JWT is created by scripts/gen-secret.sh)
 k8s/**/secret-*.yaml
+# Local scratch env files (the tracked copy leaked an Alchemy key and was
+# removed; keys belong in the cluster's `alchemy` Secret).
+.env
 
 .context/
 # Python bytecode
