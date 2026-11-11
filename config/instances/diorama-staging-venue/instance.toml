@@ -1,0 +1,68 @@
+# The STAGING Venue Mirror instance: fully committed — this deployment
+# does not depend on a gitignored specialization.toml (its product scope is
+# the committed `specialization.toml` beside this file). Deployed by the
+# staging anvil layer (k8s/stg-anvil) into daloc-diorama-stg, where the
+# whole stack shares one namespace: the ${...} wiring vars resolve to
+# same-namespace short service DNS.
+
+# The generic Venue Mirror instance shape: deployment facts only.
+
+# An explicit fork base: the staging deployment pins one (in the
+# specialization beside this file), so restarts preserve the epoch.
+
+[instance]
+name = "diorama-staging-venue"
+namespace = "daloc-diorama-stg"
+profile = "venue"
+project = "specialization"
+
+[chains.venue]
+kind = "hyperliquid"
+# An explicit fork base, when the deployment pins one, lives in the
+# specialization's [chains.venue] as `fork_pin`.
+# The EVM read pool: random healthy start, fail over to the next endpoint,
+# cool a failed endpoint down, retry it in a later round.
+source_urls = "@hyperevm"
+# The market plane's REST and WS pools (the same rotation/cooldown policy).
+api_urls = "@hyperliquid_api"
+ws_urls = "@hyperliquid_ws"
+
+[services.engine]
+state_dir = "${STATE_DIR}"
+# A fork-mode anvil comes up in seconds; only a coordinated restart delays it.
+boot_timeout_secs = 120
+
+[services.engine.anvil]
+target_url = "@anvil_v"
+
+# The follow's cadence and window against the public source. The window is
+# the **catch-up width**: a 100-block window advances slower than the source's
+# ~60 blocks/min, so a 35k-block gap never closes. 900 blocks per pass is the
+# live catch-up width that closed the measured 35k gap; the composer halves an
+# `eth_getLogs` chunk on a response-size refusal or a transient `-32000`
+# timeout, so the wider window still respects the endpoint's request budget.
+[services.engine.loops]
+poll_interval_ms = 2000
+max_gap_blocks = 900
+# JSON-RPC batch items for source reads and local cheatcode writes. This is
+# the deployment's endpoint contract (the live value), not a global default.
+chunk_size = 500
+
+[services.engine.journal]
+dir = "${STATE_DIR}/journal"
+
+[services.engine.http]
+port = 8080
+
+[services.venue_sim]
+state_dir = "${SIM_STATE_DIR}"
+engine_admin_url = "@engine_admin"
+anvil_url = "@anvil_v"
+
+[services.venue_sim.info]
+addr = "0.0.0.0"
+port = 8090
+
+[services.venue_sim.control]
+addr = "0.0.0.0"
+port = 8091

@@ -1,0 +1,15 @@
+# The staging Mainnet Mirror's instance unit: the ConfigMap every staging pod
+# of this mirror mounts at /etc/mirror/. Unlike the manual instances, BOTH
+# files are committed (staging boots from git alone). The name suffix is
+# disabled: k8s/stg/*-deployment.yaml (applied by the cicd pipeline outside
+# kustomize) reference the plain name.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+  - name: mainnet-instance
+    files:
+      - instance.toml=instance.toml
+      - specialization.toml=specialization.toml
+    options:
+      disableNameSuffixHash: true

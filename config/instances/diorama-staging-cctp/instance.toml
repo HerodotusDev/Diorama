@@ -1,0 +1,39 @@
+# The STAGING CCTP bridge instance: fully committed — this deployment
+# does not depend on a gitignored specialization.toml (its chain/lane
+# topology is the committed `specialization.toml` beside this file).
+# Deployed into daloc-diorama-stg: the bridge is a first-class instance
+# (its own ConfigMap, Secret and PVC), but in staging every chain is a
+# same-namespace anvil reached over short service DNS.
+#
+# The topology is data: the committed specialization carries
+# `[[services.cctp_bridge.chains]]` (each chain's CCTP domain and contracts)
+# and `[[services.cctp_bridge.lanes]]` (the directed burns). Add a chain or a
+# lane there, not in code.
+[instance]
+name = "diorama-staging-cctp"
+# The bridge is a first-class instance: its own ConfigMap, Secret and PVC,
+# beside its peers (the mirrors) in the single staging namespace.
+namespace = "daloc-diorama-stg"
+profile = "cctp"
+project = "specialization"
+
+[services.cctp_bridge]
+state_dir = "${CCTP_STATE_DIR}"
+relay_key = "${CCTP_RELAY_KEY}"
+attester_seed = "diorama-cctp-devnet-attester"
+# Circle's live fast-burn allowance is a rolling figure (measured
+# 2026-10-31: 56,854,459.08 USDC). This deployment pins the measured value;
+# there is no safe generic fallback.
+fast_burn_allowance = 56854459.08
+# The watcher scans the local anvils (T and V), whose per-call range is 2,000
+# blocks. The client still clamps any chunk to the endpoint group's
+# `max_log_range`, so a public source cannot receive a wider range.
+scan_chunk_blocks = 2000
+
+[services.cctp_bridge.iris]
+addr = "0.0.0.0"
+port = 8095
+
+[services.cctp_bridge.control]
+addr = "0.0.0.0"
+port = 8096
