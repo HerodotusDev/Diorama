@@ -36,7 +36,7 @@ spec:
         - name: ghcr-diorama
       containers:
         - name: venue-sim
-          image: ghcr.io/herodotusdev/diorama-venue-sim:v18
+          image: ghcr.io/herodotusdev/diorama-venue-sim:v19
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The same `envFrom` mechanism as the engines: the ConfigMap carries

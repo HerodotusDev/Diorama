@@ -97,7 +97,7 @@ spec:
             limits: { memory: 2Gi }
       containers:
         - name: engine
-          image: ghcr.io/herodotusdev/diorama-venue-engine:v18
+          image: ghcr.io/herodotusdev/diorama-venue-engine:v19
           imagePullPolicy: IfNotPresent
           args:
             - selftest

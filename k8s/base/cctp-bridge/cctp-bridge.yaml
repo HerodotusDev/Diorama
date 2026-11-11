@@ -39,7 +39,7 @@ spec:
         - name: ghcr-diorama
       containers:
         - name: cctp-bridge
-          image: ghcr.io/herodotusdev/diorama-cctp-bridge:v18
+          image: ghcr.io/herodotusdev/diorama-cctp-bridge:v19
           imagePullPolicy: IfNotPresent
           args: ["run", "--config", "/etc/mirror/instance.toml"]
           # The bridge's own wiring ConfigMap (cctp-config), not the venue's:
