@@ -11,6 +11,10 @@
 # shared `daloc` root so any accidental per-app lookup resolves to
 # /daloc/stg/<app>/.env, which is absent and warn-skips (harmless).
 namespace: daloc-diorama
+# The deploy namespace rewrites to daloc-diorama-stg on develop; this repo has
+# no prod namespace of its own, so pin where the shared etcd lives (keys are
+# warn-skip lookups only — Diorama keeps no config in etcd).
+etcd_namespace: daloc-prod
 version_file: ./Cargo.toml
 version_key: workspace.package.version
 etcd_root: daloc
