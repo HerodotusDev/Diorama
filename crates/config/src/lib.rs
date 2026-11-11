@@ -742,15 +742,9 @@ port = 8096
         names.sort();
         assert_eq!(
             names,
-            vec![
-                "ANVIL_T_URL",
-                "BEACON_URL",
-                "ENGINE_API_URL",
-                "JWT_PATH",
-                "RETH_URL",
-                "STATE_DIR"
-            ],
-            "the wiring the instance references"
+            vec!["ANVIL_T_URL", "RETH_URL", "STATE_DIR"],
+            "the wiring the instance references (reth/lighthouse dropped: the \
+             source is a remote provider URL, source_sync and beacon are gone)"
         );
     }
 

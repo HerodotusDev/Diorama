@@ -174,7 +174,7 @@ impl diorama_devnet::engine::EngineService for Ctx {
 
     fn log_start(ctx: &Self) {
         tracing::info!(
-            reth = %ctx.reth.url(),
+            reth = %diorama_anvil::redact_key(ctx.reth.url()),
             anvil_t = %ctx.anvil_t.url(),
             follow = ctx.follow_tag(),
             watchlist = ctx.mirror.scope().watch().accounts.len(),

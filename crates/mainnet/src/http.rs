@@ -67,7 +67,12 @@ pub(crate) async fn status_doc(ctx: &Ctx) -> Result<StatusResponse> {
         lag: lag_between(follow, shared.cursor),
         watchlist: ctx.mirror.scope().watch().accounts.len(),
         time_offset_seconds: ctx.plane.time_offset.load(Ordering::Relaxed),
-        sources: ctx.reth.urls().to_vec(),
+        sources: ctx
+            .reth
+            .urls()
+            .iter()
+            .map(|u| diorama_anvil::redact_key(u))
+            .collect(),
         source_pool: ctx.reth.pool().snapshot(),
         shared,
     })

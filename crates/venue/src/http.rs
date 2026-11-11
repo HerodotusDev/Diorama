@@ -54,7 +54,12 @@ pub(crate) async fn status_doc(ctx: &Ctx) -> Result<StatusResponse> {
         epoch_pin: ctx.plane.state.epoch_pin()?,
         probes: ctx.engine.verifier.probes.len(),
         source: ctx.source_rpc.url().to_string(),
-        sources: ctx.source_rpc.urls().to_vec(),
+        sources: ctx
+            .source_rpc
+            .urls()
+            .iter()
+            .map(|u| diorama_anvil::redact_key(u))
+            .collect(),
         source_pool: ctx.source_rpc.pool().snapshot(),
         shared,
     })

@@ -405,7 +405,7 @@ impl diorama_devnet::engine::EngineService for Ctx {
 
     fn log_start(ctx: &Self) {
         tracing::info!(
-            source = %ctx.source_rpc.url(),
+            source = %diorama_anvil::redact_key(ctx.source_rpc.url()),
             anvil_v = %ctx.anvil_v.url(),
             pin = ?diorama_devnet::pin::resolved_pin(&ctx.pin),
             watchlist = ctx.mirror.scope().watch().accounts.len(),

@@ -169,19 +169,22 @@ pub(crate) async fn step(ctx: &Ctx, n: u64) -> Result<ApplyOutcome> {
         } => (reapply, reapply_from),
     };
 
-    prepend_and_mark(ctx, n).await?;
+    let phases = write_phases(ctx, n, &header, base, t_head).await?;
 
-    let plan = plan_and_check_base(ctx, n, base).await?;
-    let entries =
-        diorama_devnet::journal::read_before_values(&ctx.anvil_t, &plan.writes, t_head).await?;
-
-    let applied = write_and_mine(ctx, &header, &plan.writes).await?;
-    journal_and_scan(ctx, n, &entries, t_head).await?;
     // The parent-stream continuity marker (reorg detection reads it).
     ctx.plane.state.set_source_last(n, header.hash)?;
 
     let t_latest = ctx.anvil_t.block_number().await?;
-    let (sampled, sampled_ok) = parity_step(ctx, n, &plan.writes, t_latest).await?;
+    let (sampled, sampled_ok) = parity_step(ctx, n, &phases.plan.writes, t_latest).await?;
+
+    tracing::debug!(
+        block = n,
+        entry_prepend_ms = (phases.after_prepend - started).as_millis() as u64,
+        compose_ms = (phases.after_plan - phases.after_prepend).as_millis() as u64,
+        journal_ms = (phases.after_journal - phases.after_plan).as_millis() as u64,
+        write_scan_ms = (phases.after_write - phases.after_journal).as_millis() as u64,
+        "apply phase timings"
+    );
 
     finalize(
         ctx,
@@ -191,12 +194,12 @@ pub(crate) async fn step(ctx: &Ctx, n: u64) -> Result<ApplyOutcome> {
             source: if reapply == Reapply::RolledBack {
                 "reapply"
             } else {
-                plan.kind.as_str()
+                phases.plan.kind.as_str()
             },
-            total: plan.total,
-            applied,
-            filtered: plan.writes.len(),
-            stats: plan.filter,
+            total: phases.plan.total,
+            applied: phases.applied,
+            filtered: phases.plan.writes.len(),
+            stats: phases.plan.filter,
             sampled,
             sampled_ok,
             reapply,
@@ -206,6 +209,57 @@ pub(crate) async fn step(ctx: &Ctx, n: u64) -> Result<ApplyOutcome> {
         },
     )
     .await
+}
+
+/// The write path from prepend through scan, with the phase marks the
+/// timing log reads: prepend → compose(plan) → journal reads → writes →
+/// scan. Extracted so `step` stays inside the shape gate.
+struct WritePhases {
+    plan: diorama_devnet::bal::WindowPlan,
+    applied: usize,
+    after_prepend: Instant,
+    after_plan: Instant,
+    after_journal: Instant,
+    after_write: Instant,
+}
+
+async fn write_phases(
+    ctx: &Ctx,
+    n: u64,
+    header: &Header,
+    base: Option<u64>,
+    t_head: u64,
+) -> Result<WritePhases> {
+    prepend_and_mark(ctx, n).await?;
+    let after_prepend = Instant::now();
+
+    let plan = plan_and_check_base(ctx, n, base).await?;
+    let after_plan = Instant::now();
+    // The journal's before-values: the composer's own document first (the
+    // trace's `pre` side — zero reads on the trace rung), the target read
+    // only for keys it does not cover. Runs before the writes land: the
+    // fallback reads the pre-write state.
+    let entries = diorama_devnet::journal::entries_for_writes(
+        &ctx.anvil_t,
+        &plan.writes,
+        &plan.befores,
+        t_head,
+    )
+    .await?;
+    let after_journal = Instant::now();
+
+    let applied = write_and_mine(ctx, header, &plan.writes).await?;
+    journal_and_scan(ctx, n, &entries, t_head).await?;
+    let after_write = Instant::now();
+
+    Ok(WritePhases {
+        plan,
+        applied,
+        after_prepend,
+        after_plan,
+        after_journal,
+        after_write,
+    })
 }
 
 /// Compose the window's diffs and apply the watch/COW filter. The pre-write
