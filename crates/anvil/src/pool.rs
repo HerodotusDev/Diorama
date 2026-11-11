@@ -28,6 +28,7 @@
 //! client all consume the same executor, so "both mirrors use the same logic"
 //! is a type-level fact rather than a convention.
 use crate::error::{Error, Result};
+use crate::{DEFAULT_MAX_BATCH_ITEMS, DEFAULT_BATCH_CONCURRENCY};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -153,6 +154,18 @@ pub struct EndpointSpec {
     /// bound.
     #[serde(default = "default_max_log_range")]
     pub max_log_range: u64,
+    /// The widest JSON-RPC batch this endpoint answers in one body. The
+    /// client splits a wider batch into chunks that ride this cap; the
+    /// chunk concurrency stays at the endpoint's declared budget. Absent
+    /// keeps the conservative public default.
+    #[serde(default = "default_max_batch_items")]
+    pub max_batch_items: u64,
+    /// How many batch chunk bodies may ride concurrently against this
+    /// endpoint. Absent keeps the sequential default (public endpoints
+    /// throttle concurrent bodies, measured); a provider that takes them —
+    /// the local anvil, the measured Alchemy gateway — declares more.
+    #[serde(default = "default_batch_concurrency")]
+    pub max_batch_concurrency: u64,
 }
 
 const fn one() -> u32 {
@@ -161,6 +174,14 @@ const fn one() -> u32 {
 
 const fn default_max_log_range() -> u64 {
     DEFAULT_MAX_LOG_RANGE_BLOCKS
+}
+
+const fn default_max_batch_items() -> u64 {
+    DEFAULT_MAX_BATCH_ITEMS as u64
+}
+
+const fn default_batch_concurrency() -> u64 {
+    DEFAULT_BATCH_CONCURRENCY as u64
 }
 
 impl EndpointSpec {
@@ -172,6 +193,8 @@ impl EndpointSpec {
             chain_id: None,
             weight: 1,
             max_log_range: DEFAULT_MAX_LOG_RANGE_BLOCKS,
+            max_batch_items: DEFAULT_MAX_BATCH_ITEMS as u64,
+            max_batch_concurrency: DEFAULT_BATCH_CONCURRENCY as u64,
         }
     }
 
@@ -337,16 +360,10 @@ impl EndpointPool {
             if !scheme.accepts(&spec.url) {
                 return Err(Error::InvalidEndpoint { endpoint: spec.url });
             }
-            if spec.weight == 0 {
+            if let Some(detail) = invalid_attribute(&spec) {
                 return Err(Error::InvalidEndpointAttribute {
                     endpoint: spec.url,
-                    detail: "weight must be >= 1".into(),
-                });
-            }
-            if spec.max_log_range == 0 {
-                return Err(Error::InvalidEndpointAttribute {
-                    endpoint: spec.url,
-                    detail: "max_log_range must be > 0".into(),
+                    detail,
                 });
             }
             match endpoints.iter().find(|known| known.url == spec.url) {
@@ -355,7 +372,7 @@ impl EndpointPool {
                 Some(_) => {
                     return Err(Error::ConflictingEndpointAttributes {
                         endpoint: spec.url,
-                        detail: "the same URL is declared with different roles/chain_id/weight/max_log_range"
+                        detail: "the same URL is declared with different roles/chain_id/weight/max_log_range/max_batch_items"
                             .into(),
                     });
                 }
@@ -437,6 +454,28 @@ impl EndpointPool {
             .min()
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// The widest JSON-RPC batch the pool accepts in one body: the
+    /// narrowest declared cap (one throttling endpoint pins the pool).
+    pub fn batch_items_cap(&self) -> u64 {
+        self.endpoints
+            .iter()
+            .map(|spec| spec.max_batch_items)
+            .min()
+            .unwrap_or(DEFAULT_MAX_BATCH_ITEMS as u64)
+            .max(1)
+    }
+
+    /// How many batch chunk bodies ride concurrently against this pool: the
+    /// narrowest declared budget (one throttling endpoint pins the pool).
+    pub fn batch_concurrency(&self) -> usize {
+        self.endpoints
+            .iter()
+            .map(|spec| spec.max_batch_concurrency)
+            .min()
+            .unwrap_or(DEFAULT_BATCH_CONCURRENCY as u64)
+            .max(1) as usize
     }
 
     pub fn len(&self) -> usize {
@@ -735,7 +774,7 @@ impl EndpointPool {
             .enumerate()
             .map(|(index, health)| EndpointSnapshot {
                 index,
-                url: self.endpoints[index].url.clone(),
+                url: crate::redact_key(&self.endpoints[index].url),
                 chain_id: self.endpoints[index].chain_id,
                 roles: self.endpoints[index].roles.iter().cloned().collect(),
                 weight: self.endpoints[index].weight,
@@ -799,6 +838,26 @@ fn same_attributes(a: &EndpointSpec, b: &EndpointSpec) -> bool {
         && a.chain_id == b.chain_id
         && a.weight == b.weight
         && a.max_log_range == b.max_log_range
+        && a.max_batch_items == b.max_batch_items
+        && a.max_batch_concurrency == b.max_batch_concurrency
+}
+
+/// The spec's unusable attribute, if any (zero caps make the client's
+/// chunking undefined; a zero weight makes admission undefined).
+fn invalid_attribute(spec: &EndpointSpec) -> Option<String> {
+    if spec.weight == 0 {
+        return Some("weight must be >= 1".into());
+    }
+    if spec.max_log_range == 0 {
+        return Some("max_log_range must be > 0".into());
+    }
+    if spec.max_batch_items == 0 {
+        return Some("max_batch_items must be > 0".into());
+    }
+    if spec.max_batch_concurrency == 0 {
+        return Some("max_batch_concurrency must be > 0".into());
+    }
+    None
 }
 
 /// A weighted random permutation (Efraimidis–Spirakis): each endpoint draws

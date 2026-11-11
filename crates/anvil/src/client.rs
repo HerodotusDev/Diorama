@@ -73,9 +73,13 @@ pub fn call(method: &'static str, params: impl Serialize) -> Result<Call> {
 /// win is the request *count* (a wide window is a handful of bodies, not one
 /// per block), and the public HyperEVM RPC's burst limiter refused concurrent
 /// bodies while one-at-a-time traffic — the pre-batching era's own pattern —
-/// passed (measured live). Sequential sub-batches keep the follow inside that
-/// proven-safe shape.
-const BATCH_CONCURRENCY: usize = 1;
+/// passed (measured live). The default stays sequential; a pool's endpoint
+/// can declare a wider budget (`max_batch_concurrency`) — the measured
+/// Alchemy gateway and the local anvil both take concurrent bodies, and a
+/// fork-mode anvil serializes every uncached slot behind a fork-source
+/// round-trip (~30 ms each), so a mirror block's reads never finish
+/// sequentially inside a 12 s slot.
+pub const DEFAULT_BATCH_CONCURRENCY: usize = 1;
 
 /// Whether a block read carries its transactions' bodies: the RPC's own
 /// `full` flag, named (a bare `true` at a call site says nothing).
@@ -102,14 +106,18 @@ pub enum Automine {
 }
 
 /// The batch's item cap, measured: the public HyperEVM RPC answers
-/// `Exceeded max limit of 20` for a larger batch (live), so every sub-batch
-/// stays at or below it — the client chunks transparently and sequentially.
-const BATCH_MAX_ITEMS: usize = 20;
+/// `Exceeded max limit of 20` for a larger batch (live), so the default is
+/// conservative — a pool's endpoint can declare a wider cap
+/// (`max_batch_items`; the measured Alchemy gateway answers 300-item
+/// bodies in ~0.2 s). The client chunks transparently; the chunks ride one
+/// at a time (the concurrency stays 1 — public endpoints throttle
+/// concurrent bodies, measured live).
+pub const DEFAULT_MAX_BATCH_ITEMS: usize = 20;
 
 /// The local anvil's item contract, measured live: 500 items per body are
 /// answered (1000 too — 500 is the conservative bound the write path
 /// documents). Callers that *know* their target is the local devnet chain
-/// ride this; the public cap stays [`BATCH_MAX_ITEMS`].
+/// ride this; the public cap stays [`DEFAULT_MAX_BATCH_ITEMS`].
 pub const ANVIL_BATCH_MAX_ITEMS: usize = 500;
 
 /// The throttle's JSON-RPC code (outside the protocol ranges, like the
@@ -258,7 +266,20 @@ fn endpoint_capability_refusal(text: &str) -> bool {
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or(0);
                     let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    code == -32000 && capability(message)
+                    (code == -32000 && capability(message))
+                        // A batch whose items answer method-not-found is the
+                        // endpoint's per-method capability, not the node's
+                        // final answer: the pool must try an endpoint that
+                        // serves the method (measured live: the public
+                        // HyperEVM endpoints are split on
+                        // `eth_getSystemTxsByBlockNumber`, and a
+                        // no-failover batch turned every rotation onto a
+                        // refuser into a failed follow pass). Pool
+                        // exhaustion still fails closed — a declared
+                        // method no endpoint serves stays the
+                        // declaration/endpoint disagreement the boot
+                        // audit names.
+                        || code == -32601
                 })
             })
             .unwrap_or(false);
@@ -413,6 +434,14 @@ impl Rpc {
         Self::with_pool_inner(pool, timeout, false)
     }
 
+    /// A **write-capable** client over an explicit pool: the single-endpoint
+    /// target whose reads ride the anvil batch contract still submits
+    /// writes, and a one-endpoint pool has no failover to silently retry a
+    /// write through.
+    pub fn with_writable_pool(pool: EndpointPool, timeout: Duration) -> Result<Self> {
+        Self::with_pool_inner(pool, timeout, true)
+    }
+
     fn with_pool_inner(pool: EndpointPool, timeout: Duration, write: bool) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -459,7 +488,7 @@ impl Rpc {
 
     fn transport(endpoint: &str, method: &str, source: reqwest::Error) -> Error {
         Error::Transport {
-            endpoint: endpoint.to_string(),
+            endpoint: super::error::redact_key(endpoint),
             method: method.to_string(),
             source,
         }
@@ -467,7 +496,7 @@ impl Rpc {
 
     fn status(endpoint: &str, method: &str, status: u16, body: &str) -> Error {
         Error::Status {
-            endpoint: endpoint.to_string(),
+            endpoint: super::error::redact_key(endpoint),
             method: method.to_string(),
             status,
             body: truncate(body, 300).to_string(),
@@ -476,7 +505,7 @@ impl Rpc {
 
     fn rpc(endpoint: &str, method: &str, payload: RpcError) -> Error {
         Error::Rpc {
-            endpoint: endpoint.to_string(),
+            endpoint: super::error::redact_key(endpoint),
             method: method.to_string(),
             payload,
         }
@@ -484,7 +513,7 @@ impl Rpc {
 
     fn decode(endpoint: &str, method: &str, source: serde_json::Error) -> Error {
         Error::Decode {
-            endpoint: endpoint.to_string(),
+            endpoint: super::error::redact_key(endpoint),
             method: method.to_string(),
             source,
         }
@@ -492,7 +521,7 @@ impl Rpc {
 
     fn encode(endpoint: &str, method: &str, source: serde_json::Error) -> Error {
         Error::Encode {
-            method: format!("{method} ({endpoint})"),
+            method: format!("{method} ({})", super::error::redact_key(endpoint)),
             source,
         }
     }
@@ -643,7 +672,7 @@ impl Rpc {
                     "endpoint fault; cooling it down and trying the next endpoint"
                 );
                 Err(Error::EndpointFault {
-                    endpoint: endpoint.to_string(),
+                    endpoint: super::error::redact_key(endpoint),
                     method: method.to_string(),
                     detail: format!("HTTP {}: {}", status.as_u16(), truncate(&text, 300)),
                 })
@@ -852,7 +881,8 @@ impl Rpc {
     /// (anvil rejects bodies >= 2 MB with `-32600 Invalid request`; public
     /// endpoints answer 413) and no sub-batch exceeds `max_items`.
     pub async fn batch(&self, calls: &[Call]) -> Result<ChunkAnswers> {
-        self.batch_limited(calls, BATCH_MAX_ITEMS, 1 << 20).await
+        self.batch_limited(calls, self.pool.batch_items_cap() as usize, 1 << 20)
+            .await
     }
 
     pub async fn batch_limited(
@@ -870,6 +900,7 @@ impl Rpc {
         // order). The sequential form made one wide window cost the sum of
         // every round-trip (measured live: ~450 s for a 300-block window
         // against the public source — the follow could never keep up).
+        let started = std::time::Instant::now();
         let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
         let mut start = 0usize;
         while start < calls.len() {
@@ -877,24 +908,13 @@ impl Rpc {
             ranges.push(start..end);
             start = end;
         }
-        let mut results: Vec<Option<Result<ChunkAnswers>>> =
-            (0..ranges.len()).map(|_| None).collect();
-        let mut set = tokio::task::JoinSet::new();
-        let mut next = 0usize;
-        while next < ranges.len() || !set.is_empty() {
-            while set.len() < BATCH_CONCURRENCY && next < ranges.len() {
-                let me = self.clone();
-                let chunk = calls[ranges[next].clone()].to_vec();
-                let idx = next;
-                set.spawn(async move { (idx, me.batch_once(&chunk).await) });
-                next += 1;
-            }
-            match set.join_next().await {
-                Some(Ok((idx, r))) => results[idx] = Some(r),
-                Some(Err(join)) => return Err(self.batch_task_error(&join)),
-                None => break,
-            }
-        }
+        let results = self.fanout_chunks(calls, &ranges).await?;
+        tracing::debug!(
+            chunks = ranges.len(),
+            items = calls.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "batch fanout complete"
+        );
         let mut out = Vec::with_capacity(calls.len());
         for (idx, r) in results.into_iter().enumerate() {
             let chunk = match r {
@@ -910,6 +930,35 @@ impl Rpc {
         Ok(out)
     }
 
+    /// Spawn the chunk bodies under the pool's concurrency budget and join
+    /// them in chunk order (order-preserving: the answers map back to the
+    /// calls by index, not by request id).
+    async fn fanout_chunks(
+        &self,
+        calls: &[Call],
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<Vec<Option<Result<ChunkAnswers>>>> {
+        let mut results: Vec<Option<Result<ChunkAnswers>>> =
+            (0..ranges.len()).map(|_| None).collect();
+        let mut set = tokio::task::JoinSet::new();
+        let mut next = 0usize;
+        while next < ranges.len() || !set.is_empty() {
+            while set.len() < self.pool.batch_concurrency() && next < ranges.len() {
+                let me = self.clone();
+                let chunk = calls[ranges[next].clone()].to_vec();
+                let idx = next;
+                set.spawn(async move { (idx, me.batch_once(&chunk).await) });
+                next += 1;
+            }
+            match set.join_next().await {
+                Some(Ok((idx, r))) => results[idx] = Some(r),
+                Some(Err(join)) => return Err(self.batch_task_error(&join)),
+                None => break,
+            }
+        }
+        Ok(results)
+    }
+
     /// A spawned chunk task's failure as the crate's typed error (the code
     /// stays outside the JSON-RPC ranges, like [`missing_from_batch`]'s).
     fn batch_task_error(&self, join: &tokio::task::JoinError) -> Error {
@@ -918,7 +967,7 @@ impl Rpc {
 
     fn batch_task_error_text(&self, message: String) -> Error {
         Error::Rpc {
-            endpoint: self.url().to_string(),
+            endpoint: super::error::redact_key(self.url()),
             method: "batch".to_string(),
             payload: RpcError {
                 code: -1,
@@ -956,7 +1005,7 @@ impl Rpc {
         method: &'static str,
         params: &[P],
     ) -> Result<Vec<Option<T>>> {
-        self.batch_typed_limited(method, params, BATCH_MAX_ITEMS)
+        self.batch_typed_limited(method, params, self.pool.batch_items_cap() as usize)
             .await
     }
 
@@ -988,7 +1037,7 @@ impl Rpc {
     /// each item's decode — the batch may mix methods (the read plan's four
     /// key kinds ride one body).
     pub async fn batch_raw(&self, calls: &[Call]) -> Result<Vec<Option<Box<RawValue>>>> {
-        self.batch_raw_limited(calls, BATCH_MAX_ITEMS).await
+        self.batch_raw_limited(calls, self.pool.batch_items_cap() as usize).await
     }
 
     /// [`Self::batch_raw`] with the caller's own item cap: a local anvil
@@ -1010,7 +1059,7 @@ impl Rpc {
                 ),
                 Err(payload) => {
                     return Err(Error::Rpc {
-                        endpoint: self.url().to_string(),
+                        endpoint: super::error::redact_key(self.url()),
                         method: "batch".to_string(),
                         payload,
                     })
@@ -1031,7 +1080,7 @@ impl Rpc {
             Ok(raw) => serde_json::from_str::<Option<T>>(raw.get())
                 .map_err(|source| Self::decode(self.url(), method, source)),
             Err(payload) => Err(Error::Rpc {
-                endpoint: self.url().to_string(),
+                endpoint: super::error::redact_key(self.url()),
                 method: method.to_string(),
                 payload,
             }),
@@ -1204,7 +1253,7 @@ impl Rpc {
                 Ok(got) if got == expected => verified += 1,
                 Ok(got) => {
                     return Err(Error::WrongChain {
-                        endpoint: self.pool.url(index).to_string(),
+                        endpoint: super::error::redact_key(self.pool.url(index)),
                         got,
                         want: expected,
                     });
@@ -1222,7 +1271,7 @@ impl Rpc {
         self.call_opt(BLOCK_BY_NUMBER, (U64::from(n), txs.full()))
             .await?
             .ok_or_else(|| Error::BlockMissing {
-                endpoint: self.url().to_string(),
+                endpoint: super::error::redact_key(self.url()),
                 n,
             })
     }
@@ -1247,7 +1296,7 @@ impl Rpc {
             .next()
             .flatten()
             .ok_or_else(|| Error::BlockMissing {
-                endpoint: self.url().to_string(),
+                endpoint: super::error::redact_key(self.url()),
                 n,
             })
             .and_then(|raw| self.decode_item("head_and_block", Some(raw)))?;
@@ -1365,6 +1414,25 @@ impl Rpc {
         })
     }
 
+    /// [`Self::call_decode`] with an explicit `from`: a call that must land
+    /// as a specific account (an owner-gated simulation reads `msg.sender`)
+    /// carries it on the wire — the from-less form answers as `0x0` and an
+    /// owner gate reverts it.
+    pub async fn call_decode_from<C: alloy_sol_types::SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: &C,
+    ) -> Result<C::Return> {
+        let mut tx = Self::call_tx(to, &Bytes::from(call.abi_encode()));
+        tx.from = Some(from);
+        let out: Bytes = self.call(ETH_CALL, (tx, BlockNumberOrTag::Latest)).await?;
+        C::abi_decode_returns(&out).map_err(|source| Error::Abi {
+            what: C::SIGNATURE,
+            source,
+        })
+    }
+
     /// eth_call with a state override, returned as raw bytes. Used to discover
     /// ERC20 balance slots without mining anything (anvil's own dealERC20 probe
     /// needs mined writes and fails on a no-mining fork).
@@ -1418,7 +1486,8 @@ impl Rpc {
     /// (measured live: a 300-block catch-up window ground for minutes). A
     /// null answer for a key is a fault, never a silent zero.
     pub async fn read_keys(&self, keys: &[Key], block: u64) -> Result<Vec<Value>> {
-        self.read_keys_limited(keys, block, BATCH_MAX_ITEMS).await
+        self.read_keys_limited(keys, block, self.pool.batch_items_cap() as usize)
+            .await
     }
 
     /// [`Self::read_keys`] with the caller's own item cap (the anvil
@@ -2017,6 +2086,18 @@ mod tests {
         assert!(!endpoint_capability_refusal(
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
         ));
+        // A BATCH whose items all answer method-not-found is the endpoint's
+        // per-method capability (measured live: the public HyperEVM
+        // endpoints are split on `eth_getSystemTxsByBlockNumber`) — the
+        // pool must try an endpoint that serves the method.
+        assert!(endpoint_capability_refusal(
+            r#"[{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}]"#
+        ));
+        // A single-object `-32601` stays the node's answer (the BAL
+        // fallback branches on it).
+        assert!(!endpoint_capability_refusal(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+        ));
         assert!(endpoint_fault(
             reqwest::StatusCode::OK,
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unsupported block number"}}"#
@@ -2148,6 +2229,8 @@ mod tests {
             chain_id: None,
             weight: 1,
             max_log_range: cap,
+            max_batch_items: crate::DEFAULT_MAX_BATCH_ITEMS as u64,
+            max_batch_concurrency: crate::DEFAULT_BATCH_CONCURRENCY as u64,
         };
         let pool = EndpointPool::from_specs([spec], Scheme::Http, PoolPolicy::default())
             .expect("a valid pool");

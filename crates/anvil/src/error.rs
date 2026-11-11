@@ -10,10 +10,15 @@
 //!
 //! Policy is a typed predicate, never inferred from message text
 //! (retry-discipline): [`Error::is_method_not_found`] is the capability gate
-//! every read path branches on. The measured retry matrix lives here as the
-//! record (no caller consults it today): `-32603 Internal error` is the only
-//! node code worth retrying; `-32600` / `-32601` / `-32602` are content
-//! refusals that reproduce identically; a connect-phase transport fault
+//! every read path branches on. Two measured exception shapes are keyed on
+//! the message, not the bare code: drpc's archive refusal ("historical state
+//! needed to replay") and Alchemy's unsupported-method refusal (`-32600`
+//! `"Unsupported method: <method> on <network>"` — the gateway's wording for
+//! a method its chain product does not serve). The measured retry matrix
+//! lives here as the record (no caller consults it today): `-32603 Internal
+//! error` is the only node code worth retrying; `-32600` / `-32601` /
+//! `-32602` are content refusals that reproduce identically; a connect-phase
+//! transport fault
 //! provably never sent the bytes (safe to resend) while a post-send timeout
 //! leaves a write's fate unknown — reconcile against the chain (the dedup
 //! truth), never a silent resend. Prefer the `set*` cheatcodes over
@@ -37,6 +42,30 @@ pub(crate) fn missing_from_batch(id: u64) -> RpcError {
         message: format!("batch response is missing item id {id}").into(),
         data: None,
     }
+}
+
+/// A URL path segment that carries a credential (measured: Alchemy's
+/// `/v2/alch_…` gateway key) must never land in logs. `Error`'s `Display`
+/// surfaces endpoints verbatim, so the segment is masked at construction:
+/// enough of the URL remains to attribute the failure, the key does not
+/// survive.
+pub fn redact_key(endpoint: &str) -> String {
+    const MARK: &str = "alch_";
+    let Some(start) = endpoint.find(MARK) else {
+        return endpoint.to_string();
+    };
+    let after = &endpoint[start + MARK.len()..];
+    let key_end = start
+        + MARK.len()
+        + after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(after.len());
+    let mut masked = String::with_capacity(endpoint.len());
+    masked.push_str(&endpoint[..start]);
+    masked.push_str(MARK);
+    masked.push_str("***");
+    masked.push_str(&endpoint[key_end..]);
+    masked
 }
 
 /// Everything the anvil/reth boundary can fail with.
@@ -228,7 +257,27 @@ impl Error {
     /// `eth_getBlockAccessList` answers `-32601`). Callers gate on it to fall
     /// back to older data sources.
     pub fn is_method_not_found(&self) -> bool {
-        matches!(self, Error::Rpc { payload, .. } if payload.code == -32601)
+        match self {
+            Error::Rpc { method, payload, .. } => {
+                if payload.code == -32601 {
+                    return true;
+                }
+                if payload.code != -32600 {
+                    return false;
+                }
+                // Measured Alchemy gateway shapes, both keyed on the method
+                // the request named: a dedicated prefix ("Unsupported
+                // method: …") and an availability note ("… is not available
+                // on the ETH_MAINNET"). A bare `-32600` invalid-request
+                // (anvil's 2 MB body refusal) never mentions the method and
+                // stays a fault.
+                let message = payload.message.to_ascii_lowercase();
+                message.starts_with("unsupported method")
+                    || (message.contains(&method.to_ascii_lowercase())
+                        && message.contains("not available"))
+            }
+            _ => false,
+        }
     }
 
     /// The endpoint's response-size refusal (measured live: `-32008`
@@ -338,6 +387,61 @@ mod tests {
             },
         };
         assert!(err.is_method_not_found());
+    }
+
+    /// Measured live (Alchemy, 2026-11): the gateway refuses an unserved
+    /// method with `-32600` — either `"Unsupported method: <method> on
+    /// <network>"` or `"<method> is not available on the ETH_MAINNET"` — not
+    /// the spec's `-32601`. A bare `-32600` invalid-request (anvil's 2 MB
+    /// body refusal) is a real fault, never absence.
+    #[test]
+    fn alchemy_unsupported_method_is_absence_bare_invalid_request_is_not() {
+        let refusal = |code: i64, method: &'static str, message: &'static str| {
+            Error::Rpc {
+                endpoint: "https://eth-mainnet.g.alchemy.com/v2/alch_***".into(),
+                method: method.into(),
+                payload: RpcError {
+                    code,
+                    message: message.into(),
+                    data: None,
+                },
+            }
+        };
+        assert!(refusal(
+            -32600,
+            "eth_getBlockAccessList",
+            "Unsupported method: eth_getBlockAccessList on ETH_MAINNET"
+        )
+        .is_method_not_found());
+        assert!(refusal(
+            -32600,
+            "eth_getSystemTxsByBlockNumber",
+            "eth_getSystemTxsByBlockNumber is not available on the ETH_MAINNET. For more information see our docs: https://docs.alchemy.com/alchemy/documentation/apis/ethereum"
+        )
+        .is_method_not_found());
+        assert!(!refusal(-32600, "eth_call", "Invalid request").is_method_not_found());
+    }
+
+    /// A credential-bearing URL segment is masked at construction: the
+    /// failure stays attributable, the key does not survive.
+    #[test]
+    fn redact_key_masks_only_the_key_segment() {
+        assert_eq!(
+            super::redact_key("https://eth-mainnet.g.alchemy.com/v2/alch_000000000000000000000000000000000000000"),
+            "https://eth-mainnet.g.alchemy.com/v2/alch_***"
+        );
+        assert_eq!(
+            super::redact_key("https://eth-mainnet.g.alchemy.com/v2/alch_key-at-end/alch_x9y8"),
+            "https://eth-mainnet.g.alchemy.com/v2/alch_***/alch_x9y8"
+        );
+        assert_eq!(
+            super::redact_key("https://eth-mainnet.g.alchemy.com/v2/alch_000000000000000000000000000000000000000?x=1"),
+            "https://eth-mainnet.g.alchemy.com/v2/alch_***?x=1"
+        );
+        assert_eq!(
+            super::redact_key("http://reth:8545"),
+            "http://reth:8545"
+        );
     }
 
     /// The bare revert is typed by code and empty data, never text: a revert
