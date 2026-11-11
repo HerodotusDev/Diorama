@@ -1,0 +1,56 @@
+# Diorama CI/CD — STAGING ONLY.
+#
+# `main` is intentionally NOT wired: this repo has no prod deployment. The
+# reusable workflow (HerodotusDev/cicd build-and-deploy) would target
+# daloc-diorama-prod on a main push; the triggers below never fire on main,
+# and the job-level `if` guards a stray workflow_dispatch from another
+# branch. To add prod later, wire `main` deliberately — do not piggyback.
+#
+# Tunnel safety: the per-repo WireGuard peer serves ONE tunnel at a time.
+# The two jobs below are strictly sequential (call-deploy needs apply-anvil):
+# the tunnel is a background process that dies with its job, so apply-anvil's
+# tunnel is gone before the reusable workflow's jobs open theirs. Do not run
+# these jobs concurrently (e.g. by removing the needs:).
+name: Build and deploy (staging)
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # The staging support layer (k8s/stg-anvil): namespace, wiring ConfigMap,
+  # instance ConfigMaps, PVCs, and the two fork anvils — everything the
+  # reusable workflow does not apply. Runs first: the engines wait for their
+  # anvils, and the namespace must exist before the deploy job applies
+  # k8s/stg/*-deployment.yaml into it.
+  apply-anvil:
+    name: apply staging anvil layer
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'develop'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cluster access
+        uses: HerodotusDev/cicd/.github/actions/cluster-access@main
+        with:
+          wg_config: ${{ secrets.WG_CONFIG }}
+          deployer_kubeconfig: ${{ secrets.DEPLOYER_KUBECONFIG }}
+          namespace: daloc-diorama-stg
+
+      - name: Apply anvil layer
+        run: |
+          kubectl apply -k k8s/stg-anvil
+
+  call-deploy:
+    name: build + push + deploy (staging)
+    needs: [apply-anvil]
+    if: github.ref_name == 'develop'
+    uses: HerodotusDev/cicd/.github/workflows/build-and-deploy.yaml@main
+    secrets: inherit
