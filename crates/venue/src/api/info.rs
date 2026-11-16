@@ -99,6 +99,12 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         InfoRequest::Meta { dex } => meta(&dex, &state),
         InfoRequest::MetaAndAssetCtxs { dex } => meta_and_ctxs(&dex, &state),
         InfoRequest::PerpDexs => Ok(Json(vec![None::<crate::wire::PerpDex>]).into_response()),
+        InfoRequest::AllPerpMetas => all_perp_metas(&state),
+        // The sim holds no coin annotations or categories; the real API lists
+        // only the coins that have one, so the empty list is a valid answer.
+        InfoRequest::PerpConciseAnnotations | InfoRequest::PerpCategories => {
+            Ok(Json(Vec::<()>::new()).into_response())
+        }
         InfoRequest::L2Book {
             coin,
             n_sig_figs,
@@ -444,6 +450,12 @@ async fn active_asset(
 fn meta(dex: &Option<String>, state: &ApiState) -> Result<Response> {
     expect_default_dex(dex)?;
     Ok(Json(state.feed.meta().ok_or(Error::Warming)?).into_response())
+}
+
+/// `allPerpMetas`: one metadata entry per perp dex, in `perpDexs` order. The
+/// sim serves the first dex only, so this is `meta` in a one-element list.
+fn all_perp_metas(state: &ApiState) -> Result<Response> {
+    Ok(Json(vec![state.feed.meta().ok_or(Error::Warming)?]).into_response())
 }
 
 /// `metaAndAssetCtxs`: the cached metadata + per-market ctxs, default dex.
@@ -851,5 +863,30 @@ mod tests {
         let err = active_asset_data(&state, user, &account::Account::default(), "ETH").unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }), "{err}");
         assert!(err.to_string().contains("not a simulated account"), "{err}");
+    }
+
+    /// `allPerpMetas` is `meta` in a one-element list (the first dex only);
+    /// the annotation and category lists are empty arrays, never a string.
+    #[test]
+    fn all_perp_metas_wraps_the_first_dex_meta() {
+        let feed = crate::sim::feed_with(&[("ETH", "100", "101")]);
+        feed.put_meta(crate::sim::meta_with("ETH", 10), crate::now_ms());
+        let api = crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+        let state = ApiState::new(
+            Arc::new(feed),
+            Arc::new(crate::sim::Sim::memory()),
+            api,
+            None,
+            None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let metas = serde_json::to_value(vec![state.feed.meta().unwrap()]).unwrap();
+        let arr = metas.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["universe"][0]["name"], "ETH");
+        assert_eq!(arr[0]["collateralToken"], 0);
+        assert!(all_perp_metas(&state).is_ok());
     }
 }

@@ -98,6 +98,15 @@ pub(crate) enum InfoRequest {
     },
     #[serde(rename = "perpDexs")]
     PerpDexs,
+    /// The metadata of every perp dex, in `perpDexs` order (one here).
+    #[serde(rename = "allPerpMetas")]
+    AllPerpMetas,
+    /// `[[coin, {category, description, displayName, keywords}], …]`.
+    #[serde(rename = "perpConciseAnnotations")]
+    PerpConciseAnnotations,
+    /// `[[coin, category], …]`.
+    #[serde(rename = "perpCategories")]
+    PerpCategories,
     #[serde(rename = "l2Book")]
     L2Book {
         coin: String,
@@ -136,6 +145,9 @@ impl InfoRequest {
             InfoRequest::Meta { .. } => "meta",
             InfoRequest::MetaAndAssetCtxs { .. } => "metaAndAssetCtxs",
             InfoRequest::PerpDexs => "perpDexs",
+            InfoRequest::AllPerpMetas => "allPerpMetas",
+            InfoRequest::PerpConciseAnnotations => "perpConciseAnnotations",
+            InfoRequest::PerpCategories => "perpCategories",
             InfoRequest::FrontendOpenOrders { .. } => "frontendOpenOrders",
             InfoRequest::OrderStatus { .. } => "orderStatus",
             InfoRequest::PerpsAtOpenInterestCap { .. } => "perpsAtOpenInterestCap",
@@ -807,6 +819,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, InfoRequest::Unrouted);
+        for (body, kind) in [
+            (r#"{"type":"allPerpMetas"}"#, "allPerpMetas"),
+            (
+                r#"{"type":"perpConciseAnnotations"}"#,
+                "perpConciseAnnotations",
+            ),
+            (r#"{"type":"perpCategories"}"#, "perpCategories"),
+        ] {
+            let r: InfoRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(r.kind(), kind);
+        }
     }
 
     /// The exact live sample (docs, measured): the identity the consumer gates on
