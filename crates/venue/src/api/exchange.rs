@@ -29,11 +29,12 @@ use std::sync::Arc;
 /// their client parses), as are the TP/SL groupings the sim does not model. An
 /// order action's `builder` is accepted when the account approved that builder
 /// for at least `f` (CoreWriter `approveBuilderFee`) and charged on every fill
-/// (see `order_builder`). The signature is accepted, never verified (the devnet has
-/// no keys — the anvil-impersonation analogue), and the acting account is
-/// read from `user` — or from
-/// `vaultAddress`, which routes the action to that vault or subaccount
-/// (see `acting_owner`).
+/// (see `order_builder`). The acting account is the venue's: the signer is
+/// recovered from the signature (`signing`) and acts for the account that
+/// registered it as an API wallet, or for its own — unless the body names
+/// `user`, the keyless harness shape (the anvil-impersonation analogue), whose
+/// signature is not checked. `vaultAddress` routes the action to that vault or
+/// subaccount (see `acting_owner`).
 pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
     let req: ExchangeBody = serde_json::from_slice(&body)
         .map_err(|source| Error::bad_request(format!("invalid exchange request: {source}")))?;
@@ -55,7 +56,7 @@ pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) ->
         }
         return Ok(noop_response(&req));
     }
-    let owner = match acting_user(&state, &req) {
+    let owner = match acting_user(&state, &req, &body) {
         Ok((_, owner)) => owner,
         Err(response) => return Ok(*response),
     };
@@ -184,40 +185,60 @@ fn dispatch(state: &Arc<ApiState>, owner: Address, body: &Bytes, req: &ExchangeB
     }
 }
 
-/// The acting account + the venue's nonce rule (the 100 highest per
-/// signer, window (T − 2 d, T + 1 d), no reuse). `Err` carries the ready
-/// err-envelope response.
 /// The acting account's owner: a request that names a `vaultAddress` acts on
-/// that vault or subaccount instead of the signer (docs: "Subaccounts and
-/// vaults do not have private keys. To perform actions on behalf of a
-/// subaccount or vault signing should be done by the master account and the
-/// vaultAddress field should be set to the address of the subaccount or
-/// vault."). Pure, so the routing is testable without a state.
-fn acting_owner(req: &ExchangeBody) -> Option<Address> {
-    req.vault_address.or(req.user)
+/// that vault or subaccount instead of the signer's account (docs:
+/// "Subaccounts and vaults do not have private keys. To perform actions on
+/// behalf of a subaccount or vault signing should be done by the master
+/// account and the vaultAddress field should be set to the address of the
+/// subaccount or vault."). Pure, so the routing is testable without a state.
+fn acting_owner(req: &ExchangeBody, account: Address) -> Address {
+    req.vault_address.unwrap_or(account)
 }
 
-/// The signer and the owner. The request's `user` is the signer — nonces are
-/// consumed per signer (the docs' per-address nonce set) — and the state the
-/// action touches is the owner's. The signature is never verified, so the
-/// master's authority is moot.
+/// The signer and the owner, after the venue's nonce rule (the 100 highest
+/// per signer, window (T − 2 d, T + 1 d), no reuse). Nonces are consumed per
+/// signer (the docs' per-address nonce set); the state the action touches is
+/// the owner's. `Err` carries the ready err-envelope response.
 fn acting_user(
     state: &Arc<ApiState>,
     req: &ExchangeBody,
+    body: &[u8],
 ) -> std::result::Result<(Address, Address), Box<Response>> {
-    let Some(user) = req.user else {
-        return Err(Box::new(err_envelope(
-            "venue-sim: an action must name the acting account in `user` — the devnet has \
-                 no keys to derive it from the signature. See docs/INTEGRATION.md."
-                .to_string(),
-        )));
+    let refuse = |reason: String| Box::new(err_envelope(reason));
+    let (signer, account) = match req.user {
+        Some(user) => (user, user),
+        None => signed_account(state, req, body).map_err(refuse)?,
     };
     if let Some(nonce) = req.nonce {
-        if let Err(e) = state.sim.use_nonce(user, nonce, crate::now_ms()) {
-            return Err(Box::new(err_envelope(e.to_string())));
+        if let Err(e) = state.sim.use_nonce(signer, nonce, crate::now_ms()) {
+            return Err(refuse(e.to_string()));
         }
     }
-    Ok((user, acting_owner(req).unwrap_or(user)))
+    Ok((signer, acting_owner(req, account)))
+}
+
+/// The venue's own reading of a body without `user`: the signer recovered
+/// from the signature, and the account it acts for (the one that registered
+/// it as an API wallet, or its own). A signer that is neither gets the
+/// venue's string — a tampered body recovers to such an address.
+fn signed_account(
+    state: &ApiState,
+    req: &ExchangeBody,
+    body: &[u8],
+) -> std::result::Result<(Address, Address), String> {
+    if req.signature.is_none() {
+        return Err(
+            "venue-sim: an action must carry the venue's signature, or name the \
+                    acting account in `user` (the keyless harness shape)."
+                .to_string(),
+        );
+    }
+    let signer = crate::api::signing::recover_signer(body)?;
+    match state.sim.signer_account(signer) {
+        Ok(Some(account)) => Ok((signer, account)),
+        Ok(None) => Err(format!("User or API Wallet {signer:#x} does not exist.")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The docs' "must be skipped if false" rule for the `f`/`a` flags: a present
@@ -634,13 +655,14 @@ mod tests {
     /// have private keys. To perform actions on behalf of a subaccount or
     /// vault signing should be done by the master account and the
     /// vaultAddress field should be set to the address of the subaccount or
-    /// vault." — the owner is the vault when present, the signer otherwise.
+    /// vault." — the owner is the vault when present, the signer's account
+    /// otherwise.
     #[test]
     fn acting_owner_routes_vault_and_subaccount_actions() {
-        let master = "0x00000000000000000000000000000000000000e1"
+        let master: Address = "0x00000000000000000000000000000000000000e1"
             .parse()
             .unwrap();
-        let vault = "0x00000000000000000000000000000000000000e2"
+        let vault: Address = "0x00000000000000000000000000000000000000e2"
             .parse()
             .unwrap();
         let plain: ExchangeBody = serde_json::from_str(
@@ -648,8 +670,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            acting_owner(&plain),
-            Some(master),
+            acting_owner(&plain, master),
+            master,
             "no vault: the signer acts"
         );
         let routed: ExchangeBody = serde_json::from_str(
@@ -657,8 +679,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            acting_owner(&routed),
-            Some(vault),
+            acting_owner(&routed, master),
+            vault,
             "the vault's state is touched"
         );
     }
@@ -911,6 +933,11 @@ mod tests {
         let body = format!(
             r#"{{"action":{{"type":"order","orders":[{{"a":0,"b":true,"p":"105","s":"2","t":{{"limit":{{"tif":"Ioc"}}}}}}],"grouping":"na","builder":{builder}}},"user":"{OWNER}"}}"#
         );
+        post(state, body).await
+    }
+
+    /// POST `body` to `/exchange` and return the envelope.
+    async fn post(state: &Arc<ApiState>, body: String) -> serde_json::Value {
         let response = exchange(State(state.clone()), Bytes::from(body))
             .await
             .unwrap();
@@ -918,6 +945,121 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A buy of 2 ETH at `price` (IOC) as a venue client sends it: no `user`,
+    /// signed by `key` over the venue's hash.
+    fn signed_order(key: &k256::ecdsa::SigningKey, price: &str, nonce: u64) -> String {
+        let action = format!(
+            r#"{{"type":"order","orders":[{{"a":0,"b":true,"p":"{price}","s":"2","r":false,"t":{{"limit":{{"tif":"Ioc"}}}}}}],"grouping":"na"}}"#
+        );
+        let digest = crate::api::signing::signing_digest(&action, nonce, None, None).unwrap();
+        let (signature, recovery) = key.sign_prehash_recoverable(digest.as_slice()).unwrap();
+        let bytes = signature.to_bytes();
+        let (r, s) = (
+            alloy_primitives::hex::encode(&bytes[..32]),
+            alloy_primitives::hex::encode(&bytes[32..]),
+        );
+        let v = 27 + recovery.to_byte();
+        format!(
+            r#"{{"action":{action},"nonce":{nonce},"signature":{{"r":"0x{r}","s":"0x{s}","v":{v}}},"vaultAddress":null,"expiresAfter":null}}"#
+        )
+    }
+
+    fn key(byte: u8) -> (k256::ecdsa::SigningKey, Address) {
+        let key = k256::ecdsa::SigningKey::from_slice(&[byte; 32]).unwrap();
+        let address = Address::from_public_key(key.verifying_key());
+        (key, address)
+    }
+
+    /// The venue client's shape end to end: an order signed by the API
+    /// wallet an account registered, sent without `user`, fills on that
+    /// account (and its nonce is the wallet's); the harness shape, `user`
+    /// named and nothing signed, still acts as named.
+    #[tokio::test]
+    async fn a_signed_order_acts_for_the_account_that_registered_its_key() {
+        let state = builder_state();
+        let owner: Address = OWNER.parse().unwrap();
+        let (agent, agent_address) = key(0x11);
+        state.sim.note_agent(owner, agent_address, "agent").unwrap();
+        let nonce = crate::now_ms();
+
+        let out = post(&state, signed_order(&agent, "105", nonce)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
+            "2"
+        );
+        assert!(
+            balance(&state, OWNER) < "1000".parse().unwrap(),
+            "the owner paid"
+        );
+        assert_eq!(state.sim.user_fills(owner).unwrap().len(), 1);
+
+        let replay = post(&state, signed_order(&agent, "105", nonce)).await;
+        assert_eq!(replay["status"], "err", "the wallet's nonce is spent");
+        assert_eq!(replay["response"], "Nonce already used.");
+
+        let out = post_order(&state, "null").await;
+        assert_eq!(out["status"], "ok", "the harness shape: {out}");
+        assert_eq!(state.sim.user_fills(owner).unwrap().len(), 2);
+    }
+
+    /// A key no account registered, a body changed after it was signed (it
+    /// recovers to nobody's address), and a body with neither `user` nor a
+    /// signature are refused, and nothing fills.
+    #[tokio::test]
+    async fn an_unknown_or_tampered_signature_is_refused_with_the_venues_string() {
+        let state = builder_state();
+        let owner: Address = OWNER.parse().unwrap();
+        let (agent, agent_address) = key(0x11);
+        let nonce = crate::now_ms();
+
+        let out = post(&state, signed_order(&agent, "105", nonce)).await;
+        assert_eq!(out["status"], "err");
+        assert_eq!(
+            out["response"],
+            format!("User or API Wallet {agent_address:#x} does not exist.")
+        );
+
+        state.sim.note_agent(owner, agent_address, "agent").unwrap();
+        let tampered =
+            signed_order(&agent, "105", nonce + 1).replacen(r#""p":"105""#, r#""p":"106""#, 1);
+        let out = post(&state, tampered).await;
+        assert_eq!(out["status"], "err");
+        let reason = out["response"].as_str().unwrap();
+        assert!(reason.starts_with("User or API Wallet 0x"), "{reason}");
+
+        let unsigned = r#"{"action":{"type":"order","orders":[],"grouping":"na"}}"#;
+        let out = post(&state, unsigned.to_string()).await;
+        assert_eq!(out["status"], "err");
+        assert!(
+            out["response"].as_str().unwrap().contains("signature"),
+            "{out}"
+        );
+        assert!(state.sim.user_fills(owner).unwrap().is_empty());
+    }
+
+    /// The signer's account: the one that registered it as an API wallet,
+    /// else its own; nobody's is `None`; a wallet two accounts registered is
+    /// refused rather than guessed.
+    #[test]
+    fn a_signer_acts_for_its_registering_account_or_its_own() {
+        let state = builder_state();
+        let (owner, builder): (Address, Address) =
+            (OWNER.parse().unwrap(), BUILDER.parse().unwrap());
+        let (_, agent) = key(0x11);
+        let (_, stranger) = key(0x22);
+        assert_eq!(state.sim.signer_account(owner).unwrap(), Some(owner));
+        assert_eq!(state.sim.signer_account(agent).unwrap(), None);
+        assert_eq!(state.sim.signer_account(stranger).unwrap(), None);
+
+        state.sim.note_agent(owner, agent, "agent").unwrap();
+        assert_eq!(state.sim.signer_account(agent).unwrap(), Some(owner));
+
+        state.sim.note_agent(builder, agent, "agent").unwrap();
+        let refusal = state.sim.signer_account(agent).unwrap_err().to_string();
+        assert!(refusal.contains("more than one account"), "{refusal}");
     }
 
     fn balance(state: &ApiState, who: &str) -> rust_decimal::Decimal {
