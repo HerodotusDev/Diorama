@@ -39,21 +39,24 @@ pub(crate) struct FastCtx {
     pub mid: Option<Decimal>,
 }
 
-/// Every served perp's mark and mid: the `fastAssetCtxs` state.
+/// Every served perp's mark and mid, over every dex's coins (the default
+/// dex's plain names, a builder dex's `dex:COIN`): the `fastAssetCtxs` state.
+/// A coin with no mark yet is left out. (The venue's map also carries the spot
+/// `@N` and outcome `#N` keys; the sim holds only their mids, no marks, so
+/// they are not served.)
 pub(crate) fn fast_snapshot(feed: &MarketFeed) -> BTreeMap<String, FastCtx> {
     let mut out = BTreeMap::new();
-    let Some(meta) = feed.meta() else {
-        return out;
-    };
-    let mids = feed.all_mids().0;
-    for asset in &meta.universe {
-        let Some(mark) = feed.mark(&asset.name) else {
-            continue;
-        };
-        let mid = crate::sim::account::ctx_of(feed, &asset.name)
-            .and_then(|ctx| ctx.mid_px)
-            .or_else(|| mids.get(&asset.name).copied());
-        out.insert(asset.name.clone(), FastCtx { mark, mid });
+    for (dex, coins) in feed.dex_coins() {
+        let mids = feed.all_mids_of(&dex).0;
+        for coin in coins {
+            let Some(mark) = feed.mark(&coin) else {
+                continue;
+            };
+            let mid = crate::sim::account::ctx_of(feed, &coin)
+                .and_then(|ctx| ctx.mid_px)
+                .or_else(|| mids.get(&coin).copied());
+            out.insert(coin, FastCtx { mark, mid });
+        }
     }
     out
 }
@@ -165,37 +168,79 @@ impl PacCtx {
     }
 }
 
-/// The first dex's contexts in universe order (`None` for a coin with no live
-/// context: its slot stays empty so the indexes keep lining up).
-pub(crate) fn pac_snapshot(feed: &MarketFeed) -> Option<Vec<Option<PacCtx>>> {
-    let meta = feed.meta()?;
-    Some(
-        meta.universe
-            .iter()
-            .map(|asset| crate::sim::account::ctx_of(feed, &asset.name).map(|ctx| PacCtx::of(&ctx)))
-            .collect(),
-    )
+/// The dexes in the order the venue's per-dex pushes list them: the default
+/// dex (`""`) first, then the others alphabetically (measured: abcd, cash,
+/// flx, hyna, io, km, mkts, para, vntl, xyz), not in `perpDexs` order.
+pub(crate) fn dex_order(feed: &MarketFeed) -> Vec<String> {
+    let mut named: Vec<String> = feed
+        .dex_collateral_tokens()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    named.sort_unstable();
+    std::iter::once(String::new()).chain(named).collect()
 }
 
-/// The frame body (`[[dex, [ctx, ...]]]`): every field on the first push, only
-/// the changed fields after it (an unchanged coin is `{}` so the indexes keep
-/// lining up). `None` when nothing changed.
-pub(crate) fn pac_frame(
-    prev: Option<&Vec<Option<PacCtx>>>,
-    next: &[Option<PacCtx>],
-) -> Option<String> {
+/// One dex's `pac` slots in universe order: the coin and its context (`None`
+/// for a coin with no live context: the slot stays empty so the indexes keep
+/// lining up).
+pub(crate) type PacSlots = Vec<(String, Option<PacCtx>)>;
+
+/// Every dex's slots, in [`dex_order`].
+pub(crate) type PacSnapshot = Vec<(String, PacSlots)>;
+
+/// The `pac` state: each dex's contexts in its universe order. Empty while no
+/// dex has landed.
+pub(crate) fn pac_snapshot(feed: &MarketFeed) -> PacSnapshot {
+    let mut coins: BTreeMap<String, Vec<String>> = feed.dex_coins().into_iter().collect();
+    dex_order(feed)
+        .into_iter()
+        .filter_map(|dex| {
+            let slots = coins
+                .remove(&dex)?
+                .into_iter()
+                .map(|coin| {
+                    let ctx = crate::sim::account::ctx_of(feed, &coin).map(|c| PacCtx::of(&c));
+                    (coin, ctx)
+                })
+                .collect();
+            Some((dex, slots))
+        })
+        .collect()
+}
+
+/// The frame body (`[[dex, [ctx, ...]], ...]`): every field on the first push,
+/// only the changed fields after it (an unchanged coin is `{}` so the indexes
+/// keep lining up). Every dex is listed in every frame, as the venue does.
+/// `None` when nothing changed.
+pub(crate) fn pac_frame(prev: Option<&PacSnapshot>, next: &PacSnapshot) -> Option<String> {
     let mut any = prev.is_none();
-    let slots: Vec<Value> = next
+    let dexs: Vec<Value> = next
         .iter()
-        .enumerate()
-        .map(|(i, now)| {
-            let before = prev.and_then(|p| p.get(i)).and_then(Option::as_ref);
-            let patch = now.as_ref().map(|n| n.patch(before)).unwrap_or_default();
-            any |= !patch.is_empty();
-            Value::Object(patch)
+        .map(|(dex, slots)| {
+            let before = prev
+                .and_then(|p| p.iter().find(|(d, _)| d == dex))
+                .map(|(_, s)| s);
+            let slots: Vec<Value> = slots
+                .iter()
+                .enumerate()
+                .map(|(i, (coin, now))| {
+                    // A slot is compared only with the same coin's previous one
+                    // (a relisted universe must not diff against a neighbour).
+                    let before = before
+                        .and_then(|b| b.get(i))
+                        .filter(|(c, _)| c == coin)
+                        .and_then(|(_, ctx)| ctx.as_ref());
+                    let patch = now.as_ref().map(|n| n.patch(before)).unwrap_or_default();
+                    any |= !patch.is_empty();
+                    Value::Object(patch)
+                })
+                .collect();
+            json!([dex, slots])
         })
         .collect();
-    any.then(|| deflate_b64(&json!([["", slots]]).to_string()))
+    any.then(|| deflate_b64(&Value::Array(dexs).to_string()))
 }
 
 // ---------------------------------------------------------------- l2
@@ -304,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn pac_frames_keep_one_slot_per_coin() {
+    fn pac_frames_keep_one_slot_per_coin_and_list_every_dex() {
         let ctx = |mark: &str| PacCtx {
             funding: "0.0000125".parse().unwrap(),
             open_interest: "10".parse().unwrap(),
@@ -315,25 +360,45 @@ mod tests {
             mid_px: None,
             day_base_vlm: "5".parse().unwrap(),
         };
-        let first = vec![Some(ctx("100")), Some(ctx("200"))];
+        let snapshot = |eth: &str, tsla: &str| -> PacSnapshot {
+            vec![
+                (
+                    String::new(),
+                    vec![
+                        ("BTC".to_string(), Some(ctx("100"))),
+                        ("ETH".to_string(), Some(ctx(eth))),
+                    ],
+                ),
+                (
+                    "xyz".to_string(),
+                    vec![
+                        ("xyz:TSLA".to_string(), Some(ctx(tsla))),
+                        ("xyz:GONE".to_string(), None),
+                    ],
+                ),
+            ]
+        };
+        let first = snapshot("200", "300");
         let v: Value =
             serde_json::from_str(&inflate_b64(&pac_frame(None, &first).unwrap())).unwrap();
-        let slots = v[0][1].as_array().unwrap();
         assert_eq!(v[0][0], "");
+        assert_eq!(v[1][0], "xyz");
+        let slots = v[0][1].as_array().unwrap();
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].as_object().unwrap().len(), 8, "every field first");
         assert_eq!(slots[0]["midPx"], Value::Null);
+        assert_eq!(
+            v[1][1][1],
+            json!({}),
+            "a coin without a context is an empty object"
+        );
 
-        let next = vec![Some(ctx("100")), Some(ctx("201"))];
+        // Only the xyz coin moved: the default dex is still listed, all `{}`.
+        let next = snapshot("200", "301");
         let v: Value =
             serde_json::from_str(&inflate_b64(&pac_frame(Some(&first), &next).unwrap())).unwrap();
-        let slots = v[0][1].as_array().unwrap();
-        assert_eq!(
-            slots[0],
-            json!({}),
-            "an unchanged coin keeps its empty slot"
-        );
-        assert_eq!(slots[1], json!({"markPx": "201"}));
+        assert_eq!(v[0][1], json!([{}, {}]), "an unchanged dex keeps its slots");
+        assert_eq!(v[1][1][0], json!({"markPx": "301"}));
         assert!(pac_frame(Some(&next), &next).is_none());
     }
 

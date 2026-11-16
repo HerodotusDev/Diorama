@@ -31,9 +31,6 @@ use std::sync::Arc;
 /// oldest entries drop first.
 pub(crate) const LEDGER_BOUND: usize = 10_000;
 
-/// The fee token every fill carries (the venue's collateral).
-const FEE_TOKEN: &str = "USDC";
-
 /// One fill, as the venue's `userFills` serves it (camelCase; decimals are
 /// the wire's nano-trimmed strings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -225,6 +222,10 @@ pub(crate) struct FillRecord<'a> {
     pub oid: u64,
     pub cloid: Option<B128>,
     pub liquidity: Liquidity,
+    /// The token the fee was paid in: the collateral token's name of the
+    /// fill's dex (`USDC` on the default dex, `USDH` on a USDH dex), from
+    /// [`MarketFeed::fee_token_of_coin`](crate::feed::MarketFeed::fee_token_of_coin).
+    pub fee_token: &'a str,
 }
 
 /// A deterministic transaction hash from the trade id: `0x` + 64 hex digits.
@@ -276,7 +277,7 @@ pub(crate) fn record_fill(
             cloid: fill
                 .cloid
                 .map(|c| format!("0x{}", alloy_primitives::hex::encode(c))),
-            fee_token: FEE_TOKEN.to_string(),
+            fee_token: fill.fee_token.to_string(),
             twap_id: None,
         },
     );
@@ -381,6 +382,7 @@ mod tests {
                 address: who,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: amount.parse().unwrap(),
             },
         )
@@ -647,6 +649,7 @@ mod tests {
             oid: 1,
             cloid: None,
             liquidity: Liquidity::Taker,
+            fee_token: "USDC",
         };
         for _ in 0..LEDGER_BOUND + 5 {
             record_fill(&mut account, &mut next_tid, 1, &fill);
@@ -679,13 +682,15 @@ mod tests {
     fn an_old_state_file_loads_and_the_ledger_round_trips() {
         let old = r#"{"epoch": 2, "next_oid": 5, "accounts": {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {"perp_balance": "12"}}}"#;
-        let state: crate::sim::SimState = serde_json::from_str(old).unwrap();
+        let mut state: crate::sim::SimState = serde_json::from_str(old).unwrap();
+        // The load folds the single balance into the default dex's ledger.
+        state.migrate();
         let a = Address::repeat_byte(0xaa);
         assert_eq!(state.next_tid, 0);
         assert!(state.accounts[&a].fills.is_empty());
         assert!(state.accounts[&a].fundings.is_empty());
+        assert_eq!(state.accounts[&a].perp_balance(""), dec("12"));
 
-        let mut state = state;
         let mut next_tid = state.next_tid;
         let facts = FillFacts::close("ETH", Side::Buy, dec("1"), dec("2"), 1);
         let effect = FillEffect::of(dec("-1"), dec("1"), dec("3"));
@@ -695,6 +700,7 @@ mod tests {
             oid: 4,
             cloid: None,
             liquidity: Liquidity::Maker,
+            fee_token: "USDC",
         };
         let account = state.accounts.get_mut(&a).unwrap();
         record_fill(account, &mut next_tid, 9, &fill);
@@ -711,8 +717,10 @@ mod tests {
         );
         state.next_tid = next_tid;
         let json = serde_json::to_string(&state).unwrap();
-        let back: crate::sim::SimState = serde_json::from_str(&json).unwrap();
+        let mut back: crate::sim::SimState = serde_json::from_str(&json).unwrap();
+        back.migrate();
         assert_eq!(back, state);
+        assert_eq!(back.accounts[&a].perp_balance(""), dec("12"));
         assert_eq!(back.next_tid, 1);
         assert_eq!(back.accounts[&a].fills[0].dir, "Close Short");
     }

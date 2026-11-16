@@ -111,6 +111,9 @@ pub struct DealRequest {
     pub(crate) class: DealClass,
     #[serde(default)]
     pub coin: Option<String>,
+    /// The perp dex a `perp` deal funds (absent = the default dex).
+    #[serde(default)]
+    pub dex: Option<String>,
     pub amount: Decimal,
 }
 
@@ -120,6 +123,7 @@ impl From<DealRequest> for crate::sim::Deal {
             address: req.address,
             class: req.class,
             coin: req.coin,
+            dex: req.dex,
             amount: req.amount,
         }
     }
@@ -207,6 +211,9 @@ pub(crate) async fn order(
 ) -> Result<Json<OrderResponse>> {
     let address = req.address;
     let order: crate::sim::order::Order = req.into();
+    // The fill walks the coin's book: one outside the configured markets gets
+    // it on demand.
+    let _ = state.feed.ensure_book(&order.coin).await;
     let fill = state.sim.order(&state.feed, address, &order)?;
     // The fill's provenance, so every fill is self-explaining: the levels it
     // walked (the consumed sizes — the COW analogue) and the served book's
@@ -721,15 +728,10 @@ fn control_state(state: &ApiState, address: Address) -> Result<AccountSeed> {
             mode: UserAbstraction::Disabled,
             ..Default::default()
         };
-        return control_view(None, &empty, &state.feed, state.feed.meta().as_ref());
+        return control_view(None, &empty, &state.feed);
     };
     let fixture = state.sim.control_fixture(address)?;
-    control_view(
-        fixture.as_ref(),
-        &account,
-        &state.feed,
-        state.feed.meta().as_ref(),
-    )
+    control_view(fixture.as_ref(), &account, &state.feed)
 }
 
 // ---- reset / epoch_new ---------------------------------------------------

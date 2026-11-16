@@ -11,7 +11,8 @@ diorama-config = { path = "../config" }
 diorama-anvil = { path = "../anvil" }
 diorama-devnet = { path = "../devnet" }
 alloy-consensus = { workspace = true }
-alloy-primitives = { workspace = true }
+# "k256": `/exchange` recovers an action's signer from its signature (api/signing.rs).
+alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-rpc-types-eth = { workspace = true }
 alloy-rpc-types-trace = { workspace = true }
 alloy-sol-types = { workspace = true }
@@ -23,11 +24,16 @@ futures-util = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# "raw_value": the signed action is hashed exactly as the client sent it (api/signing.rs).
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Signs test actions as a client's agent key would (api/exchange.rs tests).
+k256 = { version = "0.13", features = ["ecdsa"] }
 
 [lints]
 workspace = true

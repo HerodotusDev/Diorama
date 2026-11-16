@@ -13,6 +13,8 @@ pub(crate) mod exchange;
 pub(crate) mod info;
 #[cfg(test)]
 mod parity;
+pub(crate) mod signing;
+mod user_actions;
 pub(crate) mod ws;
 pub(crate) mod ws_codec;
 
@@ -87,10 +89,13 @@ impl ApiState {
         self
     }
 
-    /// Readiness: the market plane has a meta and every configured market's
-    /// context is fresher than `max_stale_ms` (the plan's freshness gate).
+    /// Readiness: the market plane has the default dex's meta and the dex
+    /// registry, and every configured market's context is fresher than
+    /// `max_stale_ms` (the plan's freshness gate). The builder dexes' own
+    /// contexts are deliberately not part of it: they refresh on a staggered
+    /// cadence and a slow dex must not take the pod out of rotation.
     pub fn ready(&self, max_stale_ms: u64) -> bool {
-        if self.feed.meta().is_none() {
+        if self.feed.meta().is_none() || !self.feed.registry_loaded() {
             return false;
         }
         // The spot token registry is part of the served contract (spot deals,

@@ -17,6 +17,7 @@ use super::ledger::{FillRecord, Liquidity};
 use super::validate::{validate_order, validate_trigger_side};
 use super::Sim;
 use crate::error::{Error, Result};
+use crate::feed::dex::dex_of_coin;
 use crate::feed::{Consumption, MarketFeed};
 use crate::wire::L2Book;
 use alloy_primitives::Address;
@@ -589,7 +590,7 @@ impl Sim {
         builder: Option<BuilderFee>,
     ) -> Result<Placed> {
         let placer = Placer { address, builder };
-        let meta = feed.meta();
+        let meta = feed.meta_for_lookup(&req.coin);
         validate_order(feed, meta.as_ref(), req)?;
         self.pre_place_refusals(feed, address, req, meta.as_ref())?;
         // A trigger arms instead of walking.
@@ -656,10 +657,11 @@ impl Sim {
     /// margin (value minus the positions' margin minus the account's other
     /// open orders' reservations) must cover the order's own requirement.
     pub(crate) fn remargin_ok(&self, feed: &MarketFeed, r: &RestingOrder) -> Result<bool> {
-        let meta = feed.meta();
+        let meta = feed.meta_for_lookup(&r.coin);
         let leverage = self.leverage_for(r.account, &r.coin, meta.as_ref())?;
         let requirement = order_requirement(r.sz, feed.mark_or(&r.coin, r.px), leverage, r.reduce)?;
-        let Some(available) = self.available_for(feed, r.account, Some(r.oid), meta.as_ref())?
+        let Some(available) =
+            self.available_for(feed, r.account, dex_of_coin(&r.coin), Some(r.oid))?
         else {
             // A resting order whose account vanished has nothing to re-margin
             // against: cancel it at match time, never fill it unmargined.
@@ -702,11 +704,12 @@ impl Sim {
             return Ok(());
         }
         let (px, sz) = resting_at;
-        let meta = feed.meta();
+        let meta = feed.meta_for_lookup(&req.coin);
         let leverage = self.leverage_for(address, &req.coin, meta.as_ref())?;
         let requirement =
             order_requirement(sz, feed.mark_or(&req.coin, px), leverage, Reduce::Any)?;
-        let Some(available) = self.available_for(feed, address, None, meta.as_ref())? else {
+        let Some(available) = self.available_for(feed, address, dex_of_coin(&req.coin), None)?
+        else {
             return Err(Error::bad_request(format!(
                 "account {address} is not simulated (deal or seed it before placing orders)"
             )));
@@ -717,26 +720,27 @@ impl Sim {
         Ok(())
     }
 
-    /// The account's free margin (the venue's `availableToTrade`): value minus
-    /// the positions' margin minus the open orders' reservations at the marks.
-    /// One home — the placement check, the match-time re-margin and the served
-    /// `activeAssetData` read the same figure. `exclude_oid` skips one resting
-    /// order (the re-margin's own); `None` = no account state.
+    /// The account's free margin on one dex (the venue's `availableToTrade`):
+    /// value minus the positions' margin minus the open orders' reservations
+    /// at the marks, all of that dex. One home: the placement check, the
+    /// match-time re-margin and the served `activeAssetData` read the same
+    /// figure. `exclude_oid` skips one resting order (the re-margin's own);
+    /// `None` = no account state.
     pub(crate) fn available_for(
         &self,
         feed: &MarketFeed,
         address: Address,
+        dex: &str,
         exclude_oid: Option<u64>,
-        meta: Option<&crate::wire::Meta>,
     ) -> Result<Option<Decimal>> {
         let Some(account) = self.account(address)? else {
             return Ok(None);
         };
-        let v = super::account::view(&account, feed, meta)?;
-        let reserved = self.reserved_margin(address, exclude_oid, feed, meta)?;
+        let v = super::account::view(&account, feed, dex)?;
+        let reserved = self.reserved_margin(address, exclude_oid, feed, dex)?;
         // A unified account's spot collateral is margin even though the served
         // perp summary excludes it; `available_margin` is the one fold.
-        let available = super::account::available_margin(&account, &v)?;
+        let available = super::account::available_margin(&account, feed, dex, &v)?;
         Ok(Some(super::account::sub(
             available,
             reserved,
@@ -747,20 +751,23 @@ impl Sim {
     /// The account's open orders' reserved margin (their notional over the
     /// account's leverage, at the *mark* — the margining price; a warming mark
     /// falls back to the order's own price; reduce-only orders reserve
-    /// nothing). `exclude_oid` skips the order under check.
+    /// nothing). `exclude_oid` skips the order under check; only the dex's own
+    /// orders reserve against its ledger.
     pub(crate) fn reserved_margin(
         &self,
         account: Address,
         exclude_oid: Option<u64>,
         feed: &MarketFeed,
-        meta: Option<&crate::wire::Meta>,
+        dex: &str,
     ) -> Result<Decimal> {
         let mut total = Decimal::ZERO;
         for r in self.resting_orders(Some(account))? {
-            if Some(r.oid) == exclude_oid || r.reduce == Reduce::Only {
+            if Some(r.oid) == exclude_oid || r.reduce == Reduce::Only || dex_of_coin(&r.coin) != dex
+            {
                 continue;
             }
-            let leverage = self.leverage_for(account, &r.coin, meta)?;
+            let leverage =
+                self.leverage_for(account, &r.coin, feed.meta_for_lookup(&r.coin).as_ref())?;
             let px = feed.mark_or(&r.coin, r.px);
             total = super::account::add(
                 total,
@@ -781,7 +788,7 @@ impl Sim {
         coin: &str,
         size: Decimal,
     ) -> Result<Fill> {
-        let meta = feed.meta();
+        let meta = feed.meta_for_lookup(coin);
         let direction = self
             .account(address)?
             .and_then(|a| {
@@ -822,6 +829,7 @@ impl Sim {
                 oid,
                 cloid: None,
                 liquidity: Liquidity::Taker,
+                fee_token: &feed.fee_token_of_coin(coin),
             },
         )?;
         self.settle_legs(feed, &req, &legs, meta.as_ref())?;
@@ -909,7 +917,7 @@ impl Sim {
     /// the builder when it is a simulated account.
     fn order_with_builder(&self, feed: &MarketFeed, placer: Placer, req: &Order) -> Result<Fill> {
         let address = placer.address;
-        let meta = feed.meta();
+        let meta = feed.meta_for_lookup(&req.coin);
         let resting = self.resting_orders(None)?;
         // The plan's rule: resting orders are re-margined at match time (the
         // oracle moves after placement). A maker whose account cannot carry
@@ -929,7 +937,7 @@ impl Sim {
             builder: placer.builder.map(|b| b.charge(notional)).transpose()?,
         };
         let effect = self.land_fill(feed, address, &facts, meta.as_ref())?;
-        self.credit_builder(facts.builder)?;
+        self.credit_builder(facts.builder, dex_of_coin(&req.coin))?;
         let oid = self.next_oid()?;
         self.record_fill(
             address,
@@ -939,6 +947,7 @@ impl Sim {
                 oid,
                 cloid: req.cloid,
                 liquidity: Liquidity::Taker,
+                fee_token: &feed.fee_token_of_coin(&req.coin),
             },
         )?;
         let consumed = self.settle_legs(feed, req, &legs, meta.as_ref())?;
@@ -991,7 +1000,7 @@ impl Sim {
                     let effect = self.with_account_now(*maker, feed, |account| {
                         super::account::apply_fill(account, &facts, meta)
                     })?;
-                    self.credit_builder(facts.builder)?;
+                    self.credit_builder(facts.builder, dex_of_coin(&req.coin))?;
                     self.record_fill(
                         *maker,
                         &FillRecord {
@@ -1000,6 +1009,7 @@ impl Sim {
                             oid: *oid,
                             cloid,
                             liquidity: Liquidity::Maker,
+                            fee_token: &feed.fee_token_of_coin(&req.coin),
                         },
                     )?;
                     self.fill_resting(*oid, *sz, *px)?;
@@ -1079,19 +1089,19 @@ impl Sim {
             }))
     }
 
-    /// Credit a fill's builder fee to the builder's perp balance. The builder
-    /// is paid only when it is a simulated account (a touched address); an
+    /// Credit a fill's builder fee to the builder's ledger of the fill's dex
+    /// (the fee is paid in that dex's collateral token). The builder is paid
+    /// only when it is a simulated account (a touched address); an
     /// unsimulated builder is outside the sim, so the fee has already left the
     /// payer and is credited nowhere (the venue's builder wallet is not
     /// modeled). Never creates an account.
-    pub(crate) fn credit_builder(&self, charge: Option<BuilderCharge>) -> Result<()> {
+    pub(crate) fn credit_builder(&self, charge: Option<BuilderCharge>, dex: &str) -> Result<()> {
         let Some(charge) = charge else {
             return Ok(());
         };
         self.with_state(|st| {
             if let Some(account) = st.accounts.get_mut(&charge.builder) {
-                account.perp_balance =
-                    super::account::add(account.perp_balance, charge.amount, "builder fee credit")?;
+                account.credit_perp(dex, charge.amount, "builder fee credit")?;
             }
             Ok(())
         })?;
@@ -1117,7 +1127,13 @@ impl Sim {
                 super::account::LeverageSetting { mode, leverage },
             );
             if let Some(p) = account.positions.get_mut(coin) {
-                switch_position_mode(&mut account.perp_balance, p, mode, leverage)?;
+                // The mode switch moves margin to or from the coin's own dex
+                // ledger (a disjoint borrow of the account's `perps`).
+                let ledger = account
+                    .perps
+                    .entry(dex_of_coin(coin).to_string())
+                    .or_default();
+                switch_position_mode(&mut ledger.balance, p, mode, leverage)?;
             }
             Ok(())
         })
@@ -1189,7 +1205,7 @@ impl Sim {
             .unwrap_or(Decimal::ZERO);
         let signed = req.size * req.side().sign();
         let increases = super::account::same_direction(old, signed);
-        let Some(caps) = feed.open_interest_caps() else {
+        let Some(caps) = feed.open_interest_caps_of(dex_of_coin(&req.coin)) else {
             // The cap set is unknown until the venue answers. Fail closed for
             // orders that could increase open interest; a risk-reducing order
             // cannot be the one the cap refuses.
@@ -1473,11 +1489,12 @@ impl Sim {
         self.with_account_now(address, feed, |account| {
             let mut probe = account.clone();
             super::account::apply_fill(&mut probe, facts, meta)?;
-            let view = super::account::view(&probe, feed, meta)?;
+            let dex = dex_of_coin(&coin);
+            let view = super::account::view(&probe, feed, dex)?;
             // The post-fill check reads the same unified fold as placement:
             // the perp summary alone is zero for a unified account whose
             // collateral is entirely spot.
-            let available = super::account::available_margin(&probe, &view)?;
+            let available = super::account::available_margin(&probe, feed, dex, &view)?;
             if available < Decimal::ZERO {
                 // The venue's own string; the numbers ride the log (a client
                 // matching on the vocabulary sees exactly the venue's).
@@ -1778,6 +1795,7 @@ mod tests {
                 address: a,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: amount.parse().unwrap(),
             },
         )
@@ -1940,9 +1958,7 @@ mod tests {
         assert_eq!(p.szi, "1.5".parse().unwrap());
         assert_eq!(p.entry_px, "101".parse().unwrap());
         // The identity the consumer gates on stays exact.
-        let served =
-            crate::sim::account::clearinghouse(&account, &feed, Some(&meta_with("ETH", 10)), 0)
-                .unwrap();
+        let served = crate::sim::account::clearinghouse(&account, &feed, "", 0).unwrap();
         assert!(
             crate::sim::account::identity_holds(&served),
             "the identity stays exact"
@@ -2034,10 +2050,10 @@ mod tests {
         feed.own_funding("ETH", Decimal::ZERO, None).unwrap();
         let (sim, a) = funded_sim(&feed, "1000");
         sim.order(&feed, a, &ioc(Side::Buy, "2")).unwrap();
-        let before = sim.account(a).unwrap().unwrap().perp_balance;
+        let before = sim.account(a).unwrap().unwrap().perp_balance("");
         // Sell 1 at 100: closed 1·(100 − 101) = −1.
         sim.order(&feed, a, &reduce(Side::Sell, "1")).unwrap();
-        let after = sim.account(a).unwrap().unwrap().perp_balance;
+        let after = sim.account(a).unwrap().unwrap().perp_balance("");
         // Realized −1, minus the reduce's own taker fee (100 notional × 4.5 bps).
         let fee = Decimal::from(100) * taker_fee();
         assert_eq!(
@@ -2278,6 +2294,7 @@ mod tests {
                 address: a,
                 class: DealClass::Spot,
                 coin: None,
+                dex: None,
                 amount: "1000".parse().unwrap(),
             },
         )
@@ -2292,8 +2309,7 @@ mod tests {
         let fill = sim.order(&feed, a, &ioc(Side::Buy, "0.5")).unwrap();
         assert_eq!(fill.total_sz, "0.5".parse().unwrap());
         let account = sim.account(a).unwrap().unwrap();
-        let meta = meta_with("ETH", 10);
-        let view = super::super::account::view(&account, &feed, Some(&meta)).unwrap();
+        let view = super::super::account::view(&account, &feed, "").unwrap();
         assert!(
             view.margin_summary.account_value < Decimal::ZERO,
             "the served perp summary stays the perp ledger (the fee is its only move), got {}",
@@ -2315,6 +2331,7 @@ mod tests {
                 address: b,
                 class: DealClass::Spot,
                 coin: None,
+                dex: None,
                 amount: "1000".parse().unwrap(),
             },
         )
@@ -2330,6 +2347,7 @@ mod tests {
     /// that cannot carry its fill is canceled (the venue's `marginCanceled`),
     /// never filled.
     #[test]
+    #[allow(clippy::too_many_lines)] // one transition table: splitting it would hide the rule
     fn a_breaching_maker_is_canceled_at_match_time() {
         // No bids in the served book: the maker's resting bid is the only
         // crossing liquidity, so its cancellation shows up as no fill.
@@ -2342,6 +2360,7 @@ mod tests {
                 address: taker,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: "1000".parse().unwrap(),
             },
         )
@@ -2363,6 +2382,7 @@ mod tests {
                 address: maker,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: "-990".parse().unwrap(),
             },
         )
@@ -2560,7 +2580,7 @@ mod tests {
             .unwrap()
             .resting
             .expect("a Gtc rests");
-        let before = sim.account(a).unwrap().unwrap().perp_balance;
+        let before = sim.account(a).unwrap().unwrap().perp_balance("");
         // The meta flips to delisted (the operator's act; the feed carries it
         // live) — the next tick settles.
         let mut meta = meta_with("ETH", 10);
@@ -2577,7 +2597,7 @@ mod tests {
         let account = sim.account(a).unwrap().unwrap();
         assert!(!account.positions.contains_key("ETH"), "settled flat");
         // Entry 101, the oracle 101 (the fixture's ctx): zero PnL, no fee.
-        assert_eq!(account.perp_balance, before);
+        assert_eq!(account.perp_balance(""), before);
         let err = sim.place(&feed, a, &ioc(Side::Buy, "1")).unwrap_err();
         assert!(format!("{err}").contains("no new orders"), "{err}");
     }
@@ -2757,7 +2777,7 @@ mod tests {
         );
         let (sim, a) = funded_sim(&feed, "1000");
         sim.order(&feed, a, &ioc(Side::Buy, "1")).unwrap();
-        let before = sim.account(a).unwrap().unwrap().perp_balance;
+        let before = sim.account(a).unwrap().unwrap().perp_balance("");
         // $100 = 100_000_000 at the docs' 6 decimals.
         sim.update_isolated_margin(a, "ETH", 100_000_000, &feed)
             .unwrap();
@@ -2766,7 +2786,7 @@ mod tests {
         assert_eq!(p.isolated_margin, Decimal::from(100));
         assert_eq!(p.margin_used, Decimal::from(100));
         assert_eq!(p.leverage, crate::wire::LeverageType::Isolated);
-        assert_eq!(account.perp_balance, before - Decimal::from(100));
+        assert_eq!(account.perp_balance(""), before - Decimal::from(100));
         // And back off the position.
         sim.update_isolated_margin(a, "ETH", -40_000_000, &feed)
             .unwrap();
@@ -2775,7 +2795,7 @@ mod tests {
             account.positions.get("ETH").unwrap().isolated_margin,
             Decimal::from(60)
         );
-        assert_eq!(account.perp_balance, before - Decimal::from(60));
+        assert_eq!(account.perp_balance(""), before - Decimal::from(60));
     }
     /// The nonce floor (docs): "the 100 highest nonces are stored per address.
     /// Every new transaction must have nonce larger than the smallest nonce in
@@ -2874,7 +2894,7 @@ mod tests {
         let sim = Sim::memory();
         let a = Address::repeat_byte(0xaa);
         sim.with_account(a, |acc| {
-            acc.perp_balance = Decimal::from(100);
+            *acc.perp_balance_mut("") = Decimal::from(100);
             Ok(())
         })
         .unwrap();
@@ -2895,7 +2915,7 @@ mod tests {
 
     /// The perp balance of a simulated account.
     fn balance(sim: &Sim, who: Address) -> Decimal {
-        sim.account(who).unwrap().unwrap().perp_balance
+        sim.account(who).unwrap().unwrap().perp_balance("")
     }
 
     /// Fund `who` with `amount` USDC on the perp side.
@@ -2906,6 +2926,7 @@ mod tests {
                 address: who,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: dec(amount),
             },
         )
@@ -3129,7 +3150,8 @@ mod tests {
     fn an_old_state_file_loads_without_the_builder_fields() {
         let old = r#"{"accounts": {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {"perp_balance": "12"}}}"#;
-        let state: crate::sim::SimState = serde_json::from_str(old).unwrap();
+        let mut state: crate::sim::SimState = serde_json::from_str(old).unwrap();
+        state.migrate();
         let a = Address::repeat_byte(0xaa);
         assert!(state.accounts[&a].builder_approvals.is_empty());
         let json = serde_json::to_value(&state).unwrap();
@@ -3141,7 +3163,6 @@ mod tests {
         );
 
         let builder = Address::repeat_byte(0xbb);
-        let mut state = state;
         state
             .accounts
             .get_mut(&a)
@@ -3177,7 +3198,8 @@ mod tests {
         };
         state.resting.insert(1, with);
         let text = serde_json::to_string(&state).unwrap();
-        let loaded: crate::sim::SimState = serde_json::from_str(&text).unwrap();
+        let mut loaded: crate::sim::SimState = serde_json::from_str(&text).unwrap();
+        loaded.migrate();
         assert_eq!(loaded, state);
         assert_eq!(loaded.accounts[&a].builder_approvals[&builder], 70);
         assert_eq!(

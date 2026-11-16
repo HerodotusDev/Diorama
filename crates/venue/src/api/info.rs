@@ -9,10 +9,12 @@
 //! with.
 use super::ApiState;
 use crate::error::{Error, Result};
+use crate::feed::dex::{dex_of_coin, ALL_DEXS};
+use crate::feed::MarketFeed;
 use crate::sim::{account, Sim};
 use crate::wire::{
     ActiveAssetData, ClearinghouseState, ExchangeStatus, InfoRequest, Leverage, LeverageType,
-    MarginSummary, MetaAndAssetCtxs, UserAbstraction,
+    MetaAndAssetCtxs, UserAbstraction,
 };
 use alloy_primitives::Address;
 use axum::body::Bytes;
@@ -71,6 +73,7 @@ pub(crate) async fn readyz(State(state): State<Arc<ApiState>>) -> Response {
 }
 
 /// `POST /info`: parse the typed request, dispatch, or pass through.
+#[allow(clippy::too_many_lines)] // one dispatch over every info type
 pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
     // A body the venue cannot deserialize is the caller's fault, answered the
     // way the real API answers it: HTTP 422 with a plain-text reason (measured
@@ -90,41 +93,52 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         }
         InfoRequest::SpotClearinghouseState { user } => spot_state(&state, body, user).await,
         InfoRequest::UserAbstraction { user } => abstraction(&state, body, user).await,
-        InfoRequest::OpenOrders { user, .. } => open_orders(&state, body, user).await,
-        InfoRequest::FrontendOpenOrders { user, .. } => {
-            frontend_open_orders(&state, body, user).await
+        InfoRequest::OpenOrders { user, dex } => open_orders(&state, body, user, dex).await,
+        InfoRequest::FrontendOpenOrders { user, dex } => {
+            frontend_open_orders(&state, body, user, dex).await
         }
         InfoRequest::OrderStatus { user, oid } => order_status(&state, body, user, oid).await,
-        InfoRequest::PerpsAtOpenInterestCap { .. } => {
-            let caps = state.feed.open_interest_caps().ok_or(Error::Warming)?;
-            Ok(Json(caps).into_response())
-        }
+        InfoRequest::PerpsAtOpenInterestCap { dex } => open_interest_caps(&dex, &state),
         InfoRequest::ActiveAssetData { user, coin } => active_asset(&state, body, user, coin).await,
         // ---- market-scoped: the feed's -----------------------------------
         InfoRequest::Meta { dex } => meta(&dex, &state),
         InfoRequest::MetaAndAssetCtxs { dex } => meta_and_ctxs(&dex, &state),
-        InfoRequest::PerpDexs => Ok(Json(vec![None::<crate::wire::PerpDex>]).into_response()),
+        InfoRequest::PerpDexs => perp_dexs(&state),
         InfoRequest::L2Book {
             coin,
             n_sig_figs,
             mantissa,
-        } => l2_book(&coin, n_sig_figs, mantissa, &state),
+        } => l2_book(&coin, n_sig_figs, mantissa, &state).await,
         InfoRequest::MarginTable { id } => margin_table(id, &state),
         InfoRequest::ExchangeStatus => Ok(exchange_status()),
         InfoRequest::SpotMeta => {
             Ok(Json(state.feed.spot_meta().ok_or(Error::Warming)?).into_response())
         }
-        InfoRequest::AllMids { .. } => Ok(Json(state.feed.all_mids()).into_response()),
+        InfoRequest::AllMids { dex } => Ok(all_mids(&dex, &state)),
         InfoRequest::AllPerpMetas => all_perp_metas(&state),
-        // The sim holds no coin annotations or categories, and the real API
-        // lists only the builder-deployed coins that have one (the first dex
-        // has none), so the empty list is the real answer for the first dex.
-        InfoRequest::PerpConciseAnnotations | InfoRequest::PerpCategories => {
-            Ok(Json(Vec::<()>::new()).into_response())
-        }
-        // Market data: the same candles for every consumer, answered by the
-        // venue the marks come from.
-        InfoRequest::CandleSnapshot { .. } => pass_through(&state, &body).await,
+        // Market data the sim holds no copy of: the same answer for every
+        // consumer, from the venue the marks come from. The annotations and
+        // categories describe the builder dexes' coins; the venue's
+        // are lists (never a bare string).
+        InfoRequest::CandleSnapshot { .. }
+        | InfoRequest::PerpConciseAnnotations
+        | InfoRequest::PerpCategories
+        | InfoRequest::SpotMetaAndAssetCtxs
+        | InfoRequest::FundingHistory { .. }
+        | InfoRequest::PredictedFundings
+        | InfoRequest::PerpDexLimits { .. }
+        | InfoRequest::PerpDexStatus { .. }
+        | InfoRequest::MaxMarketOrderNtls
+        | InfoRequest::VaultSummaries
+        | InfoRequest::TokenDetails { .. }
+        | InfoRequest::PerpDeployAuctionStatus
+        | InfoRequest::SpotPairDeployAuctionStatus
+        | InfoRequest::SpotDeployState { .. }
+        | InfoRequest::OutcomeMeta
+        | InfoRequest::AllBorrowLendReserveStates
+        | InfoRequest::BorrowLendReserveState { .. }
+        | InfoRequest::LeadingVaults { .. }
+        | InfoRequest::VaultDetails { .. } => pass_through(&state, &body).await,
         InfoRequest::UserFills { user, .. } => user_fills(&state, body, user).await,
         InfoRequest::UserFunding {
             user,
@@ -134,6 +148,58 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         InfoRequest::MaxBuilderFee { user, builder } => max_fee(&state, body, user, builder).await,
         InfoRequest::PreTransferCheck { user, .. } => pre_transfer_check(&state, body, user).await,
     }
+}
+
+/// The real API's answer for a `dex` it does not know, and for `ALL_DEXS` on
+/// the types that do not take it: HTTP 500 with the body `null` (measured on
+/// `meta`, `metaAndAssetCtxs`, `clearinghouseState`, `openOrders`,
+/// `frontendOpenOrders`, `perpsAtOpenInterestCap`).
+fn unknown_dex() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, diorama_anvil::JSON_CONTENT_TYPE)],
+        "null",
+    )
+        .into_response()
+}
+
+/// A plain 200 `null` (the real `allMids` answer for an unknown dex).
+fn null_ok() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, diorama_anvil::JSON_CONTENT_TYPE)],
+        "null",
+    )
+        .into_response()
+}
+
+/// The dexes a request's `dex` selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DexScope {
+    /// One dex (`""` = the default dex).
+    One(String),
+    /// `ALL_DEXS`.
+    All,
+}
+
+impl DexScope {
+    /// Whether a coin belongs to the selected dexes.
+    pub(crate) fn covers(&self, coin: &str) -> bool {
+        match self {
+            DexScope::One(dex) => dex_of_coin(coin) == dex,
+            DexScope::All => true,
+        }
+    }
+}
+
+/// Resolve a `dex` argument: `None` is the default dex, `ALL_DEXS` selects
+/// every dex only where `allow_all` (the types that take it), a listed name
+/// selects itself, and anything else is unknown (`None`).
+pub(crate) fn dex_scope(feed: &MarketFeed, dex: &str, allow_all: bool) -> Option<DexScope> {
+    if dex == ALL_DEXS {
+        return allow_all.then_some(DexScope::All);
+    }
+    (dex.is_empty() || feed.has_dex(dex)).then(|| DexScope::One(dex.to_string()))
 }
 
 /// `maxBuilderFee`: the maximum fee (tenths of a basis point) a simulated
@@ -237,19 +303,20 @@ async fn pre_transfer_check(state: &ApiState, body: Bytes, user: Address) -> Res
     .await
 }
 
-/// `clearinghouseState`: the sim's for a touched account (the first perp dex
-/// only), the venue's verbatim otherwise.
+/// `clearinghouseState`: the sim's one-dex clearinghouse for a touched
+/// account, the venue's verbatim otherwise. A dex the venue does not list (and
+/// `ALL_DEXS`, which this type does not take) is the venue's 500 `null`.
 async fn clearinghouse(
     state: &ApiState,
     body: Bytes,
     user: Address,
     dex: Option<String>,
 ) -> Result<Response> {
-    if !dex.as_deref().unwrap_or("").is_empty() {
-        // The sim serves the first perp dex only (perpDexs = [null]).
-        return Ok(Json(empty_clearinghouse(Sim::served_time(crate::now_ms()))).into_response());
-    }
-    match clearinghouse_of(state, user)? {
+    let name = dex.as_deref().unwrap_or("");
+    let Some(DexScope::One(name)) = dex_scope(&state.feed, name, false) else {
+        return Ok(unknown_dex());
+    };
+    match dex_clearinghouse_of(state, user, &name)? {
         Some(served) => Ok(Json(served).into_response()),
         None => pass_through(state, &body).await,
     }
@@ -260,13 +327,11 @@ async fn clearinghouse(
 async fn spot_state(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
     // Pure observation; the 1 Hz tick owns accrual and liquidation.
     simulated(state, &body, user, |account| {
-        let meta = state.feed.meta();
         Ok(Json(crate::wire::SpotClearinghouseState {
             balances: account::spot_balances(account),
             token_to_available_after_maintenance: account::available_after_maintenance(
                 account,
                 &state.feed,
-                meta.as_ref(),
             )?,
         })
         .into_response())
@@ -353,13 +418,37 @@ fn trigger_condition(order: &crate::sim::order::RestingOrder) -> String {
     }
 }
 
+/// The account's resting orders in the selected dexes, newest first (the
+/// venue's order: the sampled lists run from the latest oid down).
+pub(crate) fn resting_in(
+    state: &ApiState,
+    user: Address,
+    scope: &DexScope,
+) -> Result<Vec<crate::sim::order::RestingOrder>> {
+    let mut rows: Vec<_> = state
+        .sim
+        .resting_orders(Some(user))?
+        .into_iter()
+        .filter(|r| scope.covers(&r.coin))
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.oid));
+    Ok(rows)
+}
+
 /// `openOrders`: the devnet's resting book for a touched account (the venue's
-/// own row shape); untouched accounts pass through.
-async fn open_orders(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
+/// own row shape), per dex or `ALL_DEXS`; untouched accounts pass through; an
+/// unlisted dex is the venue's 500 `null`.
+async fn open_orders(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    dex: Option<String>,
+) -> Result<Response> {
+    let Some(scope) = dex_scope(&state.feed, dex.as_deref().unwrap_or(""), true) else {
+        return Ok(unknown_dex());
+    };
     simulated(state, &body, user, |_| {
-        let rows: Vec<OpenOrder> = state
-            .sim
-            .resting_orders(Some(user))?
+        let rows: Vec<OpenOrder> = resting_in(state, user, &scope)?
             .into_iter()
             .map(|r| OpenOrder {
                 coin: r.coin.clone(),
@@ -378,13 +467,19 @@ async fn open_orders(state: &ApiState, body: Bytes, user: Address) -> Result<Res
 }
 
 /// `frontendOpenOrders`: the same rows with the frontend's extra fields.
-async fn frontend_open_orders(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
+async fn frontend_open_orders(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    dex: Option<String>,
+) -> Result<Response> {
+    let Some(scope) = dex_scope(&state.feed, dex.as_deref().unwrap_or(""), true) else {
+        return Ok(unknown_dex());
+    };
     simulated(state, &body, user, |_| {
-        let rows: Vec<FrontendOpenOrder> = state
-            .sim
-            .resting_orders(Some(user))?
-            .into_iter()
-            .map(|r| frontend_row(&r))
+        let rows: Vec<FrontendOpenOrder> = resting_in(state, user, &scope)?
+            .iter()
+            .map(frontend_row)
             .collect();
         Ok(Json(rows).into_response())
     })
@@ -575,36 +670,131 @@ async fn active_asset(
     user: Address,
     coin: String,
 ) -> Result<Response> {
+    // A coin no dex lists is the venue's 500 `null` (on a builder coin as on
+    // a default one), whoever asks.
+    if state.feed.meta_for_coin(&coin).is_none() {
+        return Ok(unknown_dex());
+    }
     simulated(state, &body, user, |account| {
         Ok(Json(active_asset_data(state, user, account, &coin)?).into_response())
     })
     .await
 }
 
-/// `meta`: the cached metadata for the default dex.
+/// `meta`: one dex's cached metadata (`""` or no `dex` = the default dex). A
+/// dex the venue does not list, and `ALL_DEXS`, are the venue's 500 `null`.
 fn meta(dex: &Option<String>, state: &ApiState) -> Result<Response> {
-    expect_default_dex(dex)?;
-    Ok(Json(state.feed.meta().ok_or(Error::Warming)?).into_response())
+    match dex.as_deref().unwrap_or("") {
+        "" => Ok(Json(state.feed.meta().ok_or(Error::Warming)?).into_response()),
+        name => Ok(state
+            .feed
+            .meta_of(name)
+            .map_or_else(unknown_dex, |meta| Json(meta).into_response())),
+    }
 }
 
-/// `allPerpMetas`: one metadata entry per perp dex, in `perpDexs` order. The
-/// sim serves the first dex only, so this is `meta` in a one-element list.
+/// `allPerpMetas`: one metadata entry per perp dex, in `perpDexs` order.
 fn all_perp_metas(state: &ApiState) -> Result<Response> {
-    Ok(Json(vec![state.feed.meta().ok_or(Error::Warming)?]).into_response())
+    let metas = state.feed.metas();
+    if metas.is_empty() {
+        return Err(Error::Warming);
+    }
+    Ok(Json(metas).into_response())
 }
 
-/// `metaAndAssetCtxs`: the cached metadata + per-market ctxs, default dex.
+/// `metaAndAssetCtxs`: one dex's cached metadata and its coins' contexts, the
+/// two lists the same length (the venue's positional contract; a dex whose
+/// contexts have not all landed is warming, never a short list).
 fn meta_and_ctxs(dex: &Option<String>, state: &ApiState) -> Result<Response> {
-    expect_default_dex(dex)?;
-    let MetaAndAssetCtxs(meta, ctxs) = state.feed.meta_and_ctxs().ok_or(Error::Warming)?;
+    let name = dex.as_deref().unwrap_or("");
+    let served = state.feed.meta_and_ctxs_of(name);
+    if !name.is_empty() && served.is_none() {
+        return Ok(unknown_dex());
+    }
+    let MetaAndAssetCtxs(meta, ctxs) = served.ok_or(Error::Warming)?;
+    if ctxs.len() != meta.universe.len() {
+        return Err(Error::Warming);
+    }
     Ok(Json(MetaAndAssetCtxs(meta, ctxs)).into_response())
+}
+
+/// `allMids`: a dex's own keys (the default dex's also carry the spot `@N` and
+/// outcome `#N` keys), or every dex's at once for `ALL_DEXS`. An unlisted dex
+/// is the venue's 200 `null`.
+fn all_mids(dex: &Option<String>, state: &ApiState) -> Response {
+    let Some(scope) = dex_scope(&state.feed, dex.as_deref().unwrap_or(""), true) else {
+        return null_ok();
+    };
+    Json(mids_in(&state.feed, &scope)).into_response()
+}
+
+/// The `allMids` map of the selected dexes: one dex's own keys (the default
+/// dex's also carry the spot `@N` and outcome `#N` keys), or every dex's at
+/// once.
+pub(crate) fn mids_in(feed: &MarketFeed, scope: &DexScope) -> crate::wire::AllMids {
+    match scope {
+        DexScope::One(name) => feed.all_mids_of(name),
+        DexScope::All => crate::wire::AllMids(
+            feed.dex_collateral_tokens()
+                .into_iter()
+                .map(|(name, _)| name)
+                .chain(std::iter::once(String::new()))
+                .flat_map(|name| feed.all_mids_of(&name).0)
+                .collect(),
+        ),
+    }
+}
+
+/// `perpDexs`: `null` for the default dex, then the venue's own record of each
+/// builder dex. A dex that landed without its record (a fixture) is served a
+/// bare one rather than a `null`, which would read as the default dex.
+fn perp_dexs(state: &ApiState) -> Result<Response> {
+    let dexs = state.feed.all_dexs();
+    if dexs.is_empty() {
+        return Err(Error::Warming);
+    }
+    let rows: Vec<Option<crate::wire::PerpDex>> = dexs
+        .into_iter()
+        .map(|d| {
+            if d.name.is_empty() {
+                return None;
+            }
+            Some(d.raw.unwrap_or_else(|| crate::wire::PerpDex {
+                full_name: d.name.clone(),
+                name: d.name,
+                deployer: Address::ZERO,
+                oracle_updater: None,
+                fee_recipient: None,
+                asset_to_streaming_oi_cap: Vec::new(),
+                asset_to_funding_clamp: Vec::new(),
+                asset_to_funding_interest_rate: Vec::new(),
+                asset_to_funding_multiplier: Vec::new(),
+                sub_deployers: Vec::new(),
+            }))
+        })
+        .collect();
+    Ok(Json(rows).into_response())
+}
+
+/// `perpsAtOpenInterestCap`: one dex's coins at their cap. An unlisted dex,
+/// and `ALL_DEXS`, are the venue's 500 `null`.
+fn open_interest_caps(dex: &Option<String>, state: &ApiState) -> Result<Response> {
+    let Some(DexScope::One(name)) = dex_scope(&state.feed, dex.as_deref().unwrap_or(""), false)
+    else {
+        return Ok(unknown_dex());
+    };
+    let caps = state
+        .feed
+        .open_interest_caps_of(&name)
+        .ok_or(Error::Warming)?;
+    Ok(Json(caps).into_response())
 }
 
 /// `l2Book`: the cached or scripted book for one coin, aggregated per the
 /// request's parameters (docs: `nSigFigs ∈ {2,3,4,5}`, `mantissa ∈ {1,2,5}`
 /// only with `nSigFigs = 5`). A parameter outside the documented set is a
 /// named 400 — never silently ignored.
-fn l2_book(
+async fn l2_book(
     coin: &str,
     n_sig_figs: Option<u8>,
     mantissa: Option<u8>,
@@ -612,14 +802,24 @@ fn l2_book(
 ) -> Result<Response> {
     book_params_ok(n_sig_figs, mantissa)?;
     let now = crate::now_ms();
-    let Some(book) = state.feed.book(coin, now) else {
+    // A configured market's book is the poller's; any other coin a dex lists
+    // (a builder dex's `xyz:TSLA`, a default-dex coin outside `markets`) gets
+    // its book on demand and stays wanted while it is asked for.
+    let configured = state.feed.markets.iter().any(|m| m == coin);
+    let book = if configured {
+        state.feed.book(coin, now)
+    } else {
+        state.feed.ensure_book(coin).await
+    };
+    let Some(book) = book else {
         // The venue's own absence shape (measured live: `l2Book` for an
-        // unknown coin answers HTTP 200 `null`). A *configured* market with
-        // no book yet is a different fault — the plane is warming (503).
-        return if state.feed.markets.iter().any(|m| m == coin) {
+        // unknown coin answers HTTP 500 `null`, builder dexes included). A
+        // coin the venue lists with no book yet is a different fault: the
+        // plane is warming (503).
+        return if configured || state.feed.meta_for_coin(coin).is_some() {
             Err(Error::Warming)
         } else {
-            Ok(Json(None::<crate::wire::L2Book>).into_response())
+            Ok(unknown_dex())
         };
     };
     Ok(Json(aggregate_book(book, n_sig_figs, mantissa.unwrap_or(1))).into_response())
@@ -721,22 +921,23 @@ pub(crate) fn default_margin_table() -> crate::wire::MarginTable {
     }
 }
 
-/// `marginTable`: one table out of the cached metadata by id, with the
-/// venue's implicit default served for id 1.
+/// `marginTable`: one table by id, resolved across every dex's tables (the
+/// ids are the dexes' own: a builder dex's table 30 sits in its meta), with
+/// the venue's implicit default served for id 1. An id no dex lists is the
+/// venue's 500 `null`.
 fn margin_table(id: u32, state: &ApiState) -> Result<Response> {
     if id == 1 {
         return Ok(Json(default_margin_table()).into_response());
     }
-    let meta = state.feed.meta().ok_or(Error::Warming)?;
-    let table = meta
-        .margin_tables
+    let metas = state.feed.metas();
+    if metas.is_empty() {
+        return Err(Error::Warming);
+    }
+    Ok(metas
         .iter()
+        .flat_map(|meta| meta.margin_tables.iter())
         .find(|(tid, _)| *tid == id)
-        .map(|(_, t)| t.clone())
-        .ok_or_else(|| Error::NotFound {
-            what: format!("margin table {id}"),
-        })?;
-    Ok(Json(table).into_response())
+        .map_or_else(unknown_dex, |(_, table)| Json(table).into_response()))
 }
 
 /// `exchangeStatus`: the served clock.
@@ -748,12 +949,22 @@ fn exchange_status() -> Response {
     .into_response()
 }
 
-/// The served `clearinghouseState` for a touched account: accrual *first*,
-/// then the read (the verifier caught the reverse order: the served figures
-/// lagged one accrual window behind the stored state).
+/// The default dex's served `clearinghouseState` for a touched account (the
+/// control plane's read).
 pub(crate) fn clearinghouse_of(
     state: &ApiState,
     address: Address,
+) -> Result<Option<ClearinghouseState>> {
+    dex_clearinghouse_of(state, address, "")
+}
+
+/// The served `clearinghouseState` of one dex for a touched account: accrual
+/// *first*, then the read (the verifier caught the reverse order: the served figures
+/// lagged one accrual window behind the stored state).
+pub(crate) fn dex_clearinghouse_of(
+    state: &ApiState,
+    address: Address,
+    dex: &str,
 ) -> Result<Option<ClearinghouseState>> {
     let now = crate::now_ms();
     let served_time = Sim::served_time(now);
@@ -764,7 +975,6 @@ pub(crate) fn clearinghouse_of(
     let Some(account) = state.sim.account(address)? else {
         return Ok(None);
     };
-    let meta = state.feed.meta();
     // The served `time` is the **oldest live mark** the account is priced
     // from, not the read's clock. A stalled feed keeps its old mark; stamping
     // the read's clock made that stale mark look fresh and passed the
@@ -773,11 +983,12 @@ pub(crate) fn clearinghouse_of(
     let observation_time = account
         .positions
         .keys()
+        .filter(|coin| dex_of_coin(coin) == dex)
         .filter(|coin| !state.feed.market_is_owned(coin))
         .filter_map(|coin| state.feed.last_ctx_at(coin))
         .min()
         .map_or(served_time, |oldest| served_time.min(oldest));
-    let served = account::clearinghouse(&account, &state.feed, meta.as_ref(), observation_time)?;
+    let served = account::clearinghouse(&account, &state.feed, dex, observation_time)?;
     if !account::identity_holds(&served) {
         state
             .sim
@@ -830,33 +1041,6 @@ async fn pass_through(state: &ApiState, body: &Bytes) -> Result<Response> {
         .into_response())
 }
 
-fn empty_clearinghouse(time: u64) -> ClearinghouseState {
-    let zero = MarginSummary {
-        account_value: Decimal::ZERO,
-        total_ntl_pos: Decimal::ZERO,
-        total_raw_usd: Decimal::ZERO,
-        total_margin_used: Decimal::ZERO,
-    };
-    ClearinghouseState {
-        margin_summary: zero.clone(),
-        cross_margin_summary: zero,
-        cross_maintenance_margin_used: Decimal::ZERO,
-        withdrawable: Decimal::ZERO,
-        asset_positions: Vec::new(),
-        time,
-        control_owned: false,
-    }
-}
-
-fn expect_default_dex(dex: &Option<String>) -> Result<()> {
-    if dex.as_deref().unwrap_or("").is_empty() {
-        return Ok(());
-    }
-    Err(Error::bad_request(
-        "the sim serves the first perp dex only (multi-dex is deferred; see docs/INTEGRATION.md)",
-    ))
-}
-
 /// `activeAssetData`: the coin's mark, the user's leverage, and the sizes the
 /// withdrawable margin supports at that leverage.
 pub(crate) fn active_asset_data(
@@ -868,7 +1052,6 @@ pub(crate) fn active_asset_data(
     let mark = state.feed.mark(coin).ok_or_else(|| Error::NoMarket {
         coin: coin.to_string(),
     })?;
-    let meta = state.feed.meta();
     let leverage = account
         .positions
         .get(coin)
@@ -890,7 +1073,7 @@ pub(crate) fn active_asset_data(
     // `withdrawable`, which the docs' transfer rule bounds.
     let available = state
         .sim
-        .available_for(&state.feed, user, None, meta.as_ref())?
+        .available_for(&state.feed, user, crate::feed::dex::dex_of_coin(coin), None)?
         .ok_or_else(|| Error::NotFound {
             what: format!("{user} is not a simulated account"),
         })?

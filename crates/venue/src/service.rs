@@ -91,6 +91,9 @@ fn build_planes(
         policy,
         Duration::from_secs(sim_section.rest_timeout_secs),
     )?;
+    // The books on demand (an order or an l2Book read on a coin outside the
+    // configured markets) read through the same client and budget.
+    feed.attach_rest(api_client.clone());
     let ws_pool = diorama_anvil::EndpointPool::from_specs(
         cfg.endpoint_specs(chain.ws_urls.as_slice()),
         diorama_anvil::Scheme::Ws,
@@ -201,6 +204,7 @@ fn spawn_plane_heartbeat(
                 v_bridge_lag = bridge.lag_blocks(),
                 accounts = sim.metrics.accounts.load(std::sync::atomic::Ordering::Relaxed),
                 owned_levels = feed.owned_levels(),
+                dexs = feed.all_dexs().len(),
                 identity_violations = sim
                     .metrics
                     .identity_violations
@@ -250,6 +254,14 @@ fn spawn_tick(sim: &Arc<crate::sim::Sim>, feed: &Arc<crate::feed::MarketFeed>, t
         let mut ticker = tokio::time::interval(tick);
         loop {
             ticker.tick().await;
+            // A coin an account holds or rests an order on keeps its book
+            // wanted: the poller refreshes it however long it sits idle.
+            match tick_sim.held_coins() {
+                Ok(coins) => tick_feed.want_books(coins.iter().map(String::as_str)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "held coins unavailable; books not kept wanted");
+                }
+            }
             if let Err(e) = tick_sim.evaluate(&tick_feed) {
                 tracing::warn!(error = %e, "sim tick failed; will retry");
             }

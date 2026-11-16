@@ -54,6 +54,16 @@ pub(crate) struct CandleRequest {
     pub end_time: Option<u64>,
 }
 
+/// A request's `dex` field: absent is `None`, a string is `Some`, and an
+/// explicit `null` (or any other type) is refused, as the real API refuses it
+/// with a 422 (measured on `meta`, `metaAndAssetCtxs`, `allMids`,
+/// `clearinghouseState`, `openOrders` and `perpsAtOpenInterestCap`).
+fn dex_field<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    <String as Deserialize>::deserialize(deserializer).map(Some)
+}
+
 /// One `POST /info` request. Unknown types parse to [`InfoRequest::Unrouted`]
 /// (hl_mock answered them as unrouted; the handler keeps that contract).
 /// The docs' `oid` union for `orderStatus`: `uint64 or string` (a 16-byte hex
@@ -72,7 +82,11 @@ pub(crate) enum InfoRequest {
     #[serde(rename = "clearinghouseState")]
     ClearinghouseState {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "spotClearinghouseState")]
@@ -82,13 +96,21 @@ pub(crate) enum InfoRequest {
     #[serde(rename = "openOrders")]
     OpenOrders {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "frontendOpenOrders")]
     FrontendOpenOrders {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "orderStatus")]
@@ -99,17 +121,29 @@ pub(crate) enum InfoRequest {
     },
     #[serde(rename = "perpsAtOpenInterestCap")]
     PerpsAtOpenInterestCap {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "meta")]
     Meta {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "metaAndAssetCtxs")]
     MetaAndAssetCtxs {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "perpDexs")]
@@ -132,7 +166,11 @@ pub(crate) enum InfoRequest {
     SpotMeta,
     #[serde(rename = "allMids")]
     AllMids {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     /// `{"type":"candleSnapshot","req":{coin,interval,startTime,endTime}}`:
@@ -157,7 +195,7 @@ pub(crate) enum InfoRequest {
     MaxBuilderFee { user: Address, builder: Address },
     #[serde(rename = "preTransferCheck")]
     PreTransferCheck { user: Address, source: Address },
-    /// The metadata of every perp dex, in `perpDexs` order (one here).
+    /// The metadata of every perp dex, in `perpDexs` order.
     #[serde(rename = "allPerpMetas")]
     AllPerpMetas,
     /// `[[coin, {category, description, displayName, keywords}], ...]`.
@@ -166,6 +204,71 @@ pub(crate) enum InfoRequest {
     /// `[[coin, category], ...]`.
     #[serde(rename = "perpCategories")]
     PerpCategories,
+    // ---- market-wide types the sim does not model: the real venue's answer
+    // is forwarded verbatim (the field names are the venue's own, so a body
+    // missing one is the venue's 422 here too) ------------------------------
+    #[serde(rename = "spotMetaAndAssetCtxs")]
+    SpotMetaAndAssetCtxs,
+    #[serde(rename = "fundingHistory")]
+    FundingHistory {
+        #[serde(rename = "coin")]
+        _coin: String,
+        #[serde(rename = "startTime")]
+        _start_time: u64,
+        #[serde(rename = "endTime", default, skip_serializing_if = "Option::is_none")]
+        _end_time: Option<u64>,
+    },
+    #[serde(rename = "predictedFundings")]
+    PredictedFundings,
+    #[serde(rename = "perpDexLimits")]
+    PerpDexLimits {
+        #[serde(rename = "dex")]
+        _dex: String,
+    },
+    #[serde(rename = "perpDexStatus")]
+    PerpDexStatus {
+        #[serde(rename = "dex")]
+        _dex: String,
+    },
+    #[serde(rename = "maxMarketOrderNtls")]
+    MaxMarketOrderNtls,
+    #[serde(rename = "vaultSummaries")]
+    VaultSummaries,
+    #[serde(rename = "tokenDetails")]
+    TokenDetails {
+        #[serde(rename = "tokenId")]
+        _token_id: String,
+    },
+    #[serde(rename = "perpDeployAuctionStatus")]
+    PerpDeployAuctionStatus,
+    #[serde(rename = "spotPairDeployAuctionStatus")]
+    SpotPairDeployAuctionStatus,
+    #[serde(rename = "spotDeployState")]
+    SpotDeployState {
+        #[serde(rename = "user")]
+        _user: Address,
+    },
+    #[serde(rename = "outcomeMeta")]
+    OutcomeMeta,
+    #[serde(rename = "allBorrowLendReserveStates")]
+    AllBorrowLendReserveStates,
+    #[serde(rename = "borrowLendReserveState")]
+    BorrowLendReserveState {
+        #[serde(rename = "token")]
+        _token: u32,
+    },
+    #[serde(rename = "leadingVaults")]
+    LeadingVaults {
+        #[serde(rename = "user")]
+        _user: Address,
+    },
+    #[serde(rename = "vaultDetails")]
+    VaultDetails {
+        #[serde(rename = "vaultAddress")]
+        _vault_address: Address,
+        #[serde(rename = "user", default, skip_serializing_if = "Option::is_none")]
+        _user: Option<Address>,
+    },
     #[serde(other)]
     Unrouted,
 }
@@ -200,12 +303,28 @@ impl InfoRequest {
             InfoRequest::ExchangeStatus => "exchangeStatus",
             InfoRequest::SpotMeta => "spotMeta",
             InfoRequest::AllMids { .. } => "allMids",
+            InfoRequest::SpotMetaAndAssetCtxs => "spotMetaAndAssetCtxs",
+            InfoRequest::FundingHistory { .. } => "fundingHistory",
+            InfoRequest::PredictedFundings => "predictedFundings",
+            InfoRequest::PerpDexLimits { .. } => "perpDexLimits",
+            InfoRequest::PerpDexStatus { .. } => "perpDexStatus",
+            InfoRequest::MaxMarketOrderNtls => "maxMarketOrderNtls",
+            InfoRequest::VaultSummaries => "vaultSummaries",
+            InfoRequest::TokenDetails { .. } => "tokenDetails",
+            InfoRequest::PerpDeployAuctionStatus => "perpDeployAuctionStatus",
+            InfoRequest::SpotPairDeployAuctionStatus => "spotPairDeployAuctionStatus",
+            InfoRequest::SpotDeployState { .. } => "spotDeployState",
+            InfoRequest::OutcomeMeta => "outcomeMeta",
+            InfoRequest::AllBorrowLendReserveStates => "allBorrowLendReserveStates",
+            InfoRequest::BorrowLendReserveState { .. } => "borrowLendReserveState",
+            InfoRequest::LeadingVaults { .. } => "leadingVaults",
+            InfoRequest::VaultDetails { .. } => "vaultDetails",
             InfoRequest::Unrouted => "unrouted",
         }
     }
 
-    /// The perp dex this request scopes to (empty/absent = the first dex).
-    /// Spot reads are only defined on the first dex.
+    /// The perp dex this request scopes to (empty/absent = the default dex).
+    /// Spot reads are only defined on the default dex.
     #[cfg(test)]
     fn dex(&self) -> &str {
         match self {
@@ -448,7 +567,7 @@ pub(crate) enum MarginMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AssetInfo {
     pub name: String,
@@ -462,6 +581,18 @@ pub(crate) struct AssetInfo {
     pub only_isolated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_delisted: Option<bool>,
+    /// Builder-dex rows only (the default dex's rows never carry it): the
+    /// asset's growth mode (`"enabled"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub growth_mode: Option<String>,
+    /// Builder-dex rows only: when the fee scale last changed (an ISO-like
+    /// timestamp string, kept verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fee_scale_change_time: Option<String>,
+    /// Builder-dex rows only: the deployer's fee scale (a decimal string,
+    /// kept verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_fee_scale: Option<String>,
 }
 
 /// `marginTable`: the leverage tiers. Maintenance margin is ½ the initial
@@ -561,17 +692,17 @@ pub(crate) fn funding_ctx(mark: &str, oracle: &str) -> AssetCtx {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct MetaAndAssetCtxs(pub Meta, pub Vec<AssetCtx>);
 
-/// `perpDexs`: `[null, …]` (the first dex is null). The sim serves the first
-/// dex only (multi-dex is deferred — docs/INTEGRATION.md).
+/// One non-default `perpDexs` entry (the answer is `[null, {…}, …]`: the
+/// default dex is `null`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PerpDex {
     pub name: String,
     pub full_name: String,
     pub deployer: Address,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Served as an explicit `null` when absent: the venue sends the key.
     pub oracle_updater: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Same: an explicit `null` when absent.
     pub fee_recipient: Option<Address>,
     /// Per-coin OI caps (the venue's credit terms; the sim's feed reads them).
     pub asset_to_streaming_oi_cap: Vec<(String, Decimal)>,
@@ -841,6 +972,52 @@ mod tests {
         assert_eq!(dex.sub_deployers[0].1.len(), 1);
     }
 
+    /// A builder dex's meta round-trips in the real shape: the three
+    /// builder-only row fields survive and a default-dex row never grows them;
+    /// `perpDexs` sends the absent updater/recipient as explicit nulls.
+    #[test]
+    fn a_builder_meta_and_perp_dex_round_trip_in_the_real_shape() {
+        let raw = serde_json::json!({
+            "universe": [{
+                "szDecimals": 3, "name": "xyz:TSLA", "maxLeverage": 10,
+                "marginTableId": 10, "onlyIsolated": true, "isDelisted": false,
+                "growthMode": "enabled",
+                "lastFeeScaleChangeTime": "2025-11-20T10:00:00.000000",
+                "deployerFeeScale": "1.0"
+            }],
+            "marginTables": [],
+            "collateralToken": 360
+        });
+        let meta: Meta = serde_json::from_value(raw.clone()).unwrap();
+        let row = &meta.universe[0];
+        assert_eq!(row.growth_mode.as_deref(), Some("enabled"));
+        assert_eq!(row.deployer_fee_scale.as_deref(), Some("1.0"));
+        let back = serde_json::to_value(&meta).unwrap();
+        assert_eq!(back["universe"][0], raw["universe"][0]);
+        assert_eq!(back["collateralToken"], 360);
+        // A default-dex row carries none of them.
+        let plain: Meta = serde_json::from_str(
+            r#"{"universe":[{"szDecimals":5,"name":"BTC","maxLeverage":40}],"marginTables":[],"collateralToken":0}"#,
+        )
+        .unwrap();
+        let plain = serde_json::to_value(&plain).unwrap();
+        assert!(plain["universe"][0].get("growthMode").is_none());
+        assert!(plain["universe"][0].get("deployerFeeScale").is_none());
+
+        let dex: PerpDex = serde_json::from_value(serde_json::json!({
+            "name": "xyz", "fullName": "XYZ",
+            "deployer": "0x0000000000000000000000000000000000000001",
+            "oracleUpdater": null, "feeRecipient": null,
+            "assetToStreamingOiCap": [], "subDeployers": []
+        }))
+        .unwrap();
+        let served = serde_json::to_value(&dex).unwrap();
+        assert_eq!(served["oracleUpdater"], serde_json::Value::Null);
+        assert_eq!(served["feeRecipient"], serde_json::Value::Null);
+        assert!(served.as_object().unwrap().contains_key("oracleUpdater"));
+        assert!(served.as_object().unwrap().contains_key("feeRecipient"));
+    }
+
     #[test]
     fn requests_parse_by_tag() {
         let r: InfoRequest = serde_json::from_str(
@@ -1013,17 +1190,16 @@ fn default_true() -> bool {
     true
 }
 
-/// The `/exchange` body: the venue's compact action shape. The devnet reads
-/// the acting account from `user` (the real venue derives it from the
-/// signature) and accepts `signature` without checking it.
+/// The `/exchange` body: the venue's compact action shape. As on the venue,
+/// the acting account is recovered from `signature` (api/signing.rs); a body
+/// that names `user` is the keyless harness shape instead.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExchangeBody {
     pub action: ExchangeAction,
-    /// The acting account. The real venue derives it from the signature; the
-    /// devnet has no keys, so it reads the field (the documented analogue).
-    /// Optional in the body so the SDK's `noop` (which carries no `user`)
-    /// parses; an order without it refuses by name.
+    /// The keyless harness's acting account (the anvil-impersonation
+    /// analogue): when present it is read as named and the signature is not
+    /// checked. A venue client sends none, and its signer is recovered.
     #[serde(default)]
     pub user: Option<Address>,
     #[serde(default)]
@@ -1051,8 +1227,8 @@ pub(crate) struct ActionTagInner {
     pub r#type: String,
 }
 
-/// The EIP-712 signature's fields (accepted, never verified): the devnet
-/// reads only its presence and shape.
+/// The EIP-712 signature's fields: the signer is recovered from them when
+/// the body names no `user` (api/signing.rs).
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct Signature {
     pub r: String,
@@ -1061,17 +1237,26 @@ pub(crate) struct Signature {
 }
 
 impl Signature {
-    /// Whether the signature is shaped like the venue's (nonempty `r`/`s`).
-    /// The devnet never verifies it — the anvil-impersonation analogue.
+    /// Whether the signature is shaped like the venue's (nonempty `r`/`s`):
+    /// the order log's `signed` field.
     pub(crate) fn is_shaped(&self) -> bool {
         !self.r.is_empty() && !self.s.is_empty()
     }
 }
 
-/// The action, tagged by `type`. `order` and `noop` are modeled; every other
-/// tag the venue defines lands in `Unmodeled` and is refused by name.
+/// The action, tagged by `type`: the L1 actions (hashed as msgpack) and the
+/// user-signed ones (`usdClassTransfer`, `sendAsset`, ...; their own EIP-712
+/// type, see api/signing.rs). Their fields are camelCase on the wire; only
+/// what the handlers read is named here (the signature covers the raw body).
+/// A tag the venue defines and the sim does not model lands in `Unmodeled`
+/// and is refused by name; a tag the venue does not define is a 422 (see
+/// [`KNOWN_ACTION_TAGS`]).
 #[derive(Debug, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ExchangeAction {
     /// The no-operation action (docs): signature-authentication testing with
     /// no side effects. Answers the venue's no-data success envelope.
@@ -1135,9 +1320,129 @@ pub(crate) enum ExchangeAction {
         is_cross: bool,
         leverage: u32,
     },
+    /// `{"type":"usdClassTransfer","amount":"1.5","toPerp":true,...}`: USDC
+    /// between the account's spot wallet and its default perp dex.
+    UsdClassTransfer { amount: String, to_perp: bool },
+    /// `{"type":"sendAsset","destination":..,"sourceDex":..,"destinationDex":..,
+    /// "token":..,"amount":..,"fromSubAccount":..}`: a token between two
+    /// wallets (the spot wallet is dex `"spot"`, the default dex `""`).
+    SendAsset {
+        destination: Address,
+        source_dex: String,
+        destination_dex: String,
+        token: String,
+        amount: String,
+        #[serde(default)]
+        from_sub_account: String,
+    },
+    /// `{"type":"spotSend","destination":..,"token":"NAME:id","amount":..}`.
+    SpotSend {
+        destination: Address,
+        token: String,
+        amount: String,
+    },
+    /// `{"type":"usdSend","destination":..,"amount":..}`: USDC between two
+    /// accounts' default perp dexes.
+    UsdSend {
+        destination: Address,
+        amount: String,
+    },
+    /// `withdraw3`: bridges USDC out through Arbitrum (refused by name).
+    Withdraw3,
+    /// `{"type":"approveAgent","agentAddress":..,"agentName":..}`: the same
+    /// registration CoreWriter action 9 makes.
+    ApproveAgent {
+        agent_address: Address,
+        #[serde(default)]
+        agent_name: Option<String>,
+    },
+    /// `{"type":"approveBuilderFee","maxFeeRate":"0.01%","builder":..}`.
+    ApproveBuilderFee {
+        max_fee_rate: String,
+        builder: Address,
+    },
+    /// `{"type":"userSetAbstraction","user":..,"abstraction":"unifiedAccount"}`.
+    UserSetAbstraction { user: Address, abstraction: String },
+    /// `{"type":"agentSetAbstraction","abstraction":"i"|"u"|"p"}` (an L1
+    /// action: the account's agent may sign it).
+    AgentSetAbstraction { abstraction: String },
     #[serde(other)]
     Unmodeled,
 }
+
+impl ExchangeAction {
+    /// Whether the action is user-signed (the account's own key, the
+    /// `HyperliquidSignTransaction` domain) rather than an L1 action an API
+    /// wallet may sign.
+    pub(crate) fn is_user_signed(&self) -> bool {
+        matches!(
+            self,
+            Self::UsdClassTransfer { .. }
+                | Self::SendAsset { .. }
+                | Self::SpotSend { .. }
+                | Self::UsdSend { .. }
+                | Self::Withdraw3
+                | Self::ApproveAgent { .. }
+                | Self::ApproveBuilderFee { .. }
+                | Self::UserSetAbstraction { .. }
+        )
+    }
+}
+
+/// Every action tag the real venue defines. A body whose tag is not in this
+/// list is a 422 (measured: the venue answers an unknown tag with its
+/// deserialization failure, not an `err` envelope); a listed tag the sim does
+/// not model is refused by name.
+pub(crate) const KNOWN_ACTION_TAGS: &[&str] = &[
+    "order",
+    "cancel",
+    "cancelByCloid",
+    "modify",
+    "batchModify",
+    "scheduleCancel",
+    "updateLeverage",
+    "updateIsolatedMargin",
+    "topUpIsolatedOnlyMargin",
+    "twapOrder",
+    "twapCancel",
+    "reserveRequestWeight",
+    "noop",
+    "setReferrer",
+    "registerReferrer",
+    "claimRewards",
+    "vaultTransfer",
+    "createVault",
+    "vaultModify",
+    "vaultDistribute",
+    "createSubAccount",
+    "subAccountModify",
+    "subAccountTransfer",
+    "subAccountSpotTransfer",
+    "spotUser",
+    "usdSend",
+    "spotSend",
+    "withdraw3",
+    "usdClassTransfer",
+    "sendAsset",
+    "tokenDelegate",
+    "cDeposit",
+    "cWithdraw",
+    "approveAgent",
+    "approveBuilderFee",
+    "convertToMultiSigUser",
+    "multiSig",
+    "evmUserModify",
+    "userDexAbstraction",
+    "userSetAbstraction",
+    "agentSetAbstraction",
+    "setDisplayName",
+    "perpDeploy",
+    "spotDeploy",
+    "linkStakingUser",
+    "borrowLend",
+    "validatorL1Stream",
+    "finalizeEvmContract",
+];
 
 /// One `cancel` entry (docs: `a` asset, `o` oid).
 #[derive(Debug, serde::Deserialize)]
@@ -1224,23 +1529,20 @@ fn decimal_or_refuse(what: &str, s: &str) -> Result<Decimal> {
 }
 
 impl OrderAction {
-    /// The compact action → the lane's order: the asset index resolves
-    /// through the live meta (unknown = a named refusal), size and limit are
-    /// decimal strings; the tif decides what rests (the sim's `place` owns
-    /// the semantics).
+    /// The compact action → the lane's order: the asset id resolves through
+    /// `coin_of_asset` (the feed's one resolver: unknown = a named refusal),
+    /// size and limit are decimal strings; the tif decides what rests (the
+    /// sim's `place` owns the semantics).
     pub(crate) fn to_order(
         &self,
-        meta: Option<&crate::wire::Meta>,
+        coin_of_asset: impl Fn(u32) -> Option<String>,
     ) -> Result<crate::sim::order::Order> {
-        let coin = meta
-            .and_then(|m| m.universe.get(self.a as usize))
-            .map(|a| a.name.clone())
-            .ok_or_else(|| {
-                Error::bad_request(format!(
-                    "unknown asset index {} (the live meta has not landed, or is shorter)",
-                    self.a
-                ))
-            })?;
+        let coin = coin_of_asset(self.a).ok_or_else(|| {
+            Error::bad_request(format!(
+                "unknown asset index {} (the live meta has not landed, or is shorter)",
+                self.a
+            ))
+        })?;
         let size: Decimal = decimal_or_refuse("size", &self.s)?;
         let limit_px = match &self.p {
             Some(p) => Some(decimal_or_refuse("limit price", p)?),
