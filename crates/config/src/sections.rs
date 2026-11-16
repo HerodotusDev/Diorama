@@ -223,10 +223,9 @@ pub struct VenueSimSection {
     /// has no native balance (the real chain's system txs pay no gas; the
     /// fork's do). A deployment fact, in wei.
     pub system_gas_stipend_wei: U256,
-    /// The markets whose books are cached and whose contexts are tracked; the
-    /// account plane prices every position from these (a position in an
-    /// untracked coin is a config error at the read that needs it). Empty is
-    /// the generic mirror; a project specialization supplies its set.
+    /// Deprecated and ignored: every coin of every perp dex is a market (the
+    /// sim relays the venue's books and contexts for all of them, on demand).
+    /// The key still parses so an older specialization keeps loading.
     #[serde(default)]
     pub markets: Vec<String>,
     /// REST cache cadence (WS pushes are the primary freshness source; the
@@ -234,6 +233,12 @@ pub struct VenueSimSection {
     pub poll_interval_ms: u64,
     /// The account plane's self-advance tick (funding, liquidations, persist).
     pub tick_interval_ms: u64,
+    /// The websocket's market-data push cadence (`l2Book`, `l2`,
+    /// `activeAssetCtx`, `allMids`, `fastAssetCtxs`, `pac`); the account
+    /// channels keep `tick_interval_ms`. The real venue pushes books about
+    /// twice a second.
+    #[serde(default = "default_market_push_interval_ms")]
+    pub market_push_interval_ms: u64,
     /// The market-plane heartbeat log cadence.
     pub heartbeat_interval_secs: u64,
     /// HTTP timeout for the venue's `/info` lane (REST snapshots and the
@@ -368,6 +373,11 @@ pub struct LoopsSection {
     /// pinned deployment that must keep its head frozen.
     #[serde(default = "default_mine_empty_blocks")]
     pub mine_empty_blocks: bool,
+}
+
+/// The venue sim's market-data push cadence: about the real venue's.
+fn default_market_push_interval_ms() -> u64 {
+    500
 }
 
 /// The mirror stays alive when idle: the default. A pinned demo opts out.

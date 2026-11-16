@@ -108,15 +108,20 @@ addr = "0.0.0.0"
 # cadence, write chunk and journal ring live here once for both profiles.
 
 # ---- the venue simulator (profile "venue") -------------------------------
-# The market plane's REST cache cadence. WS pushes (allMids, activeAssetCtx)
-# are the primary freshness source; the REST poller backfills meta/books and
-# is gated by the rate budget meter (1200 weight/min: metaAndAssetCtxs = 20,
-# spotMeta = 20, l2Book/allMids = 2). 5 s gives ~600 weight/min for the
-# default four-market set (20+20+4x2+2 = 50 per pass, 12 passes/min).
+# The market plane's REST cache cadence. WS pushes are the primary freshness
+# source (activeAssetCtx for every live coin of every perp dex, l2Book for
+# the coins someone reads or holds); the REST poller backfills the
+# meta/registries/caps and any gap, gated by the rate budget meter (1200
+# weight/min: metaAndAssetCtxs = 20, spotMeta = 20, l2Book/allMids = 2). A
+# pass costs about 20 (default meta+ctxs) + 2 (allMids) + 2 (caps) + the
+# builder dexes' light cap reads, so 5 s stays far inside the budget.
 [services.venue_sim]
 poll_interval_ms = 5000
 # The account plane's self-advance tick (funding, liquidations, persist).
 tick_interval_ms = 1000
+# The websocket's market-data push cadence (books, contexts, mids); the real
+# venue pushes books about twice a second. Account channels keep the tick.
+market_push_interval_ms = 500
 # The `orderStatus` terminal-history bound (a deployment memory policy).
 terminal_orders = 1024
 # The Core↔EVM bridge's scan cadence (one pass per interval).

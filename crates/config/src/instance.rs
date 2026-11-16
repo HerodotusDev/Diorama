@@ -1355,13 +1355,10 @@ fn check_feed_bridge(fb: &FeedBridgeSection, issues: &mut Vec<String>) {
     }
 }
 
-/// The simulator's section: the state dir, at least one market, the cadence
-/// and the optional chain URLs.
+/// The simulator's section: the state dir, the cadence and the optional chain
+/// URLs (every coin of every dex is a market: no market list is required).
 fn check_venue_sim(sim: &VenueSimSection, issues: &mut Vec<String>) {
     require_path(&sim.state_dir, "services.venue_sim.state_dir", issues);
-    if sim.markets.is_empty() {
-        issues.push("services.venue_sim.markets must name at least one market".into());
-    }
     if sim.terminal_orders == 0 {
         issues.push("services.venue_sim.terminal_orders must be > 0".into());
     }
@@ -1373,6 +1370,9 @@ fn check_venue_sim(sim: &VenueSimSection, issues: &mut Vec<String>) {
     }
     if sim.poll_interval_ms == 0 {
         issues.push("services.venue_sim.poll_interval_ms must be > 0".into());
+    }
+    if sim.market_push_interval_ms == 0 {
+        issues.push("services.venue_sim.market_push_interval_ms must be > 0".into());
     }
     if sim.tick_interval_ms == 0 {
         issues.push("services.venue_sim.tick_interval_ms must be > 0".into());
