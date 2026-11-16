@@ -1103,3 +1103,134 @@ fn fast_asset_ctxs_is_one_map_over_every_dex() {
     keys.sort_unstable();
     assert_eq!(keys, ["ETH", "flx:TSLA", "xyz:TSLA"]);
 }
+
+/// The transfer ledger: every kind of row the sim writes has the shape of a
+/// real `userNonFundingLedgerUpdates` row (`send` and `spotTransfer` with their
+/// `fee`, `nativeTokenFee` and `feeToken`, `accountClassTransfer`), the window
+/// applies, an address the sim never held is the venue's own answer, and
+/// `preTransferCheck` answers the activation fee for a destination that does
+/// not exist yet with the real venue's fields.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one script: four transfers, then every read of their rows
+async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
+    use crate::sim::fees::RowKind;
+    use crate::sim::transfer::{AssetSend, Wallet};
+    use crate::sim::{ClassTransfer, Direction, TokenRef};
+    let (state, user) = world();
+    let real = real();
+    let usdc = TokenRef {
+        index: 0,
+        coin: "USDC",
+    };
+    let (other, third) = (Address::repeat_byte(0xbb), Address::repeat_byte(0xcc));
+    state
+        .sim
+        .credit_spot(user, usdc, Decimal::from(100))
+        .unwrap();
+    state
+        .sim
+        .send_asset(
+            &AssetSend {
+                from: user,
+                to: other,
+                token: usdc,
+                amount: Decimal::from(10),
+                source: Wallet::Spot,
+                destination: Wallet::Spot,
+                kind: RowKind::Send,
+            },
+            &state.feed,
+        )
+        .unwrap();
+    state
+        .sim
+        .spot_send(
+            (user, third),
+            usdc,
+            Decimal::from(5),
+            (RowKind::SpotTransfer, &state.feed),
+        )
+        .unwrap();
+    state
+        .sim
+        .usd_class_transfer(
+            user,
+            &ClassTransfer {
+                token: usdc,
+                amount: Decimal::ONE,
+                direction: Direction::ToPerp,
+            },
+            &state.feed,
+        )
+        .unwrap();
+    state
+        .sim
+        .credit_evm_deposit(
+            Address::repeat_byte(0xdd),
+            usdc,
+            Decimal::from(3),
+            &state.feed,
+        )
+        .unwrap();
+
+    let rows = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": 0}),
+    )
+    .await;
+    let rows = rows.as_array().unwrap();
+    let kinds: Vec<&str> = rows
+        .iter()
+        .map(|r| r["delta"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["send", "spotTransfer", "accountClassTransfer"]);
+    for row in rows {
+        let sample = real["info"]["userNonFundingLedgerUpdates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["delta"]["type"] == row["delta"]["type"])
+            .expect("a real sample of the kind");
+        same_shape(sample, row, "userNonFundingLedgerUpdates");
+    }
+    assert_eq!(rows[0]["delta"]["fee"], "1.0");
+    assert_eq!(rows[0]["delta"]["feeToken"], "USDC");
+    // The deposit's row, on the recipient's side, is a system-address transfer.
+    let deposit = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": Address::repeat_byte(0xdd)}),
+    )
+    .await;
+    assert_eq!(
+        deposit[0]["delta"]["user"],
+        "0x2000000000000000000000000000000000000000"
+    );
+    // The window: nothing after the last row.
+    let later = rows.last().unwrap()["time"].as_u64().unwrap() + 1;
+    let none = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": later}),
+    )
+    .await;
+    assert_eq!(none, serde_json::json!([]));
+
+    // preTransferCheck: `user` is the destination.
+    let fresh = Address::repeat_byte(0xee);
+    let new = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": fresh, "source": user}),
+    )
+    .await;
+    assert_eq!(
+        new,
+        serde_json::json!({"isSanctioned": false, "userExists": false, "fee": "1.0", "userHasSentTx": false})
+    );
+    same_shape(&real["info"]["preTransferCheck"], &new, "preTransferCheck");
+    let known = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": other, "source": user}),
+    )
+    .await;
+    assert_eq!(known["userExists"], true);
+    assert_eq!(known["fee"], "0.0");
+}

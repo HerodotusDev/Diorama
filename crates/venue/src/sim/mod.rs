@@ -37,6 +37,8 @@ pub(crate) mod order;
 pub(crate) mod seed;
 pub(crate) mod tick;
 pub(crate) mod transfer;
+#[cfg(test)]
+mod transfer_matrix_tests;
 pub(crate) mod validate;
 pub(crate) mod waterfall;
 

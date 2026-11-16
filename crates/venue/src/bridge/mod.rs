@@ -797,6 +797,22 @@ impl Bridge {
         self.feed.dex_name_at(dex).map(Wallet::Perp)
     }
 
+    /// The system address pays gas on V (the real chain's system txs do not):
+    /// fund it once, at the deployment's declared stipend, so the pool's
+    /// balance check passes, plus the `value` a native transfer moves. A
+    /// balance-read fault propagates: it must not be read as "empty" and
+    /// funded over a broken RPC.
+    async fn fund_system_address(&self, from: Address, value: Option<U256>) -> Result<()> {
+        let have = self.anvil_v.balance_at(from, 0).await?;
+        let need = self
+            .system_gas_stipend
+            .saturating_add(value.unwrap_or(U256::ZERO));
+        if (value.is_some() && have < need) || have.is_zero() {
+            self.anvil_v.anvil_set_balance(from, need.max(have)).await?;
+        }
+        Ok(())
+    }
+
     /// The completion tx: `transfer(caller, amount)` on the linked ERC20 from
     /// the system address (auto-impersonate), or for HYPE the native value
     /// from `0x2222…2`. It lands with the devnet's next mined block, like the
@@ -807,10 +823,17 @@ impl Bridge {
         info: &TokenInfo,
         amount: Decimal,
     ) -> Result<()> {
-        let Some(evm) = info.evm else {
-            return Err(system::no_evm_link(info));
-        };
         let native = info.name == crate::sim::fees::GAS_TOKEN;
+        // HYPE is the native gas token: its transfer carries a value, so the
+        // registry's link is only needed for a token's ERC20.
+        let evm = match info.evm {
+            Some(evm) => evm,
+            None if native => system::EvmToken {
+                address: system::HYPE_SYSTEM,
+                extra_decimals: 0,
+            },
+            None => return Err(system::no_evm_link(info)),
+        };
         let evm_decimals = if native {
             system::HYPE_EVM_DECIMALS
         } else {
@@ -826,20 +849,8 @@ impl Bridge {
         } else {
             system::system_address(u64::from(info.index))
         };
-        // The system address pays gas on V (the real chain's system txs do
-        // not); fund it once, at the deployment's declared stipend, so the
-        // pool's balance check passes (plus the value a native transfer
-        // moves). A balance-read fault propagates: it must not be read as
-        // "empty" and funded over a broken RPC.
-        let have = self.anvil_v.balance_at(from, 0).await?;
-        let need = if native {
-            self.system_gas_stipend.saturating_add(value)
-        } else {
-            self.system_gas_stipend
-        };
-        if (native && have < need) || have.is_zero() {
-            self.anvil_v.anvil_set_balance(from, need.max(have)).await?;
-        }
+        self.fund_system_address(from, native.then_some(value))
+            .await?;
         let tx = if native {
             TransactionRequest::default()
                 .from(from)
@@ -1358,5 +1369,199 @@ mod tests {
             "{}",
             refusals()
         );
+    }
+
+    /// A bridge over an in-memory sim and a feed whose spot registry lists
+    /// USDC, HYPE (no EVM link, so no completion can run) and a HYPE/USDC
+    /// pair at 5; the RPC points nowhere (these tests stop before the chain).
+    fn fee_bridge() -> (Bridge, Arc<Sim>, Vec<TokenInfo>) {
+        let sim = Arc::new(Sim::memory());
+        let feed = Arc::new(MarketFeed::memory(Vec::new()));
+        let token = |name: &str, index: u32| crate::wire::SpotToken {
+            name: name.into(),
+            sz_decimals: 8,
+            wei_decimals: 8,
+            index,
+            is_canonical: true,
+            evm_contract: None,
+            token_id: None,
+            full_name: None,
+            deployer_trading_fee_share: Decimal::ZERO,
+        };
+        let spot = crate::wire::SpotMeta {
+            tokens: vec![token("USDC", 0), token("HYPE", 150)],
+            universe: vec![crate::wire::SpotPair {
+                tokens: [150, 0],
+                name: "@107".into(),
+                index: 107,
+                is_canonical: true,
+            }],
+        };
+        feed.put_spot_meta(spot.clone());
+        feed.put_mids(
+            std::collections::BTreeMap::from([("@107".to_string(), "5".parse().unwrap())]),
+            crate::now_ms(),
+        );
+        let tokens = system::token_registry(&spot);
+        let bridge = Bridge::new(
+            Rpc::new("http://127.0.0.1:1", Duration::from_secs(1)).unwrap(),
+            sim.clone(),
+            feed,
+            Arc::new(BridgeMetrics::default()),
+            BridgePolicy {
+                poll: Duration::from_secs(1),
+                system_gas_stipend: U256::ZERO,
+            },
+        )
+        .unwrap();
+        (bridge, sim, tokens)
+    }
+
+    fn usdc_of(sim: &Sim, who: Address) -> Decimal {
+        sim.account(who)
+            .unwrap()
+            .and_then(|a| a.spot.get(&0).map(|e| e.total))
+            .unwrap_or_default()
+    }
+
+    /// CoreWriter's `spotSend` and `sendAsset` to an account that does not
+    /// exist pay the 1 USDC activation fee like the HTTP transfers do: the
+    /// recipient gets the full amount, the second send is free, and a send the
+    /// balance cannot cover with the fee is refused (counted) and moves nothing.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request script: splitting it would hide the order of the sends
+    async fn corewriter_sends_to_a_new_account_pay_the_activation_fee_once() {
+        let (bridge, sim, tokens) = fee_bridge();
+        let me = Address::repeat_byte(0x0a);
+        let new = Address::repeat_byte(0x0b);
+        sim.credit_spot(
+            me,
+            TokenRef {
+                index: 0,
+                coin: "USDC",
+            },
+            "10".parse().unwrap(),
+        )
+        .unwrap();
+        let wei = |human: u64| human * 100_000_000;
+        let spot_send = |wei| CoreAction::SpotSend {
+            destination: new,
+            token: 0,
+            wei,
+        };
+        // 10 to a new account needs 11: refused.
+        bridge
+            .apply_action(me, spot_send(wei(10)), &tokens)
+            .await
+            .unwrap();
+        assert_eq!(
+            (usdc_of(&sim, me), usdc_of(&sim, new)),
+            ("10".parse().unwrap(), Decimal::ZERO)
+        );
+        assert!(bridge
+            .metrics
+            .render()
+            .contains("venue_bridge_refusals_total 1"));
+        // 4 goes with its fee; the next 4 is free.
+        bridge
+            .apply_action(me, spot_send(wei(4)), &tokens)
+            .await
+            .unwrap();
+        assert_eq!(
+            (usdc_of(&sim, me), usdc_of(&sim, new)),
+            ("5".parse().unwrap(), "4".parse().unwrap())
+        );
+        let send_asset = CoreAction::SendAsset {
+            destination: new,
+            sub_account: Address::ZERO,
+            source_dex: corewriter::SPOT_DEX,
+            destination_dex: corewriter::SPOT_DEX,
+            token: 0,
+            wei: wei(4),
+        };
+        bridge.apply_action(me, send_asset, &tokens).await.unwrap();
+        assert_eq!(
+            (usdc_of(&sim, me), usdc_of(&sim, new)),
+            ("1".parse().unwrap(), "8".parse().unwrap())
+        );
+    }
+
+    /// A `spotSend` and a `sendAsset` to a system address are the Core to EVM
+    /// leg, never a credit to the system address as if it were an account: HYPE's
+    /// `0x2222...` included. A balance that cannot pay the amount and the gas
+    /// is refused and nothing moves.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request script: splitting it would hide the order of the sends
+    async fn sends_to_a_system_address_take_the_core_to_evm_path() {
+        let (bridge, sim, tokens) = fee_bridge();
+        let me = Address::repeat_byte(0x0a);
+        sim.credit_spot(
+            me,
+            TokenRef {
+                index: 0,
+                coin: "USDC",
+            },
+            "10".parse().unwrap(),
+        )
+        .unwrap();
+        sim.credit_spot(
+            me,
+            TokenRef {
+                index: 150,
+                coin: "HYPE",
+            },
+            "1".parse().unwrap(),
+        )
+        .unwrap();
+        let wei = |human: u64| human * 100_000_000;
+        // The whole 10 USDC leaves: the gas is paid in HYPE, so the debit
+        // lands; HYPE has no EVM link in this registry, so the completion
+        // cannot run and the action faults after the debit.
+        let to_usdc = CoreAction::SpotSend {
+            destination: system::system_address(0),
+            token: 0,
+            wei: wei(10),
+        };
+        assert!(bridge.apply_action(me, to_usdc, &tokens).await.is_err());
+        assert_eq!(usdc_of(&sim, me), Decimal::ZERO);
+        assert!(
+            sim.account(system::system_address(0)).unwrap().is_none(),
+            "the system address is not credited as an account"
+        );
+        // HYPE to `0x2222...`: the same path, and no gas fee for HYPE itself.
+        let to_hype = CoreAction::SendAsset {
+            destination: system::HYPE_SYSTEM,
+            sub_account: Address::ZERO,
+            source_dex: corewriter::SPOT_DEX,
+            destination_dex: corewriter::SPOT_DEX,
+            token: 150,
+            wei: 50_000_000,
+        };
+        assert!(bridge.apply_action(me, to_hype, &tokens).await.is_err());
+        assert!(sim.account(system::HYPE_SYSTEM).unwrap().is_none());
+        // More than the balance: refused (counted), nothing moves.
+        let too_much = CoreAction::SpotSend {
+            destination: system::system_address(0),
+            token: 0,
+            wei: wei(5),
+        };
+        bridge.apply_action(me, too_much, &tokens).await.unwrap();
+        assert!(bridge
+            .metrics
+            .render()
+            .contains("venue_bridge_refusals_total 1"));
+    }
+
+    /// The system-address test names the token's own address and HYPE's.
+    #[test]
+    fn the_system_destination_is_the_tokens_own_address() {
+        let (_, _, tokens) = fee_bridge();
+        let usdc = system::by_name(&tokens, "USDC").unwrap();
+        let hype = system::by_name(&tokens, "HYPE").unwrap();
+        assert!(is_system_destination(system::system_address(0), usdc));
+        assert!(!is_system_destination(system::system_address(150), usdc));
+        assert!(is_system_destination(system::HYPE_SYSTEM, hype));
+        assert!(is_system_destination(system::system_address(150), hype));
+        assert!(!is_system_destination(system::HYPE_SYSTEM, usdc));
     }
 }

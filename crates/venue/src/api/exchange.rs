@@ -1690,6 +1690,104 @@ mod tests {
         );
     }
 
+    /// A transfer to a new account over `/exchange` costs the sender the 1 USDC
+    /// activation fee on top: refused by name when the balance cannot cover
+    /// both (nothing moves, nothing is created), applied once it can, free the
+    /// second time. A replayed nonce, a sub-account source and a token's system
+    /// address as destination are refused.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the sends
+    async fn a_transfer_to_a_new_account_pays_the_activation_fee_once() {
+        use crate::sim::DealClass::{Perp, Spot};
+        let state = dex_state();
+        let (me_key, me) = key(0x11);
+        let (_, other) = key(0x22);
+        let (_, third) = key(0x55);
+        fund(&state, me, Spot, None, "10");
+        fund(&state, me, Perp, None, "5");
+        let nonce = crate::now_ms();
+        let spot_send = |to: Address, amount: &str, n: u64| {
+            user_signed(
+                "spotSend",
+                &format!(
+                    r#""destination":"{to:#x}","token":"{TOKEN}","amount":"{amount}","time":{n}"#
+                ),
+            )
+        };
+
+        // 10 to a new account needs 11.
+        let action = spot_send(other, "10", nonce);
+        let out = post(&state, signed(&me_key, &action, nonce)).await;
+        assert_eq!(out["status"], "err", "{out}");
+        assert!(
+            out["response"].as_str().unwrap().contains("activation fee"),
+            "{out}"
+        );
+        assert_eq!(spot_usdc(&state, me), dec("10"));
+        assert!(state.sim.account(other).unwrap().is_none());
+
+        // 9 goes (9 + 1 = 10), and the replayed nonce is refused.
+        let n = nonce + 1;
+        let action = spot_send(other, "9", n);
+        let body = signed(&me_key, &action, n);
+        assert_eq!(post(&state, body.clone()).await["status"], "ok");
+        assert_eq!(
+            (spot_usdc(&state, me), spot_usdc(&state, other)),
+            (dec("0"), dec("9"))
+        );
+        assert_eq!(post(&state, body).await["status"], "err", "a replay");
+        assert_eq!(spot_usdc(&state, other), dec("9"));
+
+        // usdSend to another new account pays from the default dex.
+        let n = nonce + 2;
+        let action = user_signed(
+            "usdSend",
+            &format!(r#""destination":"{third:#x}","amount":"4","time":{n}"#),
+        );
+        assert_eq!(
+            post(&state, signed(&me_key, &action, n)).await["status"],
+            "ok"
+        );
+        assert_eq!(
+            (ledger(&state, me, ""), ledger(&state, third, "")),
+            (dec("0"), dec("4"))
+        );
+
+        // The Core to EVM leg is not an /exchange destination in the sim, for
+        // a token's system address or HYPE's.
+        for (i, system) in [
+            "0x2000000000000000000000000000000000000000",
+            "0x2222222222222222222222222222222222222222",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = nonce + 10 + i as u64;
+            let action = user_signed(
+                "spotSend",
+                &format!(r#""destination":"{system}","token":"{TOKEN}","amount":"1","time":{n}"#),
+            );
+            let out = post(&state, signed(&me_key, &action, n)).await;
+            assert!(
+                out["response"].as_str().unwrap().contains("system address"),
+                "{out}"
+            );
+        }
+        // A sub-account source is refused by name.
+        let n = nonce + 4;
+        let action = user_signed(
+            "sendAsset",
+            &format!(
+                r#""destination":"{other:#x}","sourceDex":"spot","destinationDex":"spot","token":"USDC","amount":"1","fromSubAccount":"{third:#x}","nonce":{n}"#
+            ),
+        );
+        let out = post(&state, signed(&me_key, &action, n)).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("fromSubAccount"),
+            "{out}"
+        );
+    }
+
     /// The user-signed actions are the account's own: an API wallet signing
     /// one is refused (and moves nothing), a key with no account is the venue's
     /// "does not exist", and `withdraw3` is refused in the venue's envelope.

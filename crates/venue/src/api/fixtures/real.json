@@ -522,6 +522,60 @@
     }
    }
   ],
+  "userNonFundingLedgerUpdates": [
+   {
+    "time": 1794612628561,
+    "hash": "0x7238959d3912a4b573b20448bc76480201290082d415c387160140eff8167ea0",
+    "delta": {
+     "type": "send",
+     "user": "0x1111111111111111111111111111111111111111",
+     "destination": "0x1111111111111111111111111111111111111111",
+     "sourceDex": "spot",
+     "destinationDex": "spot",
+     "token": "USDC",
+     "amount": "51.976471",
+     "usdcValue": "51.976471",
+     "fee": "1.001427",
+     "nativeTokenFee": "0.0",
+     "nonce": 1794612627611,
+     "feeToken": "USDC"
+    }
+   },
+   {
+    "time": 1794611504439,
+    "hash": "0x168d15fc54edc3b718060448bc385e0000c82de1efe0e289ba55c14f13e19da1",
+    "delta": {
+     "type": "spotTransfer",
+     "token": "USDC",
+     "amount": "927.409346",
+     "usdcValue": "927.409346",
+     "user": "0x1111111111111111111111111111111111111111",
+     "destination": "0x1111111111111111111111111111111111111111",
+     "fee": "1.0",
+     "nativeTokenFee": "0.0",
+     "nonce": 5846044,
+     "feeToken": "USDC"
+    }
+   },
+   {
+    "time": 1794701572462,
+    "hash": "0xdf950fa078b151d6e10e0448cf76c5010200278613b470a8835dbaf337b52bc1",
+    "delta": {
+     "type": "accountClassTransfer",
+     "usdc": "0.000854",
+     "toPerp": false
+    }
+   },
+   {
+    "time": 1794614039350,
+    "hash": "0x47eb0f2d834ba40c49640448bcc23c00002627131e4ec2deebb3ba80424f7df6",
+    "delta": {
+     "type": "accountActivationGas",
+     "amount": "0.01397702",
+     "token": "HYPE"
+    }
+   }
+  ],
   "preTransferCheck": {
    "isSanctioned": false,
    "userExists": true,
