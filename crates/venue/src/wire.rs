@@ -11,8 +11,9 @@
 //! exact (`serde-with-str`), because the served identity
 //! `accountValue == totalRawUsd + Σ signed(positionValue)` is checked at
 //! 1e-6 by the venue client — f64 arithmetic would fail it at the edges.
-//! Fields the venue may null (`midPx` in thin books, `liquidationPx` on cross
-//! positions) are `Option`.
+//! Fields the venue may null (`midPx` in thin books, `liquidationPx` on a
+//! position that cannot be liquidated, e.g. a long its collateral covers all
+//! the way to zero) are `Option`.
 //!
 //! Every enum here is `#[non_exhaustive]`: this is the venue's vocabulary and
 //! it may grow, so a consumer outside this crate must carry a default arm. Our
@@ -40,6 +41,19 @@ pub(crate) mod decimal_nano {
 
     pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&value.round_dp(9).normalize().to_string())
+    }
+}
+
+/// `liquidationPx` on the wire: a computed price, which the venue prints with up
+/// to ten fractional digits (measured: `0.4927481777`, `21139.6026656483`),
+/// trailing zeros trimmed; `null` when there is none.
+fn liquidation_px_text<S: serde::Serializer>(
+    value: &Option<Decimal>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(v) => serializer.serialize_str(&v.round_dp(10).normalize().to_string()),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -358,7 +372,7 @@ pub(crate) struct MarginSummary {
 
 /// One position row. `positionValue` is unsigned on the wire; the side comes
 /// from the sign of `szi` (the venue's exact rule). `liquidationPx` is present
-/// for isolated positions only.
+/// for cross and isolated positions alike (measured live on both).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Position {
@@ -366,8 +380,11 @@ pub(crate) struct Position {
     #[serde(default)]
     pub entry_px: Option<Decimal>,
     pub leverage: Leverage,
-    /// Served as `null` when the position has no liquidation price (the venue does).
-    #[serde(default)]
+    /// Served as `null` only when the position has no liquidation price: the
+    /// leg's equity covers the position all the way to a zero price (a long;
+    /// measured live, a short always has one). Cross and isolated positions
+    /// carry it alike. The venue prints up to ten fractional digits.
+    #[serde(default, serialize_with = "liquidation_px_text")]
     pub liquidation_px: Option<Decimal>,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub margin_used: Decimal,

@@ -75,9 +75,62 @@ pub(crate) struct UserFill {
     pub tid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloid: Option<String>,
+    /// Present on a liquidation's fills (the liquidated user's own closes and
+    /// the backstop's takeover), absent on every other fill, as the venue's is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquidation: Option<FillLiquidation>,
     pub fee_token: String,
     /// Always `None` (no TWAP orders), served as `null`.
     pub twap_id: Option<u64>,
+}
+
+/// How a liquidation was executed (the venue's `liquidation.method`): a market
+/// order to the book, or the backstop liquidator taking the position over.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum LiquidationMethod {
+    Market,
+    Backstop,
+}
+
+/// The `liquidation` object of a liquidation's fill (measured live):
+/// `{liquidatedUser, markPx, method}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FillLiquidation {
+    /// The liquidated account, `0x` + lowercase hex.
+    pub liquidated_user: String,
+    /// The mark the liquidation was decided at.
+    #[serde(serialize_with = "decimal_nano::serialize")]
+    pub mark_px: Decimal,
+    pub method: LiquidationMethod,
+}
+
+impl FillLiquidation {
+    pub(crate) fn new(user: Address, mark_px: Decimal, method: LiquidationMethod) -> Self {
+        Self {
+            liquidated_user: format!("{user:#x}"),
+            mark_px,
+            method,
+        }
+    }
+}
+
+/// The venue's `dir` for the backstop liquidator's takeover fill: the
+/// liquidated position's own label, `Liquidated Cross Long` and its three
+/// siblings (measured live on the liquidator's fills), not an `Open`.
+pub(crate) fn liquidated_dir(
+    leverage: crate::wire::LeverageType,
+    direction: super::account::Direction,
+) -> &'static str {
+    use crate::wire::LeverageType::{Cross, Isolated};
+    use super::account::Direction::{Long, Short};
+    match (leverage, direction) {
+        (Cross, Long) => "Liquidated Cross Long",
+        (Cross, Short) => "Liquidated Cross Short",
+        (Isolated, Long) => "Liquidated Isolated Long",
+        (Isolated, Short) => "Liquidated Isolated Short",
+    }
 }
 
 /// The wire's nano-trimmed decimal string for an optional decimal (only
@@ -213,8 +266,10 @@ pub(crate) enum Liquidity {
 
 /// One applied fill, ready to record: the facts the account math took, what
 /// it did to the position, and the order-side facts only the caller knows.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct FillRecord<'a> {
+    /// `Some` on a liquidation's fills (see [`FillLiquidation`]).
+    pub liquidation: Option<FillLiquidation>,
     pub facts: &'a FillFacts,
     pub effect: FillEffect,
     /// The order's id (0 for a fill that no order made: a delisting
@@ -277,6 +332,7 @@ pub(crate) fn record_fill(
             cloid: fill
                 .cloid
                 .map(|c| format!("0x{}", alloy_primitives::hex::encode(c))),
+            liquidation: fill.liquidation.clone(),
             fee_token: fill.fee_token.to_string(),
             twap_id: None,
         },
@@ -607,6 +663,7 @@ mod tests {
             builder_fee: None,
             tid: 7,
             cloid: None,
+            liquidation: None,
             fee_token: "USDC".into(),
             twap_id: None,
         };
@@ -619,6 +676,7 @@ mod tests {
         assert_eq!(v["feeToken"], "USDC");
         assert!(v["twapId"].is_null());
         assert!(v.get("cloid").is_none());
+        assert!(v.get("liquidation").is_none());
         assert_eq!(v["hash"], format!("0x{}7", "0".repeat(63)));
         let back: UserFill = serde_json::from_value(v).unwrap();
         assert_eq!(back, fill);
@@ -644,6 +702,7 @@ mod tests {
         let facts = FillFacts::close("ETH", Side::Sell, dec("1"), dec("1"), 1);
         let effect = FillEffect::of(dec("1"), dec("-1"), Decimal::ZERO);
         let fill = FillRecord {
+            liquidation: None,
             facts: &facts,
             effect,
             oid: 1,
@@ -695,6 +754,7 @@ mod tests {
         let facts = FillFacts::close("ETH", Side::Buy, dec("1"), dec("2"), 1);
         let effect = FillEffect::of(dec("-1"), dec("1"), dec("3"));
         let fill = FillRecord {
+            liquidation: None,
             facts: &facts,
             effect,
             oid: 4,
