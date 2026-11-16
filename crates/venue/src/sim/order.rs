@@ -13,7 +13,7 @@
 //! verified (the devnet has no keys — the anvil-impersonation analogue), and
 //! the depth is the served book's (the live book minus what the devnet
 //! already consumed, so a second order sees the first one's impact).
-use super::ledger::{FillRecord, Liquidity};
+use super::ledger::{FillLiquidation, FillRecord, LiquidationMethod, Liquidity};
 use super::validate::{validate_order, validate_trigger_side};
 use super::Sim;
 use crate::error::{Error, Result};
@@ -781,6 +781,7 @@ impl Sim {
     /// A liquidation's market close: the same walk as an order, but with no
     /// fee (docs: "there is no clearance fee on liquidations") and no opening
     /// probe (the venue closes regardless of the resulting margin).
+    #[allow(clippy::too_many_lines)] // the walk, the apply, the record and the settle: one close
     pub(crate) fn liquidate_position(
         &self,
         feed: &MarketFeed,
@@ -824,6 +825,11 @@ impl Sim {
         self.record_fill(
             address,
             &FillRecord {
+                liquidation: Some(FillLiquidation::new(
+                    address,
+                    feed.mark_or(coin, avg_px),
+                    LiquidationMethod::Market,
+                )),
                 facts: &facts,
                 effect,
                 oid,
@@ -942,6 +948,7 @@ impl Sim {
         self.record_fill(
             address,
             &FillRecord {
+                liquidation: None,
                 facts: &facts,
                 effect,
                 oid,
@@ -1004,6 +1011,7 @@ impl Sim {
                     self.record_fill(
                         *maker,
                         &FillRecord {
+                            liquidation: None,
                             facts: &facts,
                             effect,
                             oid: *oid,

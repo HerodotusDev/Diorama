@@ -13,7 +13,7 @@
 //! book — an empty ranking leaves the position for the next tick (named in
 //! the log).
 use super::account::{self, FillFacts, Liquidation};
-use super::ledger::{self, FillEffect, FillRecord, Liquidity};
+use super::ledger::{self, FillEffect, FillLiquidation, FillRecord, LiquidationMethod, Liquidity};
 use super::{Account, Sim, BACKSTOP};
 use crate::error::Result;
 use crate::feed::dex::dex_of_coin;
@@ -531,6 +531,7 @@ impl Sim {
             self.record_fill(
                 who,
                 &FillRecord {
+                    liquidation: None,
                     facts,
                     effect,
                     oid: 0,
@@ -662,11 +663,13 @@ enum Rescue {
 /// with it. A refused transfer names itself and moves nothing — the
 /// position stays for the next pass.
 ///
-/// Both sides' ledgers record the takeover at the mark: the vault's is an open
-/// (it is the resting side, `crossed: false`), the account's the close of the
+/// Both sides' ledgers record the takeover at the mark: the vault's carries the
+/// liquidated position's own label (`Liquidated Cross Long`, the aggressor), the
+/// account's the close of the
 /// position it lost, its `closedPnl` the position's pnl at that mark (the
 /// takeover moves no pnl into the balance: the margin goes with the position).
 /// `stamp` is the sim's trade-id counter and the sim clock (ms).
+#[allow(clippy::too_many_lines)] // the takeover and both ledgers' records, one transfer
 fn vault_take_coin(
     vault: &mut Account,
     me: &mut Account,
@@ -676,15 +679,17 @@ fn vault_take_coin(
 ) -> Option<Decimal> {
     let (address, coin) = target;
     let (next_tid, time) = stamp;
-    let (taken, direction, size, entry_px, leverage) = me.positions.get(coin).map(|p| {
-        (
-            p.isolated_margin,
-            p.direction(),
-            p.szi.abs(),
-            p.entry_px,
-            p.leverage_value,
-        )
-    })?;
+    let (taken, direction, size, entry_px, leverage, margin_mode) =
+        me.positions.get(coin).map(|p| {
+            (
+                p.isolated_margin,
+                p.direction(),
+                p.szi.abs(),
+                p.entry_px,
+                p.leverage_value,
+                p.leverage,
+            )
+        })?;
     let szi = me.positions.get(coin).map_or(Decimal::ZERO, |p| p.szi);
     let facts = account::FillFacts {
         coin: coin.to_string(),
@@ -699,24 +704,33 @@ fn vault_take_coin(
     };
     let vault_effect = match account::apply_fill(vault, &facts, feed.meta_for_lookup(coin).as_ref())
     {
-        Ok(effect) => effect,
+        // The takeover carries the liquidated position's own label (measured
+        // live on the liquidator's fills), not an `Open`.
+        Ok(effect) => FillEffect {
+            dir: ledger::liquidated_dir(margin_mode, direction),
+            ..effect
+        },
         Err(e) => {
             tracing::warn!(account = %address, coin = %coin, error = %e, "backstop transfer refused");
             return None;
         }
     };
     let fee_token = feed.fee_token_of_coin(coin);
+    let tag = FillLiquidation::new(address, facts.px, LiquidationMethod::Backstop);
     let vault_fill = FillRecord {
+        liquidation: Some(tag.clone()),
         facts: &facts,
         effect: vault_effect,
         oid: 0,
         cloid: None,
-        liquidity: Liquidity::Maker,
+        // The liquidator is the aggressor of its takeover (measured live:
+        // `crossed: true`).
+        liquidity: Liquidity::Taker,
         fee_token: &fee_token,
     };
     ledger::record_fill(vault, next_tid, time, &vault_fill);
     let lost = LostPosition { szi, entry_px };
-    record_loss(me, &facts, &lost, (next_tid, time), &fee_token);
+    record_loss(me, &facts, &lost, (next_tid, time), (&fee_token, tag));
     me.positions.remove(coin);
     Some(taken)
 }
@@ -735,9 +749,10 @@ fn record_loss(
     vault_fill: &FillFacts,
     lost: &LostPosition,
     stamp: (&mut u64, u64),
-    fee_token: &str,
+    tagged: (&str, FillLiquidation),
 ) {
     let (next_tid, time) = stamp;
+    let (fee_token, tag) = tagged;
     let pnl = account::sub(vault_fill.px, lost.entry_px, "backstop pnl")
         .and_then(|d| account::mul(lost.szi, d, "backstop pnl"))
         .unwrap_or(Decimal::ZERO);
@@ -746,6 +761,7 @@ fn record_loss(
         ..vault_fill.clone()
     };
     let my_fill = FillRecord {
+        liquidation: Some(tag),
         facts: &closing,
         effect: FillEffect::of(lost.szi, closing.size * closing.side.sign(), pnl),
         oid: 0,
@@ -915,6 +931,7 @@ mod tests {
     /// and the margin over: the vault holds the same side, the trader ends at
     /// zero equity (docs).
     #[test]
+    #[allow(clippy::too_many_lines)] // one scenario: the state and both ledgers
     fn the_backstop_takes_the_position_below_two_thirds() {
         let feed = feed_with(&[("ETH", "40", "40")]);
         feed.put_meta(meta_with("ETH", 10), crate::now_ms());
@@ -964,9 +981,18 @@ mod tests {
         assert_eq!(lost.start_position, Decimal::ONE);
         assert!(lost.crossed);
         let taken = vault.fills.back().expect("the vault's open is recorded");
-        assert_eq!(taken.dir, "Open Long");
-        assert!(!taken.crossed);
+        // The takeover is the liquidated position's own label, the liquidator
+        // is the aggressor, and both fills carry the liquidation (measured on
+        // the real liquidator's fills).
+        assert_eq!(taken.dir, "Liquidated Cross Long");
+        assert!(taken.crossed);
         assert_ne!(taken.tid, lost.tid);
+        for fill in [taken, lost] {
+            let tag = fill.liquidation.as_ref().expect("the liquidation tag");
+            assert_eq!(tag.liquidated_user, format!("{a:#x}"));
+            assert_eq!(tag.mark_px, Decimal::from(40));
+            assert_eq!(tag.method, crate::sim::ledger::LiquidationMethod::Backstop);
+        }
     }
 
     /// **A unified account's spot collateral backs the cross leg.** The same

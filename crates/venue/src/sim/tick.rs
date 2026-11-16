@@ -109,6 +109,7 @@ impl Sim {
             self.record_fill(
                 address,
                 &FillRecord {
+                    liquidation: None,
                     facts: &facts,
                     effect,
                     oid: 0,
@@ -322,6 +323,7 @@ impl Sim {
         self.record_fill(
             r.account,
             &FillRecord {
+                liquidation: None,
                 facts: &facts,
                 effect,
                 oid: r.oid,
