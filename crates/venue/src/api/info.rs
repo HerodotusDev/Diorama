@@ -813,12 +813,13 @@ async fn l2_book(
     };
     let Some(book) = book else {
         // The venue's own absence shape (measured live: `l2Book` for an
-        // unknown coin answers HTTP 200 `null`). A coin the venue lists with
-        // no book yet is a different fault: the plane is warming (503).
+        // unknown coin answers HTTP 500 `null`, builder dexes included). A
+        // coin the venue lists with no book yet is a different fault: the
+        // plane is warming (503).
         return if configured || state.feed.meta_for_coin(coin).is_some() {
             Err(Error::Warming)
         } else {
-            Ok(Json(None::<crate::wire::L2Book>).into_response())
+            Ok(unknown_dex())
         };
     };
     Ok(Json(aggregate_book(book, n_sig_figs, mantissa.unwrap_or(1))).into_response())
