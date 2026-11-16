@@ -60,7 +60,12 @@ impl Rig {
         with_table(&mut default, "BTC", 40, &[("0", 20), ("10000", 10)]);
         feed.put_meta(default, now);
         let mut xyz = meta_of(&[("xyz:TSLA", 20)]);
-        with_table(&mut xyz, "xyz:TSLA", 41, &[("0", 20), ("1000", 10), ("3000", 5)]);
+        with_table(
+            &mut xyz,
+            "xyz:TSLA",
+            41,
+            &[("0", 20), ("1000", 10), ("3000", 5)],
+        );
         feed.put_dex_meta("xyz", xyz, now);
         feed.put_oi_caps(Vec::new());
         feed.put_oi_caps_of("xyz", Vec::new());
@@ -90,10 +95,7 @@ impl Rig {
             L2Book {
                 coin: coin.into(),
                 time: now,
-                levels: [
-                    vec![level(px - dec("0.1"))],
-                    vec![level(px + dec("0.1"))],
-                ],
+                levels: [vec![level(px - dec("0.1"))], vec![level(px + dec("0.1"))]],
                 spread: None,
             },
             now,
@@ -130,7 +132,8 @@ impl Rig {
     }
 
     /// Open a cross position at `leverage` through the order lane.
-    fn open(&self, who: Address, coin: &str, is_buy: bool, size: &str, leverage: u32) {
+    fn open(&self, who: Address, coin: &str, order: (bool, &str, u32)) {
+        let (is_buy, size, leverage) = order;
         let meta = self.feed.meta_for_lookup(coin);
         self.sim
             .set_leverage(
@@ -224,17 +227,23 @@ fn around(liq: Decimal, long: bool) -> (Decimal, Decimal) {
 /// The single-position scenario: the mark one step short of the served price
 /// liquidates nothing, one step past it closes the position through the book.
 /// Returns the closing fill and the account before the liquidation.
+#[allow(clippy::too_many_lines)] // one walk: before, past, the fill, the balances
 fn liquidates_at_the_served_price(
     rig: &Rig,
     who: Address,
     coin: &str,
     long: bool,
 ) -> (UserFill, account::Account) {
-    let liq = rig.liq(who, coin).expect("the position has a liquidation price");
+    let liq = rig
+        .liq(who, coin)
+        .expect("the position has a liquidation price");
     let (before, past) = around(liq, long);
 
     rig.mark(coin, before);
-    assert!(rig.tick().is_empty(), "no liquidation at {before} (liq {liq})");
+    assert!(
+        rig.tick().is_empty(),
+        "no liquidation at {before} (liq {liq})"
+    );
     assert_ne!(rig.szi(who, coin), Decimal::ZERO, "the position survives");
     assert_eq!(
         rig.liq(who, coin),
@@ -256,7 +265,11 @@ fn liquidates_at_the_served_price(
     assert!(fill.crossed, "a liquidation takes the book");
     assert_eq!(fill.fee, Decimal::ZERO, "no fee on a liquidation");
     assert_eq!(fill.start_position, snapshot.positions[coin].szi);
-    assert_eq!(fill.sz, snapshot.positions[coin].szi.abs(), "closed in full");
+    assert_eq!(
+        fill.sz,
+        snapshot.positions[coin].szi.abs(),
+        "closed in full"
+    );
     let tag = fill.liquidation.as_ref().expect("the liquidation object");
     assert_eq!(tag.liquidated_user, format!("{who:#x}"));
     assert_eq!(tag.mark_px, past, "the mark the liquidation was decided at");
@@ -266,9 +279,15 @@ fn liquidates_at_the_served_price(
     assert_eq!(json["liquidation"]["liquidatedUser"], format!("{who:#x}"));
     // The close walked the book at the new mark: a long sells into the bid,
     // a short buys the ask.
-    assert_eq!(fill.px, if long { past - dec("0.1") } else { past + dec("0.1") });
-    let expected_pnl =
-        snapshot.positions[coin].szi * (fill.px - snapshot.positions[coin].entry_px);
+    assert_eq!(
+        fill.px,
+        if long {
+            past - dec("0.1")
+        } else {
+            past + dec("0.1")
+        }
+    );
+    let expected_pnl = snapshot.positions[coin].szi * (fill.px - snapshot.positions[coin].entry_px);
     assert_eq!(fill.closed_pnl, expected_pnl);
     (fill, snapshot)
 }
@@ -280,13 +299,16 @@ fn a_cross_long_liquidates_at_its_served_price() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xa1);
     rig.fund(a, "", "150");
-    rig.open(a, "ETH", true, "10", 10);
+    rig.open(a, "ETH", (true, "10", 10));
     let liq = rig.liq(a, "ETH").unwrap();
     // Hand check against the docs' closed form, `l = 1/20` (10x maintenance
     // is half the 10x initial margin): equity E, maintenance 0.05 * 1000.
     let equity = rig.served(a, "").cross_margin_summary.account_value;
     let expected = dec("100") - (equity - dec("50")) / dec("10") / (Decimal::ONE - dec("0.05"));
-    assert!((liq - expected).abs() < dec("0.000000001"), "{liq} vs {expected}");
+    assert!(
+        (liq - expected).abs() < dec("0.000000001"),
+        "{liq} vs {expected}"
+    );
     assert!(liq < dec("100"), "a long liquidates below the mark");
 
     let (fill, before) = liquidates_at_the_served_price(&rig, a, "ETH", true);
@@ -304,13 +326,16 @@ fn a_cross_short_liquidates_at_its_served_price() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xa2);
     rig.fund(a, "", "150");
-    rig.open(a, "ETH", false, "10", 10);
+    rig.open(a, "ETH", (false, "10", 10));
     let liq = rig.liq(a, "ETH").unwrap();
     assert!(liq > dec("100"), "a short liquidates above the mark");
     let equity = rig.served(a, "").cross_margin_summary.account_value;
     // Short: p = m + (E - M)/q/(1 + l).
     let expected = dec("100") + (equity - dec("50")) / dec("10") / (Decimal::ONE + dec("0.05"));
-    assert!((liq - expected).abs() < dec("0.000000001"), "{liq} vs {expected}");
+    assert!(
+        (liq - expected).abs() < dec("0.000000001"),
+        "{liq} vs {expected}"
+    );
 
     let (fill, before) = liquidates_at_the_served_price(&rig, a, "ETH", false);
     let after = rig.sim.account(a).unwrap().unwrap();
@@ -327,11 +352,15 @@ fn a_fully_collateralized_long_has_no_liquidation_price() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xa3);
     rig.fund(a, "", "5000");
-    rig.open(a, "ETH", true, "10", 10);
-    assert_eq!(rig.liq(a, "ETH"), None, "5000 covers a 1000 long at any price");
+    rig.open(a, "ETH", (true, "10", 10));
+    assert_eq!(
+        rig.liq(a, "ETH"),
+        None,
+        "5000 covers a 1000 long at any price"
+    );
     let b = Address::repeat_byte(0xa4);
     rig.fund(b, "", "5000");
-    rig.open(b, "ETH", false, "10", 10);
+    rig.open(b, "ETH", (false, "10", 10));
     let liq = rig.liq(b, "ETH").expect("a short always has one");
     assert!(liq > dec("500"), "{liq}");
     let served = serde_json::to_value(rig.served(a, "")).unwrap();
@@ -347,7 +376,7 @@ fn isolated_positions_liquidate_at_their_served_prices() {
         let rig = Rig::new();
         let a = Address::repeat_byte(0xa5);
         rig.fund(a, "", "500");
-        rig.open(a, "ETH", long, "10", 10);
+        rig.open(a, "ETH", (long, "10", 10));
         rig.isolate(a, "ETH", 10);
         let position = rig.sim.account(a).unwrap().unwrap().positions["ETH"].clone();
         let margin = position.isolated_margin;
@@ -360,7 +389,10 @@ fn isolated_positions_liquidate_at_their_served_prices() {
         let rate = dec("0.05");
         let expected = dec("100")
             - side * (equity - dec("1000") * rate) / dec("10") / (Decimal::ONE - rate * side);
-        assert!((liq - expected).abs() < dec("0.000000001"), "{liq} vs {expected}");
+        assert!(
+            (liq - expected).abs() < dec("0.000000001"),
+            "{liq} vs {expected}"
+        );
 
         let (fill, before) = liquidates_at_the_served_price(&rig, a, "ETH", long);
         let after = rig.sim.account(a).unwrap().unwrap();
@@ -381,7 +413,7 @@ fn a_builder_dex_short_liquidates_in_its_tier_at_the_liquidation_price() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xb1);
     rig.fund(a, "xyz", "300");
-    rig.open(a, "xyz:TSLA", false, "8", 20);
+    rig.open(a, "xyz:TSLA", (false, "8", 20));
     let state = rig.served(a, "xyz");
     let equity = state.cross_margin_summary.account_value;
     let liq = rig.liq(a, "xyz:TSLA").unwrap();
@@ -409,7 +441,7 @@ fn a_builder_dex_long_liquidates_at_its_served_price() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xb2);
     rig.fund(a, "xyz", "60");
-    rig.open(a, "xyz:TSLA", true, "8", 20);
+    rig.open(a, "xyz:TSLA", (true, "8", 20));
     let state = rig.served(a, "xyz");
     assert_eq!(
         state.cross_maintenance_margin_used,
@@ -430,8 +462,8 @@ fn two_cross_positions_on_one_dex_liquidate_together() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xc1);
     rig.fund(a, "", "200");
-    rig.open(a, "ETH", true, "10", 10);
-    rig.open(a, "BTC", false, "5", 20);
+    rig.open(a, "ETH", (true, "10", 10));
+    rig.open(a, "BTC", (false, "5", 20));
     let state = rig.served(a, "");
     let equity = state.cross_margin_summary.account_value;
     let maintenance = state.cross_maintenance_margin_used;
@@ -443,14 +475,23 @@ fn two_cross_positions_on_one_dex_liquidate_together() {
     // The ETH price solves `equity(p) == maintenance(p)` with BTC held at its
     // mark: E + 10 (p - 100) = 0.05 * 10 p + 12.5.
     let solved = (dec("12.5") + dec("1000") - equity) / dec("9.5");
-    assert!((eth - solved).abs() < dec("0.000000001"), "{eth} vs {solved}");
+    assert!(
+        (eth - solved).abs() < dec("0.000000001"),
+        "{eth} vs {solved}"
+    );
     // And the BTC one with ETH held: E - 5 (p - 100) = 0.025 * 5 p + 50.
     let solved = (equity + dec("500") - dec("50")) / dec("5.125");
-    assert!((btc - solved).abs() < dec("0.000000001"), "{btc} vs {solved}");
+    assert!(
+        (btc - solved).abs() < dec("0.000000001"),
+        "{btc} vs {solved}"
+    );
 
     // Moving the other coin moves this one's price: BTC up costs equity.
     rig.mark("BTC", dec("102"));
-    assert!(rig.liq(a, "ETH").unwrap() > eth, "BTC losing raises ETH's price");
+    assert!(
+        rig.liq(a, "ETH").unwrap() > eth,
+        "BTC losing raises ETH's price"
+    );
     rig.mark("BTC", dec("100"));
 
     // The ETH mark just before: nothing; just past: both positions go.
@@ -471,7 +512,11 @@ fn two_cross_positions_on_one_dex_liquidate_together() {
         .filter(|f| f.liquidation.is_some())
         .map(|f| f.coin)
         .collect();
-    assert_eq!(tagged.len(), 2, "both closes are liquidation fills: {tagged:?}");
+    assert_eq!(
+        tagged.len(),
+        2,
+        "both closes are liquidation fills: {tagged:?}"
+    );
 }
 
 /// The other leg of the pair: the short crossing its own price liquidates the
@@ -481,8 +526,8 @@ fn the_second_cross_position_triggers_the_same_liquidation() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xc2);
     rig.fund(a, "", "200");
-    rig.open(a, "ETH", true, "10", 10);
-    rig.open(a, "BTC", false, "5", 20);
+    rig.open(a, "ETH", (true, "10", 10));
+    rig.open(a, "BTC", (false, "5", 20));
     let btc = rig.liq(a, "BTC").unwrap();
     let (before, past) = around(btc, false);
     rig.mark("BTC", before);
@@ -503,15 +548,19 @@ fn a_position_on_another_dex_does_not_affect_this_dex() {
     let lone = Rig::new();
     let twin = Address::repeat_byte(0xd0);
     lone.fund(twin, "", "150");
-    lone.open(twin, "ETH", true, "10", 10);
+    lone.open(twin, "ETH", (true, "10", 10));
     let alone = lone.liq(twin, "ETH").unwrap();
 
     let a = Address::repeat_byte(0xd1);
     rig.fund(a, "", "150");
     rig.fund(a, "xyz", "100");
-    rig.open(a, "ETH", true, "10", 10);
-    rig.open(a, "xyz:TSLA", true, "8", 20);
-    assert_eq!(rig.liq(a, "ETH"), Some(alone), "the xyz book is not in ETH's equity");
+    rig.open(a, "ETH", (true, "10", 10));
+    rig.open(a, "xyz:TSLA", (true, "8", 20));
+    assert_eq!(
+        rig.liq(a, "ETH"),
+        Some(alone),
+        "the xyz book is not in ETH's equity"
+    );
     let xyz = rig.liq(a, "xyz:TSLA").unwrap();
 
     // The xyz position crossing its price liquidates xyz only.
@@ -522,20 +571,28 @@ fn a_position_on_another_dex_does_not_affect_this_dex() {
     let out = rig.tick();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].positions_closed, vec!["xyz:TSLA".to_string()]);
-    assert_ne!(rig.szi(a, "ETH"), Decimal::ZERO, "the default dex is untouched");
+    assert_ne!(
+        rig.szi(a, "ETH"),
+        Decimal::ZERO,
+        "the default dex is untouched"
+    );
     assert_eq!(rig.liq(a, "ETH"), Some(alone));
 
     // And the default dex liquidating leaves a surviving xyz position alone:
     // a fresh xyz position and the ETH one crossing.
     rig.mark("xyz:TSLA", dec("100"));
     rig.fund(a, "xyz", "100");
-    rig.open(a, "xyz:TSLA", true, "8", 20);
+    rig.open(a, "xyz:TSLA", (true, "8", 20));
     let (_, past) = around(alone, true);
     rig.mark("ETH", past);
     let out = rig.tick();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].positions_closed, vec!["ETH".to_string()]);
-    assert_ne!(rig.szi(a, "xyz:TSLA"), Decimal::ZERO, "the xyz position survives");
+    assert_ne!(
+        rig.szi(a, "xyz:TSLA"),
+        Decimal::ZERO,
+        "the xyz position survives"
+    );
 }
 
 /// A unified account margins against its spot collateral: the served price
@@ -549,19 +606,21 @@ fn a_unified_account_liquidates_against_its_spot_collateral() {
     let twin = Rig::new();
     let standard = Address::repeat_byte(0xe0);
     twin.fund(standard, "", "150");
-    twin.open(standard, "ETH", true, "10", 10);
+    twin.open(standard, "ETH", (true, "10", 10));
     let standard_liq = twin.liq(standard, "ETH").unwrap();
 
     let a = Address::repeat_byte(0xe1);
     rig.fund_unified(a, "150");
-    rig.open(a, "ETH", true, "10", 10);
+    rig.open(a, "ETH", (true, "10", 10));
     let state = rig.served(a, "");
     assert!(
         state.margin_summary.account_value < Decimal::ONE,
         "the perp view alone holds no collateral: {}",
         state.margin_summary.account_value
     );
-    let liq = rig.liq(a, "ETH").expect("the spot collateral backs the long");
+    let liq = rig
+        .liq(a, "ETH")
+        .expect("the spot collateral backs the long");
     assert!(
         (liq - standard_liq).abs() < dec("0.000001"),
         "unified {liq} vs standard {standard_liq}"
@@ -585,7 +644,7 @@ fn a_large_position_is_liquidated_in_part_first() {
     let a = Address::repeat_byte(0xf1);
     // 2000 ETH = 200k notional at 10x: margin 20k.
     rig.fund(a, "", "21000");
-    rig.open(a, "ETH", true, "2000", 10);
+    rig.open(a, "ETH", (true, "2000", 10));
     let liq = rig.liq(a, "ETH").unwrap();
     let (before, past) = around(liq, true);
     rig.mark("ETH", before);
@@ -595,7 +654,10 @@ fn a_large_position_is_liquidated_in_part_first() {
     assert_eq!(out.len(), 1);
     let fill = rig.fills(a).pop().unwrap();
     assert_eq!(fill.sz, dec("400"), "20% of 2000");
-    assert_eq!(fill.liquidation.as_ref().unwrap().method, LiquidationMethod::Market);
+    assert_eq!(
+        fill.liquidation.as_ref().unwrap().method,
+        LiquidationMethod::Market
+    );
     assert_eq!(rig.szi(a, "ETH"), dec("1600"));
     assert_eq!(
         rig.sim
@@ -615,7 +677,7 @@ fn a_gap_through_the_backstop_threshold_goes_to_the_vault() {
     let rig = Rig::new();
     let a = Address::repeat_byte(0xf2);
     rig.fund(a, "", "150");
-    rig.open(a, "ETH", true, "10", 10);
+    rig.open(a, "ETH", (true, "10", 10));
     let liq = rig.liq(a, "ETH").unwrap();
     // No book at the new mark: the book cannot act. 3.5 below the price the
     // equity is about a fifth of the maintenance requirement: positive (not
@@ -662,10 +724,10 @@ fn every_clearinghouse_surface_carries_the_same_liquidation_px() {
     let a = Address::repeat_byte(0xa9);
     rig.fund(a, "", "400");
     rig.fund(a, "xyz", "100");
-    rig.open(a, "ETH", true, "10", 10);
-    rig.open(a, "BTC", false, "5", 20);
+    rig.open(a, "ETH", (true, "10", 10));
+    rig.open(a, "BTC", (false, "5", 20));
     rig.isolate(a, "BTC", 20);
-    rig.open(a, "xyz:TSLA", false, "8", 20);
+    rig.open(a, "xyz:TSLA", (false, "8", 20));
     let account = rig.sim.account(a).unwrap().unwrap();
     for dex in ["", "xyz"] {
         let direct = account::clearinghouse(&account, &rig.feed, dex, 1).unwrap();

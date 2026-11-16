@@ -123,8 +123,8 @@ pub(crate) fn liquidated_dir(
     leverage: crate::wire::LeverageType,
     direction: super::account::Direction,
 ) -> &'static str {
-    use crate::wire::LeverageType::{Cross, Isolated};
     use super::account::Direction::{Long, Short};
+    use crate::wire::LeverageType::{Cross, Isolated};
     match (leverage, direction) {
         (Cross, Long) => "Liquidated Cross Long",
         (Cross, Short) => "Liquidated Cross Short",

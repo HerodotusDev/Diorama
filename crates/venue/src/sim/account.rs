@@ -528,7 +528,9 @@ fn position_row(
             // The live bound for a tracked coin; for a coin the meta does not
             // carry (a seeded position outside the markets) the position's own
             // leverage — a value we know, never a fabricated bound.
-            max_leverage: max_leverage(coin, meta).unwrap_or(p.leverage_value),
+            max_leverage: maintenance_tiers(coin, meta)
+                .map(|tiers| tier_at(&tiers, facts.value).max_leverage)
+                .unwrap_or(p.leverage_value),
             position_value: facts.value,
             return_on_equity: roe,
             szi: p.szi,
@@ -690,7 +692,11 @@ fn fill_cross_liquidation_px(
             continue;
         };
         let tiers = maintenance_tiers(coin, meta)?;
-        let other = sub(cross_maintenance, facts.maintenance, "other cross maintenance")?;
+        let other = sub(
+            cross_maintenance,
+            facts.maintenance,
+            "other cross maintenance",
+        )?;
         row.position.liquidation_px = solve_liquidation_px(&LiquidationLeg {
             tiers: &tiers,
             equity,
@@ -1034,6 +1040,10 @@ pub(crate) fn perp_transfer_bound(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MaintenanceTier {
     pub lower_bound: Decimal,
+    /// The tier's max leverage (the served position's `maxLeverage` at a
+    /// notional in this tier: measured live, a 24M position of a 10x asset
+    /// whose second tier is 5x serves 5).
+    pub max_leverage: u32,
     pub rate: Decimal,
     pub deduction: Decimal,
 }
@@ -1092,6 +1102,7 @@ pub(crate) fn maintenance_tiers(
         };
         tiers.push(MaintenanceTier {
             lower_bound,
+            max_leverage,
             rate,
             deduction,
         });
@@ -1109,6 +1120,7 @@ fn tier_at(tiers: &[MaintenanceTier], notional: Decimal) -> MaintenanceTier {
         .copied()
         .unwrap_or(MaintenanceTier {
             lower_bound: Decimal::ZERO,
+            max_leverage: 1,
             rate: Decimal::ZERO,
             deduction: Decimal::ZERO,
         })
@@ -1202,64 +1214,90 @@ pub(crate) struct LiquidationLeg<'a> {
 /// `None` when the root is not a positive price: a long the equity covers all
 /// the way to zero never liquidates (the venue serves `null`).
 pub(crate) fn solve_liquidation_px(leg: &LiquidationLeg<'_>) -> Result<Option<Decimal>> {
+    let mut nearest: Option<(Decimal, Decimal)> = None;
+    for index in 0..leg.tiers.len() {
+        let root = tier_root(leg, index)?;
+        // The tier's range is `[lower, upper)`: a root at the upper bound
+        // belongs to the next tier (they agree there: continuity).
+        if root.miss.is_zero() && root.upper.is_none_or(|u| root.price < u) {
+            return Ok((root.price > Decimal::ZERO).then_some(root.price));
+        }
+        // Rounding at a tier boundary can leave the root a hair outside every
+        // tier: the nearest tier's root, clamped into it, is that boundary.
+        if nearest.is_none_or(|(best, _)| root.miss < best) {
+            nearest = Some((root.miss, root.clamped()));
+        }
+    }
+    Ok(nearest.and_then(|(_, price)| (price > Decimal::ZERO).then_some(price)))
+}
+
+/// One tier's root of the liquidation equation and how far it lies outside the
+/// tier's own price range `[lower, upper)` (zero when it is inside).
+struct TierRoot {
+    price: Decimal,
+    lower: Decimal,
+    upper: Option<Decimal>,
+    miss: Decimal,
+}
+
+impl TierRoot {
+    /// The root pulled into the tier's range.
+    fn clamped(&self) -> Decimal {
+        let price = self.price.max(self.lower);
+        self.upper.map_or(price, |u| price.min(u))
+    }
+}
+
+/// Solve `equity + side·size·(p − mark) = other + size·p·rate − deduction`
+/// for the tier at `index`.
+fn tier_root(leg: &LiquidationLeg<'_>, index: usize) -> Result<TierRoot> {
+    let tier = &leg.tiers[index];
     let side = match leg.direction {
         Direction::Long => Decimal::ONE,
         Direction::Short => -Decimal::ONE,
     };
+    let denominator = mul(
+        leg.size,
+        sub(side, tier.rate, "liquidation denominator")?,
+        "liquidation denominator",
+    )?;
+    if denominator.is_zero() {
+        return Err(Error::DivideByZero {
+            what: "liquidation denominator",
+        });
+    }
     let signed_notional = mul(
         mul(side, leg.size, "liquidation signed size")?,
         leg.mark,
         "liquidation signed notional",
     )?;
-    let mut nearest: Option<(Decimal, Decimal)> = None;
-    for (index, tier) in leg.tiers.iter().enumerate() {
-        let denominator = mul(
-            leg.size,
-            sub(side, tier.rate, "liquidation denominator")?,
-            "liquidation denominator",
-        )?;
-        if denominator.is_zero() {
-            return Err(Error::DivideByZero {
-                what: "liquidation denominator",
-            });
-        }
-        // equity + side·size·(p − mark) = other + size·p·rate − deduction.
-        let numerator = sub(
-            add(
-                sub(
-                    leg.other_maintenance,
-                    tier.deduction,
-                    "liquidation numerator",
-                )?,
-                signed_notional,
+    let numerator = sub(
+        add(
+            sub(
+                leg.other_maintenance,
+                tier.deduction,
                 "liquidation numerator",
             )?,
-            leg.equity,
+            signed_notional,
             "liquidation numerator",
-        )?;
-        let price = div(numerator, denominator, "liquidation price")?;
-        let lower = div(tier.lower_bound, leg.size, "liquidation tier bound")?;
-        let upper = match leg.tiers.get(index + 1) {
-            Some(next) => Some(div(next.lower_bound, leg.size, "liquidation tier bound")?),
-            None => None,
-        };
-        let below = (lower - price).max(Decimal::ZERO);
-        let above = upper.map_or(Decimal::ZERO, |u| (price - u).max(Decimal::ZERO));
-        let miss = below + above;
-        // The tier's range is `[lower, upper)`: a root at the upper bound
-        // belongs to the next tier (they agree there: continuity).
-        if below.is_zero() && upper.is_none_or(|u| price < u) {
-            return Ok((price > Decimal::ZERO).then_some(price));
-        }
-        // Rounding at a tier boundary can leave the root a hair outside every
-        // tier: the nearest tier's root, clamped into it, is that boundary.
-        if nearest.is_none_or(|(best, _)| miss < best) {
-            let clamped = price.max(lower);
-            let clamped = upper.map_or(clamped, |u| clamped.min(u));
-            nearest = Some((miss, clamped));
-        }
-    }
-    Ok(nearest.and_then(|(_, price)| (price > Decimal::ZERO).then_some(price)))
+        )?,
+        leg.equity,
+        "liquidation numerator",
+    )?;
+    let price = div(numerator, denominator, "liquidation price")?;
+    let lower = div(tier.lower_bound, leg.size, "liquidation tier bound")?;
+    let upper = match leg.tiers.get(index + 1) {
+        Some(next) => Some(div(next.lower_bound, leg.size, "liquidation tier bound")?),
+        None => None,
+    };
+    let below = (lower - price).max(Decimal::ZERO);
+    let above = upper.map_or(Decimal::ZERO, |u| (price - u).max(Decimal::ZERO));
+    Ok(TierRoot {
+        price,
+        lower,
+        upper,
+        miss: below + above,
+    })
 }
 
 /// An isolated position's liquidation price: its own margin plus its own pnl
@@ -1837,6 +1875,7 @@ mod tests {
     fn a_zero_liquidation_denominator_is_refused() {
         let tiers = [MaintenanceTier {
             lower_bound: Decimal::ZERO,
+            max_leverage: 1,
             rate: Decimal::ONE,
             deduction: Decimal::ZERO,
         }];
@@ -1939,6 +1978,7 @@ mod tests {
         let rate = Decimal::ONE / Decimal::from(2 * 50); // tier: 50x → l = 1/100
         let tiers = [MaintenanceTier {
             lower_bound: Decimal::ZERO,
+            max_leverage: 50,
             rate,
             deduction: Decimal::ZERO,
         }];
@@ -1957,9 +1997,12 @@ mod tests {
         // subtraction) gave 2836.1087743102668475802804161.
         let maintenance = szi * mark * rate;
         let expected = mark - (margin - maintenance) / szi / (Decimal::ONE - rate);
-        assert!((liq - expected).abs() < Decimal::new(1, 18), "{liq} vs {expected}");
+        assert!(
+            (liq - expected).abs() < Decimal::new(1, 18),
+            "{liq} vs {expected}"
+        );
         // The docs' figure, to the precision of their rounded inputs.
-        assert_eq!(liq.round_dp(3), Decimal::new(2866269, 3));
+        assert_eq!(liq.round_dp(3), Decimal::new(2_866_269, 3));
     }
 
     #[test]

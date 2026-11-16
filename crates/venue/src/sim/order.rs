@@ -781,6 +781,7 @@ impl Sim {
     /// A liquidation's market close: the same walk as an order, but with no
     /// fee (docs: "there is no clearance fee on liquidations") and no opening
     /// probe (the venue closes regardless of the resulting margin).
+    #[allow(clippy::too_many_lines)] // the walk, the apply, the record and the settle: one close
     pub(crate) fn liquidate_position(
         &self,
         feed: &MarketFeed,

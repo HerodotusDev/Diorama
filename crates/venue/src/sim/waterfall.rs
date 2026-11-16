@@ -663,11 +663,13 @@ enum Rescue {
 /// with it. A refused transfer names itself and moves nothing — the
 /// position stays for the next pass.
 ///
-/// Both sides' ledgers record the takeover at the mark: the vault's is an open
-/// (it is the resting side, `crossed: false`), the account's the close of the
+/// Both sides' ledgers record the takeover at the mark: the vault's carries the
+/// liquidated position's own label (`Liquidated Cross Long`, the aggressor), the
+/// account's the close of the
 /// position it lost, its `closedPnl` the position's pnl at that mark (the
 /// takeover moves no pnl into the balance: the margin goes with the position).
 /// `stamp` is the sim's trade-id counter and the sim clock (ms).
+#[allow(clippy::too_many_lines)] // the takeover and both ledgers' records, one transfer
 fn vault_take_coin(
     vault: &mut Account,
     me: &mut Account,
@@ -929,6 +931,7 @@ mod tests {
     /// and the margin over: the vault holds the same side, the trader ends at
     /// zero equity (docs).
     #[test]
+    #[allow(clippy::too_many_lines)] // one scenario: the state and both ledgers
     fn the_backstop_takes_the_position_below_two_thirds() {
         let feed = feed_with(&[("ETH", "40", "40")]);
         feed.put_meta(meta_with("ETH", 10), crate::now_ms());
