@@ -73,7 +73,6 @@ contract = "0xe4aE88743c3834d0c492eAbC47384c84BcADC6a6"
 slots = ["0x3e54e5ae16d7bdb0bade122edbe34ab784fcd78c6d535e29aff3bc7d357e7586"]
 
 [services.venue_sim]
-markets = ["BTC", "ETH", "HYPE", "SOL"]
 
 [[watchlist]]
 address = "0xb88339CB7199b77E23DB6E890353E22632Ba630f"

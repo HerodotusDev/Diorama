@@ -69,12 +69,7 @@ fn book(coin: &str, px: &str) -> L2Book {
 /// builder dex (`flx`); the spot registry lists USDC, PURR, HYPE and USDH, and
 /// HYPE trades at 5 USDC (pair `@107`).
 fn feed() -> MarketFeed {
-    let feed = MarketFeed::memory(vec![
-        "ETH".to_string(),
-        "xyz:TSLA".to_string(),
-        "abc:GOLD".to_string(),
-        "flx:TSLA".to_string(),
-    ]);
+    let feed = MarketFeed::memory();
     let now = crate::now_ms();
     feed.put_meta(meta_with("ETH", 10), now);
     feed.put_dex_meta("xyz", meta_of(&[("xyz:TSLA", 10)]), now);

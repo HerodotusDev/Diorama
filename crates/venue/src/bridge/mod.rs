@@ -1376,7 +1376,7 @@ mod tests {
     /// pair at 5; the RPC points nowhere (these tests stop before the chain).
     fn fee_bridge() -> (Bridge, Arc<Sim>, Vec<TokenInfo>) {
         let sim = Arc::new(Sim::memory());
-        let feed = Arc::new(MarketFeed::memory(Vec::new()));
+        let feed = Arc::new(MarketFeed::memory());
         let token = |name: &str, index: u32| crate::wire::SpotToken {
             name: name.into(),
             sz_decimals: 8,
