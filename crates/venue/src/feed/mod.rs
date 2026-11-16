@@ -147,6 +147,42 @@ pub struct MarketFeed {
     stalled_until_ms: AtomicU64,
 }
 
+/// A live context with the scenario's overrides applied: the one composition
+/// `metaAndAssetCtxs` and the per-coin lookups share.
+fn compose_ctx(
+    live: &AssetCtx,
+    coin: &str,
+    overrides: &Overrides,
+    stalled: bool,
+    now: u64,
+) -> AssetCtx {
+    let mut ctx = live.clone();
+    // `control_owned` is the PRICE ownership bit: the mark/oracle
+    // (`crash`/`rally`), the book (`set_book`) or the whole live plane
+    // (`stall`). Funding moves no mark and is reported separately below;
+    // conflating the two froze the mirror's WHYPE oracle on a funding-only
+    // scenario.
+    let price_owned =
+        overrides.prices.contains_key(coin) || overrides.books.contains_key(coin) || stalled;
+    let funding_owned = overrides.funding.contains_key(coin)
+        && overrides
+            .funding_expires_ms
+            .get(coin)
+            .is_none_or(|deadline| *deadline > now);
+    if let Some(p) = overrides.prices.get(coin) {
+        ctx.mark_px = p.mark;
+        ctx.oracle_px = p.oracle;
+    }
+    if funding_owned {
+        if let Some(rate) = overrides.funding.get(coin) {
+            ctx.funding = *rate;
+        }
+    }
+    ctx.control_owned = price_owned;
+    ctx.funding_owned = funding_owned;
+    ctx
+}
+
 impl MarketFeed {
     /// Load the persisted overrides beside the live cache.
     pub fn load(path: PathBuf, markets: Vec<String>) -> Result<Self> {
@@ -388,6 +424,7 @@ impl MarketFeed {
     /// The default dex's cached cap list. `None` until the venue has
     /// answered: an unknown cap set is refused by the order lane, never read
     /// as "nothing is capped".
+    #[cfg(test)]
     pub fn open_interest_caps(&self) -> Option<Vec<String>> {
         self.open_interest_caps_of("")
     }
@@ -752,6 +789,28 @@ impl MarketFeed {
             .collect()
     }
 
+    /// Every dex with its coin names in universe order, `perpDexs` order (the
+    /// push lanes' per-tick read: only the names are copied).
+    pub(crate) fn dex_coins(&self) -> Vec<(String, Vec<String>)> {
+        self.read()
+            .registry
+            .dexs()
+            .iter()
+            .map(|d| {
+                (
+                    d.name.clone(),
+                    d.meta.universe.iter().map(|a| a.name.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the registry lists the dex (`""` is the default dex): the
+    /// names an info request or a subscription may select.
+    pub(crate) fn has_dex(&self, name: &str) -> bool {
+        self.read().registry.dex(name).is_some()
+    }
+
     /// The name of spot token `index` (the venue's spot meta). Token 0 is
     /// `USDC` even before the registry lands; any other index needs the
     /// registry (`None` = unknown).
@@ -851,6 +910,7 @@ impl MarketFeed {
 
     /// `metaAndAssetCtxs` with the overrides applied: the served contexts are
     /// exactly what the account plane prices from.
+    #[cfg(test)]
     pub(crate) fn meta_and_ctxs(&self) -> Option<crate::wire::MetaAndAssetCtxs> {
         self.meta_and_ctxs_of("")
     }
@@ -866,35 +926,24 @@ impl MarketFeed {
             .universe
             .iter()
             .filter_map(|asset| {
-                let mut ctx = c.ctxs.get(&asset.name)?.clone();
-                // `control_owned` is the PRICE ownership bit: the mark/oracle
-                // (`crash`/`rally`), the book (`set_book`) or the whole live
-                // plane (`stall`). Funding moves no mark and is reported
-                // separately below; conflating the two froze the mirror's
-                // WHYPE oracle on a funding-only scenario.
-                let price_owned = overrides.prices.contains_key(&asset.name)
-                    || overrides.books.contains_key(&asset.name)
-                    || stalled;
-                let funding_owned = overrides.funding.contains_key(&asset.name)
-                    && overrides
-                        .funding_expires_ms
-                        .get(&asset.name)
-                        .is_none_or(|deadline| *deadline > now);
-                if let Some(p) = overrides.prices.get(&asset.name) {
-                    ctx.mark_px = p.mark;
-                    ctx.oracle_px = p.oracle;
-                }
-                if funding_owned {
-                    if let Some(rate) = overrides.funding.get(&asset.name) {
-                        ctx.funding = *rate;
-                    }
-                }
-                ctx.control_owned = price_owned;
-                ctx.funding_owned = funding_owned;
-                Some(ctx)
+                let ctx = c.ctxs.get(&asset.name)?;
+                Some(compose_ctx(ctx, &asset.name, &overrides, stalled, now))
             })
             .collect();
         Some(crate::wire::MetaAndAssetCtxs(meta, ctxs))
+    }
+
+    /// One coin's context with the overrides applied (the row
+    /// `metaAndAssetCtxs` serves for it), looked up directly by the coin's
+    /// name (builder coins included); `None` while no live context has landed
+    /// for the coin.
+    pub(crate) fn ctx(&self, coin: &str) -> Option<AssetCtx> {
+        let stalled = self.stalled();
+        let now = crate::now_ms();
+        let overrides = self.read_overrides();
+        let c = self.read();
+        let ctx = c.ctxs.get(coin)?;
+        Some(compose_ctx(ctx, coin, &overrides, stalled, now))
     }
 
     /// `allMids` with the overrides applied.

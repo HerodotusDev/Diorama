@@ -54,6 +54,16 @@ pub(crate) struct CandleRequest {
     pub end_time: Option<u64>,
 }
 
+/// A request's `dex` field: absent is `None`, a string is `Some`, and an
+/// explicit `null` (or any other type) is refused, as the real API refuses it
+/// with a 422 (measured on `meta`, `metaAndAssetCtxs`, `allMids`,
+/// `clearinghouseState`, `openOrders` and `perpsAtOpenInterestCap`).
+fn dex_field<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    <String as Deserialize>::deserialize(deserializer).map(Some)
+}
+
 /// One `POST /info` request. Unknown types parse to [`InfoRequest::Unrouted`]
 /// (hl_mock answered them as unrouted; the handler keeps that contract).
 /// The docs' `oid` union for `orderStatus`: `uint64 or string` (a 16-byte hex
@@ -72,7 +82,11 @@ pub(crate) enum InfoRequest {
     #[serde(rename = "clearinghouseState")]
     ClearinghouseState {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "spotClearinghouseState")]
@@ -82,13 +96,21 @@ pub(crate) enum InfoRequest {
     #[serde(rename = "openOrders")]
     OpenOrders {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "frontendOpenOrders")]
     FrontendOpenOrders {
         user: Address,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "orderStatus")]
@@ -99,17 +121,29 @@ pub(crate) enum InfoRequest {
     },
     #[serde(rename = "perpsAtOpenInterestCap")]
     PerpsAtOpenInterestCap {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "meta")]
     Meta {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "metaAndAssetCtxs")]
     MetaAndAssetCtxs {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     #[serde(rename = "perpDexs")]
@@ -132,7 +166,11 @@ pub(crate) enum InfoRequest {
     SpotMeta,
     #[serde(rename = "allMids")]
     AllMids {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "dex_field",
+            skip_serializing_if = "Option::is_none"
+        )]
         dex: Option<String>,
     },
     /// `{"type":"candleSnapshot","req":{coin,interval,startTime,endTime}}`:
@@ -166,6 +204,71 @@ pub(crate) enum InfoRequest {
     /// `[[coin, category], ...]`.
     #[serde(rename = "perpCategories")]
     PerpCategories,
+    // ---- market-wide types the sim does not model: the real venue's answer
+    // is forwarded verbatim (the field names are the venue's own, so a body
+    // missing one is the venue's 422 here too) ------------------------------
+    #[serde(rename = "spotMetaAndAssetCtxs")]
+    SpotMetaAndAssetCtxs,
+    #[serde(rename = "fundingHistory")]
+    FundingHistory {
+        #[serde(rename = "coin")]
+        _coin: String,
+        #[serde(rename = "startTime")]
+        _start_time: u64,
+        #[serde(rename = "endTime", default, skip_serializing_if = "Option::is_none")]
+        _end_time: Option<u64>,
+    },
+    #[serde(rename = "predictedFundings")]
+    PredictedFundings,
+    #[serde(rename = "perpDexLimits")]
+    PerpDexLimits {
+        #[serde(rename = "dex")]
+        _dex: String,
+    },
+    #[serde(rename = "perpDexStatus")]
+    PerpDexStatus {
+        #[serde(rename = "dex")]
+        _dex: String,
+    },
+    #[serde(rename = "maxMarketOrderNtls")]
+    MaxMarketOrderNtls,
+    #[serde(rename = "vaultSummaries")]
+    VaultSummaries,
+    #[serde(rename = "tokenDetails")]
+    TokenDetails {
+        #[serde(rename = "tokenId")]
+        _token_id: String,
+    },
+    #[serde(rename = "perpDeployAuctionStatus")]
+    PerpDeployAuctionStatus,
+    #[serde(rename = "spotPairDeployAuctionStatus")]
+    SpotPairDeployAuctionStatus,
+    #[serde(rename = "spotDeployState")]
+    SpotDeployState {
+        #[serde(rename = "user")]
+        _user: Address,
+    },
+    #[serde(rename = "outcomeMeta")]
+    OutcomeMeta,
+    #[serde(rename = "allBorrowLendReserveStates")]
+    AllBorrowLendReserveStates,
+    #[serde(rename = "borrowLendReserveState")]
+    BorrowLendReserveState {
+        #[serde(rename = "token")]
+        _token: u32,
+    },
+    #[serde(rename = "leadingVaults")]
+    LeadingVaults {
+        #[serde(rename = "user")]
+        _user: Address,
+    },
+    #[serde(rename = "vaultDetails")]
+    VaultDetails {
+        #[serde(rename = "vaultAddress")]
+        _vault_address: Address,
+        #[serde(rename = "user", default, skip_serializing_if = "Option::is_none")]
+        _user: Option<Address>,
+    },
     #[serde(other)]
     Unrouted,
 }
@@ -200,6 +303,22 @@ impl InfoRequest {
             InfoRequest::ExchangeStatus => "exchangeStatus",
             InfoRequest::SpotMeta => "spotMeta",
             InfoRequest::AllMids { .. } => "allMids",
+            InfoRequest::SpotMetaAndAssetCtxs => "spotMetaAndAssetCtxs",
+            InfoRequest::FundingHistory { .. } => "fundingHistory",
+            InfoRequest::PredictedFundings => "predictedFundings",
+            InfoRequest::PerpDexLimits { .. } => "perpDexLimits",
+            InfoRequest::PerpDexStatus { .. } => "perpDexStatus",
+            InfoRequest::MaxMarketOrderNtls => "maxMarketOrderNtls",
+            InfoRequest::VaultSummaries => "vaultSummaries",
+            InfoRequest::TokenDetails { .. } => "tokenDetails",
+            InfoRequest::PerpDeployAuctionStatus => "perpDeployAuctionStatus",
+            InfoRequest::SpotPairDeployAuctionStatus => "spotPairDeployAuctionStatus",
+            InfoRequest::SpotDeployState { .. } => "spotDeployState",
+            InfoRequest::OutcomeMeta => "outcomeMeta",
+            InfoRequest::AllBorrowLendReserveStates => "allBorrowLendReserveStates",
+            InfoRequest::BorrowLendReserveState { .. } => "borrowLendReserveState",
+            InfoRequest::LeadingVaults { .. } => "leadingVaults",
+            InfoRequest::VaultDetails { .. } => "vaultDetails",
             InfoRequest::Unrouted => "unrouted",
         }
     }
