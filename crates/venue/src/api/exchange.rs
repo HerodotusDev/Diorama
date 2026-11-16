@@ -1661,11 +1661,11 @@ mod tests {
             &format!(r#""destination":"{other:#x}","token":"{TOKEN}","amount":"25","time":{n}"#),
         );
         ok(&post(&state, signed(&me_key, &action, n)).await);
-        // `other` is a new account: the sender also pays the 1 USDC
-        // activation fee, the recipient gets the full 25.
+        // `other` is new: credited in full, and the sender (funded by a
+        // helper) owes no activation.
         assert_eq!(
             (spot_usdc(&state, me), spot_usdc(&state, other)),
-            (dec("704"), dec("25"))
+            (dec("705"), dec("25"))
         );
         let n = nonce + 7;
         let action = user_signed(
@@ -1690,21 +1690,20 @@ mod tests {
         );
     }
 
-    /// A transfer to a new account over `/exchange` costs the sender the 1 USDC
-    /// activation fee on top: refused by name when the balance cannot cover
-    /// both (nothing moves, nothing is created), applied once it can, free the
-    /// second time. A replayed nonce, a sub-account source and a token's system
-    /// address as destination are refused.
+    /// Over `/exchange`, an account created by an inbound transfer is credited
+    /// in full and pays the 1 USDC activation on its first outbound transfer:
+    /// refused by name when the balance cannot cover amount plus fee (nothing
+    /// moves), applied once it can, free the second time. A replayed nonce, a
+    /// sub-account source and a token's system address as destination are
+    /// refused.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the sends
-    async fn a_transfer_to_a_new_account_pays_the_activation_fee_once() {
-        use crate::sim::DealClass::{Perp, Spot};
+    async fn an_accounts_first_outbound_transfer_pays_the_activation_fee_once() {
+        use crate::sim::DealClass::Spot;
         let state = dex_state();
         let (me_key, me) = key(0x11);
-        let (_, other) = key(0x22);
-        let (_, third) = key(0x55);
-        fund(&state, me, Spot, None, "10");
-        fund(&state, me, Perp, None, "5");
+        let (other_key, other) = key(0x22);
+        fund(&state, me, Spot, None, "30");
         let nonce = crate::now_ms();
         let spot_send = |to: Address, amount: &str, n: u64| {
             user_signed(
@@ -1715,43 +1714,36 @@ mod tests {
             )
         };
 
-        // 10 to a new account needs 11.
+        // `me` is funded by a helper: sending 10 to a new account costs it nothing extra.
         let action = spot_send(other, "10", nonce);
         let out = post(&state, signed(&me_key, &action, nonce)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            (spot_usdc(&state, me), spot_usdc(&state, other)),
+            (dec("20"), dec("10"))
+        );
+
+        // `other` owes the activation: 10 of its 10 is refused, 9 goes.
+        let n = nonce + 1;
+        let action = spot_send(me, "10", n);
+        let out = post(&state, signed(&other_key, &action, n)).await;
         assert_eq!(out["status"], "err", "{out}");
         assert!(
             out["response"].as_str().unwrap().contains("activation fee"),
             "{out}"
         );
-        assert_eq!(spot_usdc(&state, me), dec("10"));
-        assert!(state.sim.account(other).unwrap().is_none());
-
-        // 9 goes (9 + 1 = 10), and the replayed nonce is refused.
-        let n = nonce + 1;
-        let action = spot_send(other, "9", n);
-        let body = signed(&me_key, &action, n);
+        assert_eq!(spot_usdc(&state, other), dec("10"));
+        let n = nonce + 2;
+        let action = spot_send(me, "9", n);
+        let body = signed(&other_key, &action, n);
         assert_eq!(post(&state, body.clone()).await["status"], "ok");
         assert_eq!(
-            (spot_usdc(&state, me), spot_usdc(&state, other)),
-            (dec("0"), dec("9"))
+            (spot_usdc(&state, other), spot_usdc(&state, me)),
+            (dec("0"), dec("29"))
         );
+        // A replay of the signed body is refused.
         assert_eq!(post(&state, body).await["status"], "err", "a replay");
-        assert_eq!(spot_usdc(&state, other), dec("9"));
-
-        // usdSend to another new account pays from the default dex.
-        let n = nonce + 2;
-        let action = user_signed(
-            "usdSend",
-            &format!(r#""destination":"{third:#x}","amount":"4","time":{n}"#),
-        );
-        assert_eq!(
-            post(&state, signed(&me_key, &action, n)).await["status"],
-            "ok"
-        );
-        assert_eq!(
-            (ledger(&state, me, ""), ledger(&state, third, "")),
-            (dec("0"), dec("4"))
-        );
+        assert_eq!(spot_usdc(&state, me), dec("29"));
 
         // The Core to EVM leg is not an /exchange destination in the sim, for
         // a token's system address or HYPE's.
@@ -1778,7 +1770,7 @@ mod tests {
         let action = user_signed(
             "sendAsset",
             &format!(
-                r#""destination":"{other:#x}","sourceDex":"spot","destinationDex":"spot","token":"USDC","amount":"1","fromSubAccount":"{third:#x}","nonce":{n}"#
+                r#""destination":"{other:#x}","sourceDex":"spot","destinationDex":"spot","token":"USDC","amount":"1","fromSubAccount":"{me:#x}","nonce":{n}"#
             ),
         );
         let out = post(&state, signed(&me_key, &action, n)).await;

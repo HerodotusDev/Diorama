@@ -151,7 +151,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             end_time,
         } => ledger_updates(&state, body, user, (start_time, end_time)).await,
         InfoRequest::MaxBuilderFee { user, builder } => max_fee(&state, body, user, builder).await,
-        InfoRequest::PreTransferCheck { user, .. } => pre_transfer_check(&state, user),
+        InfoRequest::PreTransferCheck { user, source } => pre_transfer_check(&state, user, source),
     }
 }
 
@@ -308,22 +308,27 @@ fn deserialize_failure() -> Response {
         .into_response()
 }
 
-/// `preTransferCheck`: `user` is the destination. The sim answers from its own
-/// view of who exists (the transfers it applies charge by that view): a
-/// destination that does not exist yet costs the sender the 1 USDC activation
-/// fee, the real venue's answer for such an address.
-fn pre_transfer_check(state: &ApiState, user: Address) -> Result<Response> {
-    let exists = state.sim.address_exists(user)?;
-    let fee = if exists {
-        rust_decimal::Decimal::ZERO
-    } else {
+/// `preTransferCheck`: `user` is the destination, `source` the sender. The
+/// shape is the real venue's. The sim answers from its own state: `userExists`
+/// is whether the destination exists on the sim, `userHasSentTx` whether it
+/// exists and has paid its activation (it made its first outbound transfer, or
+/// was funded by a seed or `deal`), and `fee` is the 1 USDC activation the
+/// *source* would pay on this transfer (Circle's rule: charged once, on an
+/// account's first outbound action) or `0.0`. The real venue answers
+/// `fee: "1.0"` for a destination it has never seen; the sim does not tie the
+/// fee to the destination.
+fn pre_transfer_check(state: &ApiState, user: Address, source: Address) -> Result<Response> {
+    let check = state.sim.pre_transfer(user, source)?;
+    let fee = if check.source_owes {
         crate::sim::fees::ACTIVATION_FEE
+    } else {
+        rust_decimal::Decimal::ZERO
     };
     Ok(Json(serde_json::json!({
         "isSanctioned": false,
-        "userExists": exists,
+        "userExists": check.destination_exists,
         "fee": crate::sim::fees::real_text(fee),
-        "userHasSentTx": exists,
+        "userHasSentTx": check.destination_has_sent,
     }))
     .into_response())
 }

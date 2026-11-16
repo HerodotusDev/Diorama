@@ -17,9 +17,10 @@
 //! the maintenance its positions hold on every dex margining against the token
 //! (and never what a resting spot order holds).
 //!
-//! Fees ([`super::fees`]): a send to another account that does not exist yet
-//! also costs the sender 1 USDC (the activation fee, the recipient gets the
-//! full amount), and a Core to EVM transfer costs the HyperEVM gas.
+//! Fees ([`super::fees`]): an account's first outbound transfer to another
+//! account pays the 1 USDC activation fee on top of the amount (Circle's rule;
+//! the debt is set when the account first receives funds), and a Core to EVM
+//! transfer costs the HyperEVM gas.
 use super::account::{self, Account};
 use super::fees::{self, Paid, RowKind, TransferRow, ACTIVATION_FEE, QUOTE_TOKEN};
 use super::{stamp_funding_baseline, Applied, Sim, SimState, TokenRef};
@@ -199,9 +200,8 @@ fn check_funds(
         let free = spot_free(source, feed, QUOTE_TOKEN.index)?;
         if due > free {
             return Err(refuse(format!(
-                "sending {} to an account that does not exist yet also costs the {due} USDC \
-                 activation fee, and the spot wallet has {free} USDC free",
-                send.token.coin
+                "an account's first outbound transfer also costs the {due} USDC activation \
+                 fee, and the spot wallet has {free} USDC free"
             )));
         }
     }
@@ -255,6 +255,7 @@ fn apply_send(
     clock: u64,
 ) -> Result<()> {
     let due = state.activation_due(send.from, send.to);
+    let new_recipient = send.from != send.to && !state.exists(send.to);
     let source = state
         .accounts
         .get(&send.from)
@@ -274,7 +275,7 @@ fn apply_send(
     if let Some(to) = state.accounts.get_mut(&send.to) {
         stamp_funding_baseline(to, clock);
     }
-    state.settle_activation(send.from, send.to);
+    state.settle_activation((send.from, send.to), new_recipient);
     let paid = Paid {
         fee: due,
         fee_token: if due > Decimal::ZERO {

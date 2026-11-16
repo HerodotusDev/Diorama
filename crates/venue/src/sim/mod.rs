@@ -136,14 +136,17 @@ pub(crate) struct SimState {
     #[serde(default)]
     pub prev_marks: std::collections::BTreeMap<String, Decimal>,
     /// The addresses that exist on the venue (they received or held
-    /// something): a send to any other pays the activation fee once. Every
+    /// something). An address first funded by a transfer or deposit while it
+    /// is not in this set (and holds nothing) owes its activation. Every
     /// account a state file already carries is folded in on load
-    /// ([`SimState::migrate`]), so an older file never bills an existing
-    /// account.
+    /// ([`SimState::migrate`]).
     #[serde(default)]
     pub activated: std::collections::BTreeSet<Address>,
-    /// Accounts a deposit created: Circle's rule, the 1 USDC activation is
-    /// earmarked and charged on the account's first outbound transfer.
+    /// The accounts that owe the 1 USDC activation fee (Circle: earmarked when
+    /// the account is first funded by a deposit or an inbound transfer, charged
+    /// on its first outbound transfer, then cleared). Never set by `deal`,
+    /// seeds or `/control`, and empty in a state saved before the fee existed:
+    /// an existing address owes nothing.
     #[serde(default)]
     pub activation_owed: std::collections::BTreeSet<Address>,
     /// The transfer ledger per account (`userNonFundingLedgerUpdates` rows
@@ -166,7 +169,7 @@ impl SimState {
             account.migrate_legacy();
         }
         // Every address a saved state carries exists: only the accounts
-        // created from now on can be new destinations.
+        // created from now on can owe an activation.
         let known: Vec<Address> = self.accounts.keys().copied().collect();
         self.activated.extend(known);
     }

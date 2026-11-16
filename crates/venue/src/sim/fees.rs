@@ -1,19 +1,23 @@
 //! What a transfer costs on the venue, and the ledger rows that record it.
 //!
-//! Researched rules (the docs, and the real `userNonFundingLedgerUpdates` rows
-//! and `preTransferCheck` answers read on 2026-11-17):
+//! Researched rules (the docs, Circle's CCTP guide, and the real
+//! `userNonFundingLedgerUpdates` rows read on 2026-11-17):
 //!
-//! * **Activation fee.** "New HyperCore accounts require 1 quote token (e.g.,
-//!   1 USDC, 1 USDT) of fees for the first transaction which has the new
-//!   account as destination address. This applies regardless of the asset
-//!   being transfered to the new account." (docs, "Activation gas fee"). On
-//!   the real wire the sender pays it on top of the amount: the row carries
-//!   `fee: "1.0"`, `feeToken: "USDC"`, the recipient gets the full amount, and
-//!   `preTransferCheck` answers `userExists: false, fee: "1.0"` for such a
-//!   destination. Circle's CCTP guide adds that a deposit credited to a new
-//!   account is credited in full and the fee is "charged on the user's first
-//!   outbound action"; the sim models that as an *owed* activation
-//!   ([`SimState::activation_owed`]).
+//! * **Activation fee** (Circle, <https://developers.circle.com/cctp/cctp-on-hypercore>):
+//!   "New HyperCore accounts are subject to a one-time 1 USDC activation fee,
+//!   managed entirely by the Hyperliquid protocol." When an account is first
+//!   funded "the full deposit amount is credited to their tradable balance.
+//!   The 1 USDC activation fee is earmarked at the account level and charged
+//!   on the user's first outbound action", such as a withdrawal or a
+//!   `SendAsset` transfer; "the first outbound action requires a balance of at
+//!   least 1 USDC" or it fails, and later actions "are not subject to it". The
+//!   Hyperliquid page ("Activation gas fee") words it as a fee on "the first
+//!   transaction which has the new account as destination address"; the owner
+//!   tested the real venue and follows Circle, so the sim does: the debt is
+//!   set on the account when it first receives funds (a deposit or any
+//!   inbound transfer; [`SimState::activation_owed`]), the destination's own
+//!   newness never matters, and the first outbound transfer pays 1 USDC on top
+//!   of the amount (row: `fee: "1.0"`, `feeToken: "USDC"`).
 //! * **Core to EVM gas.** "A transfer from HyperCore to HyperEVM costs 200k
 //!   gas at the base gas price of the next HyperEVM block." The real rows show
 //!   it as `nativeTokenFee` (HYPE, `0.00002` = 200k gas at 0.1 gwei) when the
@@ -23,9 +27,9 @@
 //! * `withdraw3` costs 1 USDC (docs, "$1 fee"; real `withdraw` rows carry
 //!   `fee: "1.0"`); the devnet does not run that bridge, so it stays refused.
 //!
-//! Where the sources are silent the sim follows its owner's rule: both fees
-//! apply on outbound transfers, the activation fee once per destination
-//! account (the account then exists).
+//! Choices where the sources are silent: a move between one's own wallets is
+//! not an outbound transfer (it pays nothing and keeps the debt), and the
+//! funding helpers (`deal`, seeds, `/control`) do not create the debt.
 use super::account::Account;
 use super::{SimState, TokenRef};
 use crate::feed::MarketFeed;
@@ -105,24 +109,30 @@ impl SimState {
         self.activated.contains(&who) || self.accounts.get(&who).is_some_and(holds_anything)
     }
 
-    /// The activation fee a send from `from` to `to` pays now: one unit when
-    /// `to` is another account that does not exist yet, one more when `from`
-    /// is a deposited account that still owes its own. A send to oneself
-    /// pays none.
+    /// The activation fee a send from `from` to `to` pays now: 1 USDC when
+    /// `from` still owes its account's activation. Where the funds go does not
+    /// matter; a move to oneself is not an outbound transfer.
     pub(crate) fn activation_due(&self, from: Address, to: Address) -> Decimal {
-        if from == to {
-            return Decimal::ZERO;
+        if from != to && self.activation_owed.contains(&from) {
+            ACTIVATION_FEE
+        } else {
+            Decimal::ZERO
         }
-        let new_destination = !self.exists(to);
-        let owed = self.activation_owed.contains(&from);
-        ACTIVATION_FEE * Decimal::from(u8::from(new_destination) + u8::from(owed))
     }
 
-    /// Book a send's activation: the destination now exists and the sender's
-    /// owed fee, when it was part of `due`, is paid.
-    pub(crate) fn settle_activation(&mut self, from: Address, to: Address) {
+    /// Book a send's two sides: the sender's debt, when it was charged, is
+    /// paid; a recipient that did not exist before (`new_recipient`) now owes
+    /// its own; both addresses exist from now on.
+    pub(crate) fn settle_activation(
+        &mut self,
+        (from, to): (Address, Address),
+        new_recipient: bool,
+    ) {
         if from != to {
             self.activation_owed.remove(&from);
+            if new_recipient {
+                self.activation_owed.insert(to);
+            }
         }
         self.activated.insert(to);
         self.activated.insert(from);
@@ -239,10 +249,31 @@ pub(crate) fn rows_of(
     )
 }
 
+/// What `preTransferCheck` reads: the destination's standing and whether the
+/// source still owes its activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreTransfer {
+    pub destination_exists: bool,
+    pub source_owes: bool,
+    pub destination_has_sent: bool,
+}
+
 impl super::Sim {
-    /// Whether the address exists on the sim's venue (`preTransferCheck`).
-    pub(crate) fn address_exists(&self, who: Address) -> crate::error::Result<bool> {
-        self.with_state(|state| Ok(state.exists(who)))
+    /// `preTransferCheck`: what a transfer from `source` to `destination`
+    /// would meet now.
+    pub(crate) fn pre_transfer(
+        &self,
+        destination: Address,
+        source: Address,
+    ) -> crate::error::Result<PreTransfer> {
+        self.with_state(|state| {
+            let exists = state.exists(destination);
+            Ok(PreTransfer {
+                destination_exists: exists,
+                source_owes: state.activation_owed.contains(&source),
+                destination_has_sent: exists && !state.activation_owed.contains(&destination),
+            })
+        })
     }
 
     /// The account's transfer rows for `userNonFundingLedgerUpdates`, oldest

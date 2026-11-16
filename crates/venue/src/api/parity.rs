@@ -1108,8 +1108,9 @@ fn fast_asset_ctxs_is_one_map_over_every_dex() {
 /// real `userNonFundingLedgerUpdates` row (`send` and `spotTransfer` with their
 /// `fee`, `nativeTokenFee` and `feeToken`, `accountClassTransfer`), the window
 /// applies, an address the sim never held is the venue's own answer, and
-/// `preTransferCheck` answers the activation fee for a destination that does
-/// not exist yet with the real venue's fields.
+/// `preTransferCheck` has the real shape: `fee` is the activation the source
+/// still owes (Circle's first-outbound rule), `userExists` the destination's
+/// standing.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one script: four transfers, then every read of their rows
 async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
@@ -1122,30 +1123,33 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
         index: 0,
         coin: "USDC",
     };
+    // `user` funds `other` (a new account), which then sends on (its first
+    // outbound transfer pays the activation) and moves money between its own
+    // wallets.
     let (other, third) = (Address::repeat_byte(0xbb), Address::repeat_byte(0xcc));
     state
         .sim
         .credit_spot(user, usdc, Decimal::from(100))
         .unwrap();
-    state
-        .sim
-        .send_asset(
-            &AssetSend {
-                from: user,
-                to: other,
-                token: usdc,
-                amount: Decimal::from(10),
-                source: Wallet::Spot,
-                destination: Wallet::Spot,
-                kind: RowKind::Send,
-            },
-            &state.feed,
-        )
-        .unwrap();
+    let send = AssetSend {
+        from: user,
+        to: other,
+        token: usdc,
+        amount: Decimal::from(10),
+        source: Wallet::Spot,
+        destination: Wallet::Spot,
+        kind: RowKind::Send,
+    };
+    state.sim.send_asset(&send, &state.feed).unwrap();
+    let before = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": third, "source": other}),
+    )
+    .await;
     state
         .sim
         .spot_send(
-            (user, third),
+            (other, third),
             usdc,
             Decimal::from(5),
             (RowKind::SpotTransfer, &state.feed),
@@ -1154,7 +1158,7 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
     state
         .sim
         .usd_class_transfer(
-            user,
+            other,
             &ClassTransfer {
                 token: usdc,
                 amount: Decimal::ONE,
@@ -1175,7 +1179,7 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
 
     let rows = info_json(
         &state,
-        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": 0}),
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": other, "startTime": 0}),
     )
     .await;
     let rows = rows.as_array().unwrap();
@@ -1193,8 +1197,12 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
             .expect("a real sample of the kind");
         same_shape(sample, row, "userNonFundingLedgerUpdates");
     }
-    assert_eq!(rows[0]["delta"]["fee"], "1.0");
-    assert_eq!(rows[0]["delta"]["feeToken"], "USDC");
+    assert_eq!(rows[0]["delta"]["fee"], "0.0", "the receipt carries no fee");
+    assert_eq!(
+        rows[1]["delta"]["fee"], "1.0",
+        "the first outbound send does"
+    );
+    assert_eq!(rows[1]["delta"]["feeToken"], "USDC");
     // The deposit's row, on the recipient's side, is a system-address transfer.
     let deposit = info_json(
         &state,
@@ -1209,28 +1217,36 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
     let later = rows.last().unwrap()["time"].as_u64().unwrap() + 1;
     let none = info_json(
         &state,
-        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": later}),
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": other, "startTime": later}),
     )
     .await;
     assert_eq!(none, serde_json::json!([]));
 
-    // preTransferCheck: `user` is the destination.
-    let fresh = Address::repeat_byte(0xee);
-    let new = info_json(
+    // preTransferCheck: `user` is the destination, `source` the sender.
+    // `other` owed the activation before its send, `user` never does.
+    assert_eq!(
+        before,
+        serde_json::json!({"isSanctioned": false, "userExists": false, "fee": "1.0", "userHasSentTx": false})
+    );
+    same_shape(
+        &real["info"]["preTransferCheck"],
+        &before,
+        "preTransferCheck",
+    );
+    let after = info_json(
         &state,
-        serde_json::json!({"type": "preTransferCheck", "user": fresh, "source": user}),
+        serde_json::json!({"type": "preTransferCheck", "user": third, "source": other}),
+    )
+    .await;
+    assert_eq!(after["fee"], "0.0", "the debt was paid");
+    assert_eq!(after["userExists"], true);
+    let funded = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": Address::repeat_byte(0xee), "source": user}),
     )
     .await;
     assert_eq!(
-        new,
-        serde_json::json!({"isSanctioned": false, "userExists": false, "fee": "1.0", "userHasSentTx": false})
+        (&funded["userExists"], &funded["fee"]),
+        (&false.into(), &"0.0".into())
     );
-    same_shape(&real["info"]["preTransferCheck"], &new, "preTransferCheck");
-    let known = info_json(
-        &state,
-        serde_json::json!({"type": "preTransferCheck", "user": other, "source": user}),
-    )
-    .await;
-    assert_eq!(known["userExists"], true);
-    assert_eq!(known["fee"], "0.0");
 }

@@ -1424,66 +1424,63 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// CoreWriter's `spotSend` and `sendAsset` to an account that does not
-    /// exist pay the 1 USDC activation fee like the HTTP transfers do: the
-    /// recipient gets the full amount, the second send is free, and a send the
-    /// balance cannot cover with the fee is refused (counted) and moves nothing.
+    /// CoreWriter's `spotSend` and `sendAsset` follow the same activation rule
+    /// as the HTTP transfers (Circle): an account created by an inbound send is
+    /// credited in full and pays 1 USDC on top of its first outbound send; a
+    /// send its balance cannot cover with the fee is refused (counted) and
+    /// moves nothing; the second send is free.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one request script: splitting it would hide the order of the sends
-    async fn corewriter_sends_to_a_new_account_pay_the_activation_fee_once() {
+    async fn corewriter_sends_pay_the_activation_on_the_accounts_first_outbound_send() {
         let (bridge, sim, tokens) = fee_bridge();
         let me = Address::repeat_byte(0x0a);
         let new = Address::repeat_byte(0x0b);
-        sim.credit_spot(
-            me,
-            TokenRef {
-                index: 0,
-                coin: "USDC",
-            },
-            "10".parse().unwrap(),
-        )
-        .unwrap();
+        let usdc = TokenRef {
+            index: 0,
+            coin: "USDC",
+        };
+        sim.credit_spot(me, usdc, "20".parse().unwrap()).unwrap();
         let wei = |human: u64| human * 100_000_000;
-        let spot_send = |wei| CoreAction::SpotSend {
-            destination: new,
+        let spot_send = |destination, wei| CoreAction::SpotSend {
+            destination,
             token: 0,
             wei,
         };
-        // 10 to a new account needs 11: refused.
+        let both = |a, b| (usdc_of(&sim, a), usdc_of(&sim, b));
+        let dec = |t: &str| t.parse::<Decimal>().unwrap();
+        // The funded sender pays nothing to reach a new account; the account
+        // is credited in full.
         bridge
-            .apply_action(me, spot_send(wei(10)), &tokens)
+            .apply_action(me, spot_send(new, wei(10)), &tokens)
             .await
             .unwrap();
-        assert_eq!(
-            (usdc_of(&sim, me), usdc_of(&sim, new)),
-            ("10".parse().unwrap(), Decimal::ZERO)
-        );
+        assert_eq!(both(me, new), (dec("10"), dec("10")));
+        // The new account's first outbound send: 10 of its 10 is refused.
+        bridge
+            .apply_action(new, spot_send(me, wei(10)), &tokens)
+            .await
+            .unwrap();
+        assert_eq!(both(me, new), (dec("10"), dec("10")));
         assert!(bridge
             .metrics
             .render()
             .contains("venue_bridge_refusals_total 1"));
-        // 4 goes with its fee; the next 4 is free.
+        // 4 goes with the 1 USDC fee; the next 4 (a sendAsset) is free.
         bridge
-            .apply_action(me, spot_send(wei(4)), &tokens)
+            .apply_action(new, spot_send(me, wei(4)), &tokens)
             .await
             .unwrap();
-        assert_eq!(
-            (usdc_of(&sim, me), usdc_of(&sim, new)),
-            ("5".parse().unwrap(), "4".parse().unwrap())
-        );
+        assert_eq!(both(me, new), (dec("14"), dec("5")));
         let send_asset = CoreAction::SendAsset {
-            destination: new,
+            destination: me,
             sub_account: Address::ZERO,
             source_dex: corewriter::SPOT_DEX,
             destination_dex: corewriter::SPOT_DEX,
             token: 0,
             wei: wei(4),
         };
-        bridge.apply_action(me, send_asset, &tokens).await.unwrap();
-        assert_eq!(
-            (usdc_of(&sim, me), usdc_of(&sim, new)),
-            ("1".parse().unwrap(), "8".parse().unwrap())
-        );
+        bridge.apply_action(new, send_asset, &tokens).await.unwrap();
+        assert_eq!(both(me, new), (dec("18"), dec("1")));
     }
 
     /// A `spotSend` and a `sendAsset` to a system address are the Core to EVM
