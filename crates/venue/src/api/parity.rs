@@ -1,6 +1,11 @@
 //! Parity with the real venue: every info response and websocket frame the
 //! frontend consumes is compared, shape for shape, against a sample captured
-//! live from the real API (`fixtures/real.json`, arrays trimmed to two items).
+//! live from the real API (`fixtures/real.json`, arrays trimmed to two items,
+//! every address replaced by one placeholder). The world has three dexes: the
+//! default one, a USDC builder dex (`xyz`) and a USDH builder dex (`flx`), so
+//! the per-dex answers are compared too, and the venue's answers for an
+//! unlisted dex, for `ALL_DEXS` and for the other bad requests are replayed
+//! from the capture (`errors`, `wsSilence`).
 //!
 //! The comparison is structural: the same keys, the same JSON types, at every
 //! depth. `null` matches anything (the venue nulls fields the sim fills and the
@@ -12,7 +17,7 @@ use super::{info, ws_codec, ApiState};
 use crate::feed::MarketFeed;
 use crate::sim::order::{Order, Tif};
 use crate::sim::{Deal, DealClass};
-use crate::wire::{test_ctx, L2Book, Level};
+use crate::wire::{L2Book, Level};
 use alloy_primitives::Address;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -115,18 +120,67 @@ fn book(coin: &str) -> L2Book {
     }
 }
 
+/// A builder dex's meta in the real shape: rows carry the builder-only fields
+/// and a margin table, the dex its own collateral token.
+fn builder_meta(coin: &str, table: u32, collateral_token: u32) -> crate::wire::Meta {
+    let mut meta = crate::sim::meta_of(&[(coin, 10)]);
+    for asset in &mut meta.universe {
+        asset.margin_table_id = Some(table);
+        asset.growth_mode = Some("enabled".into());
+        asset.last_fee_scale_change_time = Some("2025-11-24T21:19:25.980742012".into());
+        asset.deployer_fee_scale = Some("1.0".into());
+    }
+    meta.margin_tables = vec![(
+        table,
+        crate::wire::MarginTable {
+            description: String::new(),
+            margin_tiers: vec![crate::wire::MarginTier {
+                lower_bound: Decimal::ZERO,
+                max_leverage: 10,
+            }],
+        },
+    )];
+    meta.collateral_token = collateral_token;
+    meta
+}
+
 /// A venue with one funded account that holds a position, a resting order, a
-/// fill and a funding payment.
-#[allow(clippy::too_many_lines)] // one fixture world: funding, position, resting order, fill, funding hour
+/// fill and a funding payment on the default dex and on the `xyz` builder dex
+/// (a USDC dex); `flx` is a USDH dex the account never touched. The registry
+/// order is default, xyz, flx (not alphabetical).
 fn world() -> (Arc<ApiState>, Address) {
+    world_on("http://127.0.0.1:1")
+}
+
+/// [`world`] with the venue's public API at `venue` (the pass-through target).
+#[allow(clippy::too_many_lines)] // one fixture world: dexes, funding, positions, resting orders, fills, funding hour
+fn world_on(venue: &str) -> (Arc<ApiState>, Address) {
     let feed = Arc::new(MarketFeed::memory(vec!["ETH".to_string()]));
     let now = crate::now_ms();
     feed.put_meta(crate::sim::meta_with_table("ETH", 10), now);
+    feed.put_dex_meta("xyz", builder_meta("xyz:TSLA", 30, 0), now);
+    feed.put_dex_meta("flx", builder_meta("flx:TSLA", 10, 360), now);
     feed.put_oi_caps(Vec::new());
-    feed.put_ctx("ETH".into(), crate::wire::funding_ctx("101", "101"), now);
+    feed.put_oi_caps_of("xyz", Vec::new());
+    feed.put_oi_caps_of("flx", Vec::new());
+    for coin in ["ETH", "xyz:TSLA", "flx:TSLA"] {
+        feed.put_ctx(coin.into(), crate::wire::funding_ctx("101", "101"), now);
+    }
     feed.put_book(book("ETH"), now);
-    let _ = test_ctx;
-    let api = crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+    feed.put_book(book("xyz:TSLA"), now);
+    feed.put_all_dexs_mids(
+        [
+            ("ETH", "101"),
+            ("@107", "5"),
+            ("xyz:TSLA", "101"),
+            ("flx:TSLA", "101"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.parse().unwrap()))
+        .collect(),
+        now,
+    );
+    let api = crate::feed::rest::RestClient::new(&[venue.to_string()]).unwrap();
     let state = Arc::new(
         ApiState::new(
             feed.clone(),
@@ -140,21 +194,23 @@ fn world() -> (Arc<ApiState>, Address) {
         .unwrap(),
     );
     let user = Address::repeat_byte(0xaa);
-    state
-        .sim
-        .deal(
-            &feed,
-            &Deal {
-                address: user,
-                class: DealClass::Perp,
-                coin: None,
-                dex: None,
-                amount: Decimal::from(10_000),
-            },
-        )
-        .unwrap();
-    let order = |is_buy: bool, size: &str, px: Option<&str>, tif: Tif| Order {
-        coin: "ETH".into(),
+    for dex in [None, Some("xyz".to_string())] {
+        state
+            .sim
+            .deal(
+                &feed,
+                &Deal {
+                    address: user,
+                    class: DealClass::Perp,
+                    coin: None,
+                    dex,
+                    amount: Decimal::from(10_000),
+                },
+            )
+            .unwrap();
+    }
+    let order = |coin: &str, is_buy: bool, size: &str, px: Option<&str>, tif: Tif| Order {
+        coin: coin.into(),
         is_buy,
         size: size.parse().unwrap(),
         limit_px: px.map(|p| p.parse().unwrap()),
@@ -163,17 +219,34 @@ fn world() -> (Arc<ApiState>, Address) {
         cloid: Some(alloy_primitives::B128::repeat_byte(0x11)),
         trigger: None,
     };
-    state
-        .sim
-        .order(&feed, user, &order(true, "1", None, Tif::Ioc))
-        .unwrap();
-    state
-        .sim
-        .place(&feed, user, &order(true, "1", Some("90"), Tif::Gtc))
-        .unwrap();
-    // An hour passes: one funding payment.
+    for coin in ["ETH", "xyz:TSLA"] {
+        state
+            .sim
+            .order(&feed, user, &order(coin, true, "1", None, Tif::Ioc))
+            .unwrap();
+        state
+            .sim
+            .place(&feed, user, &order(coin, true, "1", Some("90"), Tif::Gtc))
+            .unwrap();
+    }
+    // An hour passes: one funding payment per position.
     state.sim.advance(&feed, 3600, 1).unwrap();
+    // The default dex ends at its open interest cap (the trades above are done).
+    feed.put_oi_caps(vec!["ETH".to_string()]);
     (state, user)
+}
+
+/// The answer's status and body text (for the venue's `null` and plain-text
+/// answers, which are not all JSON objects).
+async fn info_raw(state: &Arc<ApiState>, body: Value) -> (u16, String) {
+    let response = info::info(State(state.clone()), Bytes::from(body.to_string()))
+        .await
+        .expect("info");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
 async fn info_json(state: &Arc<ApiState>, body: Value) -> Value {
@@ -195,12 +268,28 @@ async fn info_responses_have_the_venues_shapes() {
         ("allPerpMetas", serde_json::json!({"type": "allPerpMetas"})),
         ("meta", serde_json::json!({"type": "meta"})),
         (
+            "meta:xyz",
+            serde_json::json!({"type": "meta", "dex": "xyz"}),
+        ),
+        (
             "metaAndAssetCtxs",
             serde_json::json!({"type": "metaAndAssetCtxs"}),
         ),
         (
+            "metaAndAssetCtxs:xyz",
+            serde_json::json!({"type": "metaAndAssetCtxs", "dex": "xyz"}),
+        ),
+        (
             "clearinghouseState",
             serde_json::json!({"type": "clearinghouseState", "user": user}),
+        ),
+        (
+            "clearinghouseState:xyz",
+            serde_json::json!({"type": "clearinghouseState", "user": user, "dex": "xyz"}),
+        ),
+        (
+            "clearinghouseState:flx",
+            serde_json::json!({"type": "clearinghouseState", "user": user, "dex": "flx"}),
         ),
         (
             "spotClearinghouseState",
@@ -211,16 +300,40 @@ async fn info_responses_have_the_venues_shapes() {
             serde_json::json!({"type": "openOrders", "user": user}),
         ),
         (
+            "openOrders:xyz",
+            serde_json::json!({"type": "openOrders", "user": user, "dex": "xyz"}),
+        ),
+        (
             "frontendOpenOrders",
             serde_json::json!({"type": "frontendOpenOrders", "user": user}),
+        ),
+        (
+            "frontendOpenOrders:ALL_DEXS",
+            serde_json::json!({"type": "frontendOpenOrders", "user": user, "dex": "ALL_DEXS"}),
         ),
         (
             "activeAssetData",
             serde_json::json!({"type": "activeAssetData", "user": user, "coin": "ETH"}),
         ),
         (
+            "activeAssetData:xyz:TSLA",
+            serde_json::json!({"type": "activeAssetData", "user": user, "coin": "xyz:TSLA"}),
+        ),
+        (
             "l2Book",
             serde_json::json!({"type": "l2Book", "coin": "ETH"}),
+        ),
+        (
+            "l2Book:xyz:TSLA",
+            serde_json::json!({"type": "l2Book", "coin": "xyz:TSLA"}),
+        ),
+        (
+            "perpsAtOpenInterestCap:xyz",
+            serde_json::json!({"type": "perpsAtOpenInterestCap", "dex": "xyz"}),
+        ),
+        (
+            "marginTable:30",
+            serde_json::json!({"type": "marginTable", "id": 30}),
         ),
         (
             "userFills",
@@ -242,35 +355,255 @@ async fn info_responses_have_the_venues_shapes() {
             "exchangeStatus",
             serde_json::json!({"type": "exchangeStatus"}),
         ),
-        (
-            "perpConciseAnnotations",
-            serde_json::json!({"type": "perpConciseAnnotations"}),
-        ),
-        (
-            "perpCategories",
-            serde_json::json!({"type": "perpCategories"}),
-        ),
     ];
     for (name, body) in cases {
         let sim = info_json(&state, body).await;
         let real = &real["info"][name];
-        // `allPerpMetas` is one entry per dex: the sim serves the first dex.
-        let (real, sim) = if name == "allPerpMetas" {
-            (&real[0], &sim[0])
-        } else {
-            (real, &sim)
-        };
         assert!(!sim.is_null(), "{name}: the sim answered null");
-        same_shape(real, sim, name);
+        same_shape(real, &sim, name);
     }
 
-    // Maps keyed by coin: the values' shape only.
-    let mids = info_json(&state, serde_json::json!({"type": "allMids"})).await;
-    assert!(mids.as_object().unwrap().values().all(Value::is_string));
+    // `allPerpMetas`: one entry per dex, each of the venue's shape.
+    let metas = info_json(&state, serde_json::json!({"type": "allPerpMetas"})).await;
+    let real_metas = &real["info"]["allPerpMetas"];
+    assert_eq!(metas.as_array().unwrap().len(), 3);
+    same_shape(&real_metas[0], &metas[0], "allPerpMetas[default]");
+    same_shape(&real_metas[1], &metas[1], "allPerpMetas[builder]");
+    assert_eq!(metas[2]["collateralToken"], 360, "flx is a USDH dex");
+    // `meta {dex}` is that dex's entry of `allPerpMetas`.
+    for (i, dex) in [(0, ""), (1, "xyz"), (2, "flx")] {
+        let one = info_json(&state, serde_json::json!({"type": "meta", "dex": dex})).await;
+        assert_eq!(one, metas[i], "meta for `{dex}`");
+    }
 
-    // The first dex only: `perpDexs` lists it as null.
+    // `perpDexs`: `null` for the default dex, a record per builder dex in the
+    // registry's order.
     let dexs = info_json(&state, serde_json::json!({"type": "perpDexs"})).await;
-    assert_eq!(dexs, serde_json::json!([null]));
+    let dexs = dexs.as_array().unwrap();
+    assert_eq!(dexs.len(), 3);
+    assert!(dexs[0].is_null());
+    assert_eq!(
+        [&dexs[1]["name"], &dexs[2]["name"]],
+        [&Value::from("xyz"), &Value::from("flx")]
+    );
+    same_shape(&real["info"]["perpDexs"][1], &dexs[1], "perpDexs[1]");
+
+    // `allMids`: coin-keyed maps compare their values and key families. The
+    // default dex carries the default perps and the spot keys, a builder dex
+    // only its own coins, `ALL_DEXS` all of them.
+    let keys =
+        |mids: &Value| -> Vec<String> { mids.as_object().unwrap().keys().cloned().collect() };
+    let default = info_json(&state, serde_json::json!({"type": "allMids"})).await;
+    assert_eq!(keys(&default), ["@107", "ETH"]);
+    assert!(default.as_object().unwrap().values().all(Value::is_string));
+    let explicit = info_json(&state, serde_json::json!({"type": "allMids", "dex": ""})).await;
+    assert_eq!(explicit, default, "an empty dex is the default dex");
+    let xyz = info_json(&state, serde_json::json!({"type": "allMids", "dex": "xyz"})).await;
+    assert_eq!(keys(&xyz), ["xyz:TSLA"]);
+    assert!(real["info"]["allMids:xyz"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(Value::is_string));
+    let all = info_json(
+        &state,
+        serde_json::json!({"type": "allMids", "dex": "ALL_DEXS"}),
+    )
+    .await;
+    assert_eq!(keys(&all), ["@107", "ETH", "flx:TSLA", "xyz:TSLA"]);
+    assert!(real["info"]["allMids:ALL_DEXS"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(Value::is_string));
+}
+
+/// The sim's own per-dex figures: a builder dex's clearinghouse holds its
+/// position and none of the others', an untouched dex is empty, the resting
+/// orders split by dex (`ALL_DEXS` lists them all, newest first), and a table
+/// id resolves across the dexes' tables.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one fixture world read per dex
+async fn the_per_dex_reads_hold_only_that_dexs_figures() {
+    let (state, user) = world();
+    let positions = |state: &Arc<ApiState>, dex: &'static str| {
+        let state = state.clone();
+        async move {
+            let ch = info_json(
+                &state,
+                serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}),
+            )
+            .await;
+            ch["assetPositions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["position"]["coin"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(positions(&state, "").await, ["ETH"]);
+    assert_eq!(positions(&state, "xyz").await, ["xyz:TSLA"]);
+    assert!(positions(&state, "flx").await.is_empty());
+
+    let coins = |rows: &Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["coin"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for kind in ["openOrders", "frontendOpenOrders"] {
+        let rows = |dex: &str| {
+            let body = serde_json::json!({"type": kind, "user": user, "dex": dex});
+            let state = state.clone();
+            async move { info_json(&state, body).await }
+        };
+        assert_eq!(coins(&rows("").await), ["ETH"], "{kind}");
+        assert_eq!(coins(&rows("xyz").await), ["xyz:TSLA"], "{kind}");
+        assert!(coins(&rows("flx").await).is_empty(), "{kind}");
+        assert_eq!(
+            coins(&rows("ALL_DEXS").await),
+            ["xyz:TSLA", "ETH"],
+            "{kind}"
+        );
+        let absent = info_json(&state, serde_json::json!({"type": kind, "user": user})).await;
+        assert_eq!(coins(&absent), ["ETH"], "{kind}: no dex is the default dex");
+    }
+
+    // Table ids are the dexes' own: 30 is xyz's, 10 is flx's, 50 the default's.
+    for (id, leverage) in [(30u64, 10u64), (10, 10), (50, 10), (1, 1)] {
+        let table = info_json(&state, serde_json::json!({"type": "marginTable", "id": id})).await;
+        assert_eq!(
+            table["marginTiers"][0]["maxLeverage"], leverage,
+            "table {id}"
+        );
+    }
+    // The builder coin's active data uses the coin's own dex ledger and mark.
+    let data = info_json(
+        &state,
+        serde_json::json!({"type": "activeAssetData", "user": user, "coin": "xyz:TSLA"}),
+    )
+    .await;
+    assert_eq!(data["coin"], "xyz:TSLA");
+    assert_eq!(data["markPx"], "101");
+}
+
+/// What the venue answers for an unlisted dex, for `ALL_DEXS` where the type
+/// does not take it, for a `null` dex and for an unknown table or coin:
+/// replayed from the capture, status and body.
+#[tokio::test]
+async fn unlisted_dexes_and_bad_requests_answer_like_the_venue() {
+    let (state, user) = world();
+    let real = real();
+    let errors = real["errors"].as_object().unwrap();
+    assert!(errors.len() >= 15, "the capture lost its error cases");
+    for (name, case) in errors {
+        let request: Value = serde_json::from_str(
+            &case["request"]
+                .to_string()
+                .replace("$USER", &user.to_string()),
+        )
+        .unwrap();
+        let (status, body) = info_raw(&state, request).await;
+        assert_eq!(
+            i64::from(status),
+            case["status"].as_i64().unwrap(),
+            "{name}"
+        );
+        assert_eq!(body, case["body"].as_str().unwrap(), "{name}");
+    }
+}
+
+/// A venue standing in for the real API: answers `/info` with the capture's
+/// sample for the type when it has one, else echoes what it was sent.
+async fn mock_venue() -> String {
+    let real = real();
+    let app = axum::Router::new().route(
+        "/info",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let real = real.clone();
+            async move {
+                let kind = body["type"].as_str().unwrap_or_default().to_string();
+                match real["info"].get(&kind) {
+                    Some(sample) => axum::Json(sample.clone()),
+                    None => axum::Json(serde_json::json!({"forwarded": body})),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The market-wide types the sim does not model are the real venue's answer,
+/// forwarded verbatim; a body missing a field the venue requires is the
+/// venue's 422, and the account-specific types stay unrouted (the venue's 422
+/// for a type it cannot parse here).
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one table of forwarded types
+async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
+    let venue = mock_venue().await;
+    let (state, user) = world_on(&venue);
+    let real = real();
+    let vault = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+    let forwarded: Vec<Value> = vec![
+        serde_json::json!({"type": "spotMetaAndAssetCtxs"}),
+        serde_json::json!({"type": "fundingHistory", "coin": "xyz:TSLA", "startTime": 1}),
+        serde_json::json!({"type": "predictedFundings"}),
+        serde_json::json!({"type": "perpDexLimits", "dex": "xyz"}),
+        serde_json::json!({"type": "perpDexStatus", "dex": "xyz"}),
+        serde_json::json!({"type": "maxMarketOrderNtls"}),
+        serde_json::json!({"type": "vaultSummaries"}),
+        serde_json::json!({"type": "tokenDetails", "tokenId": "0x6d1e7cde53ba9467b783cb7c530ce054"}),
+        serde_json::json!({"type": "perpDeployAuctionStatus"}),
+        serde_json::json!({"type": "spotPairDeployAuctionStatus"}),
+        serde_json::json!({"type": "spotDeployState", "user": user}),
+        serde_json::json!({"type": "outcomeMeta"}),
+        serde_json::json!({"type": "allBorrowLendReserveStates"}),
+        serde_json::json!({"type": "borrowLendReserveState", "token": 0}),
+        serde_json::json!({"type": "leadingVaults", "user": user}),
+        serde_json::json!({"type": "vaultDetails", "vaultAddress": vault}),
+        serde_json::json!({"type": "vaultDetails", "vaultAddress": vault, "user": user}),
+    ];
+    for request in forwarded {
+        let (status, body) = info_raw(&state, request.clone()).await;
+        assert_eq!(status, 200, "{request}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["forwarded"], request, "forwarded verbatim");
+    }
+    // The annotations and categories are the venue's lists, never a string.
+    for kind in ["perpConciseAnnotations", "perpCategories"] {
+        let (status, body) = info_raw(&state, serde_json::json!({"type": kind})).await;
+        assert_eq!(status, 200);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body, real["info"][kind], "{kind}");
+        assert!(body.is_array(), "{kind}");
+    }
+    // A missing required field never reaches the venue.
+    for request in [
+        serde_json::json!({"type": "perpDexLimits"}),
+        serde_json::json!({"type": "fundingHistory", "coin": "BTC"}),
+        serde_json::json!({"type": "tokenDetails"}),
+        serde_json::json!({"type": "vaultDetails"}),
+        serde_json::json!({"type": "borrowLendReserveState"}),
+        // Account-specific types the sim does not model stay unrouted.
+        serde_json::json!({"type": "userRateLimit", "user": user}),
+        serde_json::json!({"type": "portfolio", "user": user}),
+        serde_json::json!({"type": "userFees", "user": user}),
+        serde_json::json!({"type": "historicalOrders", "user": user}),
+    ] {
+        let (status, body) = info_raw(&state, request.clone()).await;
+        assert_eq!(status, 422, "{request}");
+        assert_eq!(
+            body,
+            "Failed to deserialize the JSON body into the target type"
+        );
+    }
 }
 
 /// The venue's order of the two ledgers: fills newest first, funding oldest
@@ -373,6 +706,38 @@ fn websocket_acks_and_frames_have_the_venues_shapes() {
             serde_json::json!({"type": "openOrders", "user": user, "dex": ""}),
         ),
         (
+            "clearinghouseState:xyz",
+            serde_json::json!({"type": "clearinghouseState", "user": user, "dex": "xyz"}),
+        ),
+        (
+            "openOrders:xyz",
+            serde_json::json!({"type": "openOrders", "user": user, "dex": "xyz"}),
+        ),
+        (
+            "openOrders:ALL_DEXS",
+            serde_json::json!({"type": "openOrders", "user": user, "dex": "ALL_DEXS"}),
+        ),
+        (
+            "allMids:ALL_DEXS",
+            serde_json::json!({"type": "allMids", "dex": "ALL_DEXS"}),
+        ),
+        (
+            "webData3",
+            serde_json::json!({"type": "webData3", "user": user}),
+        ),
+        (
+            "activeAssetCtx:xyz:TSLA",
+            serde_json::json!({"type": "activeAssetCtx", "coin": "xyz:TSLA"}),
+        ),
+        (
+            "l2Book:xyz:TSLA",
+            serde_json::json!({"type": "l2Book", "coin": "xyz:TSLA"}),
+        ),
+        (
+            "activeAssetData:xyz:TSLA",
+            serde_json::json!({"type": "activeAssetData", "user": user, "coin": "xyz:TSLA"}),
+        ),
+        (
             "spotState",
             serde_json::json!({"type": "spotState", "user": user}),
         ),
@@ -408,6 +773,15 @@ fn websocket_acks_and_frames_have_the_venues_shapes() {
                 .first()
                 .unwrap_or_else(|| panic!("{name}: no first frame")),
         );
+        if name == "allMids:ALL_DEXS" {
+            // A map keyed by coin: every value is a price string.
+            assert!(first["data"]["mids"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(Value::is_string));
+            continue;
+        }
         if name == "fastAssetCtxs" {
             // A map keyed by coin: the entries' shape, not the coin names.
             let entry = |frame: &Value| {
@@ -539,4 +913,193 @@ fn the_funding_stream_serves_flat_rows() {
         "flat, not the info route's wrapper"
     );
     assert!(pushes(&mut live, &state, crate::now_ms()).is_empty());
+}
+
+/// The venue's quirks and errors on the subscriptions the dexes added,
+/// replayed from the capture: how many frames come back at all (a named
+/// dex's `allMids` is acked and then silent, an unlisted dex on
+/// `clearinghouseState`/`openOrders` gets nothing), and the error text of a
+/// subscription it cannot parse.
+#[test]
+#[allow(clippy::too_many_lines)] // one table of captured quirks and errors
+fn the_venues_ws_silences_and_errors_are_mirrored() {
+    let (state, user) = world();
+    let real = real();
+    let sim_user = user.to_string();
+    let request = |subscription: Value| {
+        let mut subs: Vec<Live> = Vec::new();
+        let reply = request_reply(
+            &serde_json::json!({"method": "subscribe", "subscription": subscription}).to_string(),
+            &mut subs,
+            &state,
+        );
+        let ack = serde_json::to_value(&reply)
+            .ok()
+            .filter(|_| !matches!(reply, super::ws::WsPush::Silent));
+        let frames = subs
+            .last_mut()
+            .map(|live| pushes(live, &state, crate::now_ms()).len())
+            .unwrap_or(0);
+        (ack, frames)
+    };
+    let cases: [(&str, Value); 6] = [
+        (
+            "allMids:xyz",
+            serde_json::json!({"type": "allMids", "dex": "xyz"}),
+        ),
+        (
+            "allMids:empty",
+            serde_json::json!({"type": "allMids", "dex": ""}),
+        ),
+        (
+            "allMids:nope",
+            serde_json::json!({"type": "allMids", "dex": "nope"}),
+        ),
+        (
+            "clearinghouseState:nope",
+            serde_json::json!({"type": "clearinghouseState", "user": sim_user, "dex": "nope"}),
+        ),
+        (
+            "clearinghouseState:ALL_DEXS",
+            serde_json::json!({"type": "clearinghouseState", "user": sim_user, "dex": "ALL_DEXS"}),
+        ),
+        (
+            "openOrders:nope",
+            serde_json::json!({"type": "openOrders", "user": sim_user, "dex": "nope"}),
+        ),
+    ];
+    for (name, subscription) in cases {
+        let venue = &real["wsSilence"][name];
+        let (ack, frames) = request(subscription);
+        // The venue's count includes the ack.
+        let sim_total = usize::from(ack.is_some()) + frames;
+        assert_eq!(
+            sim_total as u64,
+            venue["frames"].as_u64().unwrap(),
+            "{name}"
+        );
+        match (&ack, &venue["ack"]) {
+            (Some(ack), expected) if !expected.is_null() => assert_eq!(ack, expected, "{name}"),
+            (None, expected) => assert!(expected.is_null(), "{name}"),
+            (Some(_), _) => panic!("{name}: the venue sends no ack"),
+        }
+    }
+
+    // The captured error texts, with the capture's placeholder user.
+    let placeholder = "0x1111111111111111111111111111111111111111";
+    let mut subs: Vec<Live> = Vec::new();
+    for (name, subscription) in [
+        (
+            "webData2",
+            serde_json::json!({"type": "webData2", "user": user}),
+        ),
+        (
+            "activeAssetCtx:xyz:NOPE",
+            serde_json::json!({"type": "activeAssetCtx", "coin": "xyz:NOPE"}),
+        ),
+    ] {
+        let reply = request_reply(
+            &serde_json::json!({"method": "subscribe", "subscription": subscription}).to_string(),
+            &mut subs,
+            &state,
+        );
+        let reply = serde_json::to_value(&reply).unwrap();
+        let expected = &real["wsErrors"][name];
+        assert_eq!(reply["channel"], expected["channel"], "{name}");
+        assert_eq!(
+            reply["data"]
+                .as_str()
+                .unwrap()
+                .replace(&sim_user.to_lowercase(), placeholder),
+            expected["data"].as_str().unwrap(),
+            "{name}"
+        );
+    }
+}
+
+/// The venue lists the dexes in one order on `allDexsClearinghouseState` and
+/// `pac`: the default dex first, then alphabetically (not in `perpDexs`
+/// order). The capture is the evidence, the sim follows the same rule over
+/// its own registry (default, xyz, flx here: flx sorts before xyz).
+#[test]
+#[allow(clippy::too_many_lines)] // one scenario over the dex order
+fn per_dex_pushes_list_the_dexes_in_the_venues_order() {
+    let real = real();
+    let venue: Vec<&str> = real["dexOrder"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(venue[0], "");
+    assert!(
+        venue[1..].windows(2).all(|w| w[0] < w[1]),
+        "the capture is alphabetical after the default dex: {venue:?}"
+    );
+
+    let (state, user) = world();
+    let registry: Vec<String> = state
+        .feed
+        .dex_collateral_tokens()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        registry,
+        ["", "xyz", "flx"],
+        "the registry is in perpDexs order"
+    );
+
+    let (_, frames, _) = subscribe(
+        &state,
+        &serde_json::json!({"type": "allDexsClearinghouseState", "user": user}),
+    );
+    let states = frames[0]["data"]["clearinghouseStates"].as_array().unwrap();
+    let all_dexs: Vec<&str> = states.iter().map(|s| s[0].as_str().unwrap()).collect();
+    assert_eq!(all_dexs, ["", "flx", "xyz"]);
+
+    let (_, frames, mut live) = subscribe(&state, &serde_json::json!({"type": "pac"}));
+    let pac = decode(&frames[0]);
+    let dexs: Vec<&str> = pac["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d[0].as_str().unwrap())
+        .collect();
+    assert_eq!(dexs, all_dexs, "pac and allDexsClearinghouseState agree");
+    // One slot per universe coin, the same dexes in every frame.
+    for dex in pac["data"].as_array().unwrap() {
+        assert_eq!(dex[1].as_array().unwrap().len(), 1, "{dex}");
+    }
+    state.feed.put_ctx(
+        "xyz:TSLA".into(),
+        crate::wire::funding_ctx("102", "102"),
+        crate::now_ms(),
+    );
+    let frames = pushes(&mut live, &state, crate::now_ms());
+    let next = decode(&serde_json::from_str(&frames[0]).unwrap());
+    let later: Vec<&str> = next["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d[0].as_str().unwrap())
+        .collect();
+    assert_eq!(later, all_dexs, "every dex is listed in every frame");
+}
+
+/// The flat `fastAssetCtxs` map covers the default dex's coins and the builder
+/// dexes' prefixed ones.
+#[test]
+fn fast_asset_ctxs_is_one_map_over_every_dex() {
+    let (state, _) = world();
+    let (_, frames, _) = subscribe(&state, &serde_json::json!({"type": "fastAssetCtxs"}));
+    let fast = decode(&frames[0]);
+    let mut keys: Vec<&str> = fast["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["ETH", "flx:TSLA", "xyz:TSLA"]);
 }
