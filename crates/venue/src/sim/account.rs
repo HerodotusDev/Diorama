@@ -1271,14 +1271,16 @@ fn isolated_liquidation_px(
     facts: &PositionFacts,
     meta: Option<&crate::wire::Meta>,
 ) -> Result<Option<Decimal>> {
-    let margin = if p.isolated_margin.is_zero() {
-        p.margin_used
-    } else {
-        p.isolated_margin
-    };
+    // The leg's equity is the waterfall's (`Sim::check_isolated_legs`): the
+    // position's own margin plus its unrealized pnl at the mark.
+    let equity = add(
+        p.isolated_margin,
+        p.unrealized_pnl(facts.mark)?,
+        "isolated equity",
+    )?;
     solve_liquidation_px(&LiquidationLeg {
         tiers: &maintenance_tiers(coin, meta)?,
-        equity: margin,
+        equity,
         other_maintenance: Decimal::ZERO,
         direction: p.direction(),
         size: p.szi.abs(),
