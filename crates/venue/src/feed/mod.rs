@@ -18,13 +18,15 @@
 //! the same owned numbers the account plane computes with — the consumer must never
 //! read a different mark than the sim used for margin.
 pub(crate) mod budget;
+pub(crate) mod dex;
 pub(crate) mod metrics;
 pub(crate) mod rest;
 pub(crate) mod ws;
 
 use crate::error::Result;
-use crate::wire::{AllMids, AssetCtx, L2Book, Meta};
+use crate::wire::{AllMids, AssetCtx, L2Book, Meta, PerpDex};
 use budget::Budget;
+use dex::{dex_of_coin, DexRegistry, PerpDexInfo};
 use diorama_devnet::store;
 use metrics::FeedMetrics;
 use rust_decimal::Decimal;
@@ -97,21 +99,33 @@ pub(crate) enum BookAge {
 
 /// The live cache (never persisted: it is a cache, and a stale file would
 /// masquerade as fresh data).
+///
+/// Per-dex state is keyed by the dex name (`""` = the default dex); ctxs,
+/// books and overrides are keyed by the coin name, which is already unique
+/// across dexes (`xyz:TSLA`).
 #[derive(Default)]
 struct Cache {
-    meta: Option<Meta>,
+    /// The dexes in `perpDexs` order, each with its universe.
+    registry: DexRegistry,
+    /// Whether `perpDexs` has landed (the registry is the venue's, not just
+    /// the default dex a fixture or the first `metaAndAssetCtxs` put there).
+    registry_loaded: bool,
+    /// The default dex meta's last update.
     meta_at: Option<u64>,
     spot_meta: Option<crate::wire::SpotMeta>,
     ctxs: BTreeMap<String, AssetCtx>,
     ctx_at: BTreeMap<String, u64>,
     books: BTreeMap<String, L2Book>,
     book_at: BTreeMap<String, u64>,
-    mids: BTreeMap<String, Decimal>,
-    mids_at: Option<u64>,
-    /// `perpsAtOpenInterestCap`'s last answer (the venue's cap list).
-    /// `None` = the market plane has not answered yet: the order lane refuses
-    /// rather than treating an unknown cap set as "no caps".
-    pub(crate) oi_caps: Option<Vec<String>>,
+    /// `allMids` per dex (the default dex's also carries the spot `@N` and
+    /// outcome `#N` keys, exactly as the venue's default `allMids` does).
+    mids: BTreeMap<String, BTreeMap<String, Decimal>>,
+    mids_at: BTreeMap<String, u64>,
+    /// `perpsAtOpenInterestCap`'s last answer per dex (the venue's cap list).
+    /// An absent dex = the market plane has not answered for it yet: the
+    /// order lane refuses rather than treating an unknown cap set as "no
+    /// caps".
+    oi_caps: BTreeMap<String, Vec<String>>,
 }
 
 pub struct MarketFeed {
@@ -259,19 +273,97 @@ impl MarketFeed {
     /// first one. The REST poller uses this to skip a mids read the socket has
     /// already served within the poll interval.
     pub(crate) fn mids_age_ms(&self, now_ms: u64) -> Option<u64> {
-        self.read().mids_at.map(|at| now_ms.saturating_sub(at))
+        self.read()
+            .mids_at
+            .get("")
+            .map(|at| now_ms.saturating_sub(*at))
+    }
+
+    /// Milliseconds since the OLDEST builder dex's mids update (`None` while
+    /// any builder dex has none yet, and `None` with no builder dex). The
+    /// socket only pushes the default dex's `allMids`, so the builder dexes'
+    /// freshness is the REST lane's alone.
+    pub(crate) fn builder_mids_age_ms(&self, now_ms: u64) -> Option<u64> {
+        let c = self.read();
+        let mut oldest = None;
+        for dex in c.registry.dexs().iter().filter(|d| !d.name.is_empty()) {
+            let at = *c.mids_at.get(&dex.name)?;
+            let age = now_ms.saturating_sub(at);
+            oldest = Some(oldest.map_or(age, |o: u64| o.max(age)));
+        }
+        oldest
     }
 
     // ---- writes (the poller / WS client / control plane) ------------------
 
+    /// The default dex's meta.
     pub(crate) fn put_meta(&self, meta: Meta, now_ms: u64) {
         if self.stalled() {
             tracing::debug!("live meta dropped: the feed is stalled (the staleness drill)");
             return;
         }
         let mut c = self.write();
-        c.meta = Some(meta);
+        c.registry.put_meta("", meta);
         c.meta_at = Some(now_ms);
+    }
+
+    /// One dex's meta (the default dex is `""`); a dex the registry does not
+    /// know yet is appended after the others. The poller rebuilds the whole
+    /// registry through [`Self::put_perp_dexs`]; this is the fixtures' door
+    /// for a second dex.
+    #[cfg(test)]
+    pub(crate) fn put_dex_meta(&self, dex: &str, meta: Meta, now_ms: u64) {
+        if dex.is_empty() {
+            self.put_meta(meta, now_ms);
+            return;
+        }
+        self.write().registry.put_meta(dex, meta);
+    }
+
+    /// The venue's dex list with every dex's meta (`perpDexs` +
+    /// `allPerpMetas`, index-aligned): the registry. A misaligned pair keeps
+    /// the previous registry and returns `false`.
+    pub(crate) fn put_perp_dexs(
+        &self,
+        dexs: Vec<(String, Option<PerpDex>)>,
+        metas: Vec<Meta>,
+        now_ms: u64,
+    ) -> bool {
+        if self.stalled() {
+            tracing::debug!("live perpDexs dropped: the feed is stalled (the staleness drill)");
+            return false;
+        }
+        let Some(registry) = DexRegistry::from_api(dexs, metas) else {
+            return false;
+        };
+        let mut c = self.write();
+        c.registry = registry;
+        c.registry_loaded = true;
+        c.meta_at = Some(now_ms);
+        true
+    }
+
+    /// One builder dex's contexts, aligned to its universe by index, and its
+    /// fresh meta when the dex is in the registry.
+    pub(crate) fn put_dex_ctxs(&self, dex: &str, meta: Meta, ctxs: Vec<AssetCtx>, now_ms: u64) {
+        if self.stalled() {
+            tracing::debug!(dex = %dex, "live dex ctxs dropped: the feed is stalled (the staleness drill)");
+            return;
+        }
+        if ctxs.len() != meta.universe.len() {
+            tracing::warn!(
+                dex = %dex,
+                universe = meta.universe.len(),
+                ctxs = ctxs.len(),
+                "dex ctxs are not aligned with the universe; folding the aligned prefix"
+            );
+        }
+        let mut c = self.write();
+        for (asset, ctx) in meta.universe.iter().zip(ctxs) {
+            c.ctx_at.insert(asset.name.clone(), now_ms);
+            c.ctxs.insert(asset.name.clone(), ctx);
+        }
+        c.registry.refresh_meta(dex, meta);
     }
 
     pub(crate) fn put_spot_meta(&self, spot: crate::wire::SpotMeta) {
@@ -281,18 +373,28 @@ impl MarketFeed {
     /// `perpsAtOpenInterestCap`: the coins at their cap (the venue's own
     /// list; the order lane refuses orders that would increase their OI).
     pub(crate) fn put_oi_caps(&self, caps: Vec<String>) {
+        self.put_oi_caps_of("", caps);
+    }
+
+    /// One dex's cap list (the default dex is `""`).
+    pub(crate) fn put_oi_caps_of(&self, dex: &str, caps: Vec<String>) {
         if self.stalled() {
             tracing::debug!("live OI caps dropped: the feed is stalled (the staleness drill)");
             return;
         }
-        self.write().oi_caps = Some(caps);
+        self.write().oi_caps.insert(dex.to_string(), caps);
     }
 
-    /// The cached cap list. `None` until the venue has answered: an unknown
-    /// cap set is refused by the order lane, never read as "nothing is
-    /// capped".
+    /// The default dex's cached cap list. `None` until the venue has
+    /// answered: an unknown cap set is refused by the order lane, never read
+    /// as "nothing is capped".
     pub fn open_interest_caps(&self) -> Option<Vec<String>> {
-        self.read().oi_caps.clone()
+        self.open_interest_caps_of("")
+    }
+
+    /// One dex's cached cap list (`None` = not answered yet).
+    pub fn open_interest_caps_of(&self, dex: &str) -> Option<Vec<String>> {
+        self.read().oi_caps.get(dex).cloned()
     }
 
     pub(crate) fn put_ctx(&self, coin: String, ctx: AssetCtx, now_ms: u64) {
@@ -359,14 +461,46 @@ impl MarketFeed {
         (met, before - o.consumptions.len())
     }
 
+    /// The default dex's `allMids` (the socket's `allMids` push and the
+    /// default REST read).
     pub fn put_mids(&self, mids: BTreeMap<String, Decimal>, now_ms: u64) {
         if self.stalled() {
             tracing::debug!("live mids dropped: the feed is stalled (the staleness drill)");
             return;
         }
         let mut c = self.write();
-        c.mids = mids;
-        c.mids_at = Some(now_ms);
+        c.mids.insert(String::new(), mids);
+        c.mids_at.insert(String::new(), now_ms);
+    }
+
+    /// `allMids {dex:"ALL_DEXS"}`: every dex's coins in one answer, split by
+    /// the coin's dex prefix. A key without a prefix (a default perp, a spot
+    /// `@N`, an outcome `#N`) belongs to the default dex, which is how the
+    /// venue's own default `allMids` reads. Every registry dex is stamped
+    /// (one with no keys serves an empty map, not a stale one).
+    pub(crate) fn put_all_dexs_mids(&self, mids: BTreeMap<String, Decimal>, now_ms: u64) {
+        if self.stalled() {
+            tracing::debug!("live mids dropped: the feed is stalled (the staleness drill)");
+            return;
+        }
+        let mut c = self.write();
+        let mut by_dex: BTreeMap<String, BTreeMap<String, Decimal>> = c
+            .registry
+            .dexs()
+            .iter()
+            .map(|d| (d.name.clone(), BTreeMap::new()))
+            .collect();
+        by_dex.entry(String::new()).or_default();
+        for (coin, mid) in mids {
+            by_dex
+                .entry(dex_of_coin(&coin).to_string())
+                .or_default()
+                .insert(coin, mid);
+        }
+        for (dex, mids) in by_dex {
+            c.mids_at.insert(dex.clone(), now_ms);
+            c.mids.insert(dex, mids);
+        }
     }
 
     /// `crash`: own this coin's mark and oracle (live updates stop mattering
@@ -553,10 +687,58 @@ impl MarketFeed {
         Some(apply_consumptions(base, &overrides.consumptions))
     }
 
-    /// The perp universe + margin tables (the live meta; `None` until the
-    /// first poll lands — a read that needs it is a 503, never a guess).
+    /// The DEFAULT dex's perp universe + margin tables (the live meta; `None`
+    /// until the first poll lands, a read that needs it is a 503, never a
+    /// guess). Other dexes: [`Self::meta_of`], [`Self::meta_for_coin`].
     pub(crate) fn meta(&self) -> Option<Meta> {
-        self.read().meta.clone()
+        self.meta_of("")
+    }
+
+    /// One dex's meta (`""` = the default dex; `None` = the dex is unknown or
+    /// has not landed).
+    pub(crate) fn meta_of(&self, dex: &str) -> Option<Meta> {
+        self.read().registry.dex(dex).map(|d| d.meta.clone())
+    }
+
+    /// Every dex's meta in `perpDexs` order (what `allPerpMetas` serves).
+    #[allow(dead_code)] // the REST info handlers adopt it with the multi-dex serving phase
+    pub(crate) fn metas(&self) -> Vec<Meta> {
+        self.read()
+            .registry
+            .dexs()
+            .iter()
+            .map(|d| d.meta.clone())
+            .collect()
+    }
+
+    /// The meta of the dex that lists `coin` (`None` = no dex lists it).
+    pub(crate) fn meta_for_coin(&self, coin: &str) -> Option<Meta> {
+        self.read().registry.meta_for_coin(coin).cloned()
+    }
+
+    /// Every dex (`perpDexs` order): name, index, collateral token, asset-id
+    /// base, the raw `perpDexs` record and the universe.
+    pub(crate) fn all_dexs(&self) -> Vec<PerpDexInfo> {
+        self.read().registry.dexs().to_vec()
+    }
+
+    /// Whether `perpDexs` has landed: the readiness gate's registry fact.
+    pub fn registry_loaded(&self) -> bool {
+        self.read().registry_loaded
+    }
+
+    /// The coin's asset id (its dex's base plus its index in that dex's
+    /// universe; `None` = no dex lists the coin).
+    #[allow(dead_code)] // the activeAssetData / marginTable serving adopts it with the multi-dex serving phase
+    pub(crate) fn asset_id(&self, coin: &str) -> Option<u32> {
+        self.read().registry.asset_id(coin)
+    }
+
+    /// The one asset-id resolver (see [`DexRegistry::coin_of_asset`]): the
+    /// default dex's plain index or `100000 + dex * 10000 + index` for a
+    /// builder dex; `None` = unknown id.
+    pub(crate) fn coin_of_asset(&self, asset: u32) -> Option<String> {
+        self.read().registry.coin_of_asset(asset)
     }
 
     /// The spot token registry (`None` until the first poll lands).
@@ -585,7 +767,12 @@ impl MarketFeed {
     /// `metaAndAssetCtxs` with the overrides applied: the served contexts are
     /// exactly what the account plane prices from.
     pub(crate) fn meta_and_ctxs(&self) -> Option<crate::wire::MetaAndAssetCtxs> {
-        let meta = self.meta()?;
+        self.meta_and_ctxs_of("")
+    }
+
+    /// [`Self::meta_and_ctxs`] for one dex (`""` = the default dex).
+    pub(crate) fn meta_and_ctxs_of(&self, dex: &str) -> Option<crate::wire::MetaAndAssetCtxs> {
+        let meta = self.meta_of(dex)?;
         let overrides = self.read_overrides().clone();
         let stalled = self.stalled();
         let now = crate::now_ms();
@@ -627,11 +814,19 @@ impl MarketFeed {
 
     /// `allMids` with the overrides applied.
     pub(crate) fn all_mids(&self) -> AllMids {
+        self.all_mids_of("")
+    }
+
+    /// `allMids` for one dex (`""` = the default dex): the dex's own keys,
+    /// with an owned price winning for the coins of that dex.
+    pub(crate) fn all_mids_of(&self, dex: &str) -> AllMids {
         let overrides = self.read_overrides().clone();
         let c = self.read();
-        let mut mids = c.mids.clone();
+        let mut mids = c.mids.get(dex).cloned().unwrap_or_default();
         for (coin, p) in &overrides.prices {
-            mids.insert(coin.clone(), p.mark);
+            if dex_of_coin(coin) == dex {
+                mids.insert(coin.clone(), p.mark);
+            }
         }
         AllMids(mids)
     }
@@ -985,6 +1180,7 @@ mod tests {
                     margin_mode: None,
                     only_isolated: None,
                     is_delisted: None,
+                    ..Default::default()
                 }],
                 margin_tables: Vec::new(),
                 collateral_token: 0,
@@ -1023,5 +1219,148 @@ mod tests {
         assert!(!feed.funding_is_owned("BTC"));
         assert_eq!(feed.owned_count(), 0);
         assert_eq!(feed.funding("BTC"), Some(Decimal::ZERO));
+    }
+
+    /// The registry is the venue's `perpDexs` order, one meta per dex, with
+    /// the default dex readable through the old single-dex accessor.
+    #[test]
+    fn the_feed_serves_every_dex_and_the_default_through_meta() {
+        let feed = crate::sim::feed_with_dexs(
+            &[],
+            &[
+                ("", &[("BTC", 40)]),
+                ("xyz", &[("xyz:XYZ100", 20), ("xyz:TSLA", 10)]),
+            ],
+        );
+        assert_eq!(feed.meta().unwrap().universe[0].name, "BTC");
+        assert_eq!(feed.meta_of("xyz").unwrap().universe.len(), 2);
+        assert!(feed.meta_of("nope").is_none());
+        let names: Vec<String> = feed.all_dexs().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["", "xyz"]);
+        assert_eq!(feed.metas().len(), 2);
+        assert_eq!(
+            feed.meta_for_coin("xyz:TSLA").unwrap().universe[1].name,
+            "xyz:TSLA"
+        );
+        assert!(feed.meta_for_coin("xyz:NOPE").is_none());
+        // The one resolver, both ways.
+        assert_eq!(feed.coin_of_asset(0).as_deref(), Some("BTC"));
+        assert_eq!(feed.coin_of_asset(110_001).as_deref(), Some("xyz:TSLA"));
+        assert_eq!(feed.coin_of_asset(5), None);
+        assert_eq!(feed.asset_id("xyz:TSLA"), Some(110_001));
+        // A fixture feed has no venue `perpDexs` yet: not registry-ready.
+        assert!(!feed.registry_loaded());
+    }
+
+    /// `put_perp_dexs` is the venue's registry: it flips the readiness fact,
+    /// keeps `perpDexs` order, and a misaligned `allPerpMetas` is refused (the
+    /// previous registry stays).
+    #[test]
+    fn the_perp_dexs_registry_lands_aligned_or_not_at_all() {
+        let feed = MarketFeed::memory(vec![]);
+        let metas = vec![
+            crate::sim::meta_of(&[("BTC", 40)]),
+            crate::sim::meta_of(&[("xyz:TSLA", 10)]),
+        ];
+        let dexs = vec![(String::new(), None), ("xyz".to_string(), None)];
+        assert!(!feed.put_perp_dexs(dexs.clone(), metas[..1].to_vec(), 1));
+        assert!(!feed.registry_loaded());
+        assert!(feed.put_perp_dexs(dexs, metas, 1));
+        assert!(feed.registry_loaded());
+        assert_eq!(feed.coin_of_asset(110_000).as_deref(), Some("xyz:TSLA"));
+    }
+
+    /// A builder dex's contexts align to its universe by index, are quoted by
+    /// coin name (`mark`, `meta_and_ctxs_of`) and a slot without a context is
+    /// skipped, not shifted onto its neighbour.
+    #[test]
+    fn a_builder_dexs_contexts_are_quoted_by_coin_and_aligned_by_index() {
+        let feed = crate::sim::feed_with_dexs(
+            &[("BTC", "100", "100")],
+            &[
+                ("", &[("BTC", 40)]),
+                ("xyz", &[("xyz:A", 10), ("xyz:B", 10), ("xyz:C", 10)]),
+            ],
+        );
+        // Two contexts for three assets: A and B are folded, C is not.
+        feed.put_dex_ctxs(
+            "xyz",
+            crate::sim::meta_of(&[("xyz:A", 10), ("xyz:B", 10), ("xyz:C", 10)]),
+            vec![test_ctx("1", "1"), test_ctx("2", "2")],
+            5,
+        );
+        assert_eq!(feed.mark("xyz:A"), Some(Decimal::from(1)));
+        assert_eq!(feed.mark("xyz:B"), Some(Decimal::from(2)));
+        assert_eq!(feed.mark("xyz:C"), None);
+        assert_eq!(feed.stale_ms("xyz:B", 15), Some(10));
+        let served = feed.meta_and_ctxs_of("xyz").unwrap();
+        assert_eq!(served.1.len(), 2);
+        assert_eq!(feed.mark("BTC"), Some(Decimal::from(100)));
+        // The default dex's served contexts do not carry the builder coins.
+        assert_eq!(feed.meta_and_ctxs().unwrap().1.len(), 1);
+    }
+
+    /// `ALL_DEXS` mids split by the coin's dex; an unprefixed key (a default
+    /// perp, a spot `@N`, an outcome `#N`) is the default dex's, exactly as
+    /// the venue's default `allMids` reads; an owned price wins in its dex.
+    #[test]
+    fn all_dexs_mids_split_by_the_coins_dex() {
+        let feed = crate::sim::feed_with_dexs(
+            &[],
+            &[
+                ("", &[("BTC", 40)]),
+                ("xyz", &[("xyz:TSLA", 10)]),
+                ("flx", &[]),
+            ],
+        );
+        let mids: BTreeMap<String, Decimal> = [
+            ("BTC", "100"),
+            ("@107", "5"),
+            ("#10", "0.5"),
+            ("xyz:TSLA", "300"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.parse().unwrap()))
+        .collect();
+        assert_eq!(feed.builder_mids_age_ms(10), None, "none landed yet");
+        feed.put_all_dexs_mids(mids, 4);
+        let default = feed.all_mids().0;
+        assert_eq!(default.len(), 3);
+        assert!(default.contains_key("@107") && default.contains_key("#10"));
+        let xyz = feed.all_mids_of("xyz").0;
+        assert_eq!(xyz.len(), 1);
+        assert_eq!(xyz["xyz:TSLA"], Decimal::from(300));
+        assert!(feed.all_mids_of("flx").0.is_empty(), "stamped, empty");
+        assert_eq!(feed.builder_mids_age_ms(10), Some(6));
+        assert_eq!(feed.mids_age_ms(10), Some(6));
+        feed.own_price(
+            "xyz:TSLA",
+            PriceOverride {
+                mark: Decimal::from(7),
+                oracle: Decimal::from(7),
+            },
+        )
+        .unwrap();
+        assert_eq!(feed.all_mids_of("xyz").0["xyz:TSLA"], Decimal::from(7));
+        assert!(
+            !feed.all_mids().0.contains_key("xyz:TSLA"),
+            "an owned builder price is not a default-dex mid"
+        );
+    }
+
+    /// Caps are per dex; a dex that has not answered is unknown, never
+    /// "nothing capped".
+    #[test]
+    fn open_interest_caps_are_per_dex() {
+        let feed = MarketFeed::memory(vec![]);
+        assert_eq!(feed.open_interest_caps_of("xyz"), None);
+        feed.put_oi_caps_of("xyz", vec!["xyz:TSLA".into()]);
+        feed.put_oi_caps(vec!["BTC".into()]);
+        assert_eq!(
+            feed.open_interest_caps_of("xyz"),
+            Some(vec!["xyz:TSLA".into()])
+        );
+        assert_eq!(feed.open_interest_caps(), Some(vec!["BTC".into()]));
+        assert_eq!(feed.open_interest_caps_of("flx"), None);
     }
 }

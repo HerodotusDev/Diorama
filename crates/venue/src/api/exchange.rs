@@ -81,9 +81,8 @@ fn prevalidate(state: &Arc<ApiState>, orders: &[OrderAction]) -> Result<(), Stri
     if orders.is_empty() {
         return Err("venue-sim: an empty order batch is rejected (docs: pre-validation)".into());
     }
-    let meta = state.feed.meta();
     for action in orders {
-        let Ok(order) = action.to_order(meta.as_ref()) else {
+        let Ok(order) = action.to_order(|a| state.feed.coin_of_asset(a)) else {
             continue; // a per-order mapping error keeps its own status
         };
         if order.trigger.is_some() && !order.reduce_only {
@@ -91,6 +90,9 @@ fn prevalidate(state: &Arc<ApiState>, orders: &[OrderAction]) -> Result<(), Stri
                 "venue-sim: TP/SL orders must be reduce-only (docs: pre-validation)".into(),
             );
         }
+        // The meta of the dex that lists the coin (a builder coin is not in
+        // the default dex's universe).
+        let meta = state.feed.meta_for_coin(&order.coin);
         if let Err(e) = crate::sim::validate::validate_order(&state.feed, meta.as_ref(), &order) {
             let reason = e.to_string();
             if reason.contains("too far from oracle") {
@@ -107,7 +109,7 @@ fn asset_action<F>(state: &Arc<ApiState>, asset: u32, run: F) -> Response
 where
     F: FnOnce(&str) -> std::result::Result<(), crate::error::Error>,
 {
-    match coin_of(state.feed.meta().as_ref(), asset) {
+    match state.feed.coin_of_asset(asset) {
         Some(coin) => match run(&coin) {
             Ok(()) => default_ok(),
             Err(e) => err_envelope(e.to_string()),
@@ -280,8 +282,8 @@ fn leverage_action(
     mode: crate::wire::LeverageType,
     leverage: u32,
 ) -> Response {
-    let meta = state.feed.meta();
     asset_action(state, asset, |coin| {
+        let meta = state.feed.meta_for_coin(coin);
         state.sim.set_leverage(
             owner,
             coin,
@@ -318,7 +320,6 @@ fn order_action(
         builder = ?builder,
         "exchange order action accepted (the signature is accepted, never verified)"
     );
-    let meta = state.feed.meta();
     // The docs' pre-validation class: one error for the whole payload
     // (empty batches, non-reduce-only TP/SL, an order too far from the
     // reference price) — every status carries it, as their clients expect.
@@ -331,7 +332,7 @@ fn order_action(
     }
     let statuses = orders
         .iter()
-        .map(|action| fill_status(state, (owner, builder), meta.as_ref(), action))
+        .map(|action| fill_status(state, (owner, builder), action))
         .collect();
     order_response(statuses)
 }
@@ -353,11 +354,6 @@ fn unmodeled_reason(body: &Bytes) -> String {
     format!("venue-sim: the `{tag}` action is not modeled; {MODELED_ACTIONS}")
 }
 
-/// The asset index → coin map (one home; `None` = unknown index).
-fn coin_of(meta: Option<&crate::wire::Meta>, asset: u32) -> Option<String> {
-    meta?.universe.get(asset as usize).map(|a| a.name.clone())
-}
-
 /// `cancel`: per-entry statuses in the venue's own shape.
 fn cancel_action(
     state: &ApiState,
@@ -372,10 +368,9 @@ fn cancel_action(
             "venue-sim: an empty cancel batch is rejected (docs: pre-validation)".to_string(),
         );
     }
-    let meta = state.feed.meta();
     let statuses = cancels
         .iter()
-        .map(|c| match coin_of(meta.as_ref(), c.a) {
+        .map(|c| match state.feed.coin_of_asset(c.a) {
             Some(coin) => match state.sim.cancel(owner, &coin, c.o, speed) {
                 Ok(()) => CancelStatus::Success(SuccessStatus),
                 Err(e) => CancelStatus::Error(Box::new(ErrorStatus {
@@ -405,10 +400,9 @@ fn cancel_by_cloid_action(
             "venue-sim: an empty cancel batch is rejected (docs: pre-validation)".to_string(),
         );
     }
-    let meta = state.feed.meta();
     let statuses = cancels
         .iter()
-        .map(|c| match coin_of(meta.as_ref(), c.asset) {
+        .map(|c| match state.feed.coin_of_asset(c.asset) {
             Some(coin) => match state.sim.cancel_by_cloid(owner, &coin, c.cloid, speed) {
                 Ok(()) => CancelStatus::Success(SuccessStatus),
                 Err(e) => CancelStatus::Error(Box::new(ErrorStatus {
@@ -455,28 +449,30 @@ fn modify_one(
     order: &OrderAction,
     mode: crate::sim::order::AlwaysPlace,
 ) -> Result<()> {
-    let meta = state.feed.meta();
-    let canceled = match oid {
-        crate::wire::OidOrCloid::Oid(o) => {
-            // The oid's coin is the order's own asset (the docs' `a`).
-            let coin = coin_of(meta.as_ref(), order.a)
-                .ok_or_else(|| Error::bad_request(format!("unknown asset index {}", order.a)))?;
-            state
-                .sim
-                .cancel(owner, &coin, *o, crate::sim::order::CancelSpeed::Normal)
-        }
-        crate::wire::OidOrCloid::Cloid(c) => {
-            let coin = coin_of(meta.as_ref(), order.a)
-                .ok_or_else(|| Error::bad_request(format!("unknown asset index {}", order.a)))?;
-            state
-                .sim
-                .cancel_by_cloid(owner, &coin, *c, crate::sim::order::CancelSpeed::Normal)
-        }
-    };
+    let canceled =
+        match oid {
+            crate::wire::OidOrCloid::Oid(o) => {
+                // The oid's coin is the order's own asset (the docs' `a`).
+                let coin = state.feed.coin_of_asset(order.a).ok_or_else(|| {
+                    Error::bad_request(format!("unknown asset index {}", order.a))
+                })?;
+                state
+                    .sim
+                    .cancel(owner, &coin, *o, crate::sim::order::CancelSpeed::Normal)
+            }
+            crate::wire::OidOrCloid::Cloid(c) => {
+                let coin = state.feed.coin_of_asset(order.a).ok_or_else(|| {
+                    Error::bad_request(format!("unknown asset index {}", order.a))
+                })?;
+                state
+                    .sim
+                    .cancel_by_cloid(owner, &coin, *c, crate::sim::order::CancelSpeed::Normal)
+            }
+        };
     if matches!(mode, crate::sim::order::AlwaysPlace::RequiresCancel) {
         canceled?;
     }
-    let mut mapped = order.to_order(meta.as_ref())?;
+    let mut mapped = order.to_order(|a| state.feed.coin_of_asset(a))?;
     if matches!(mode, crate::sim::order::AlwaysPlace::RequiresCancel) {
         if mapped.trigger.is_some() {
             return Err(Error::bad_request(
@@ -583,7 +579,6 @@ fn err_envelope(response: String) -> Response {
 fn fill_status(
     state: &ApiState,
     acting: (Address, Option<BuilderFee>),
-    meta: Option<&crate::wire::Meta>,
     action: &OrderAction,
 ) -> OrderStatus {
     let (user, builder) = acting;
@@ -595,7 +590,7 @@ fn fill_status(
         );
     }
     match action
-        .to_order(meta)
+        .to_order(|a| state.feed.coin_of_asset(a))
         .and_then(|o| state.sim.place_with_builder(&state.feed, user, &o, builder))
     {
         Ok(placed) => match (placed.fill, placed.resting) {
@@ -617,6 +612,12 @@ fn fill_status(
 mod tests {
     use super::*;
 
+    /// The asset-id resolver over a one-asset default dex (ETH at index 0).
+    fn eth_resolver() -> impl Fn(u32) -> Option<String> {
+        let registry = crate::feed::dex::DexRegistry::of_default(eth_meta());
+        move |asset| registry.coin_of_asset(asset)
+    }
+
     /// A one-asset meta (ETH at index 0, szDecimals 4).
     fn eth_meta() -> crate::wire::Meta {
         let mut meta: crate::wire::Meta = serde_json::from_str(r#"{"universe": []}"#).unwrap();
@@ -624,10 +625,7 @@ mod tests {
             name: "ETH".into(),
             sz_decimals: 4,
             max_leverage: 20,
-            margin_table_id: None,
-            only_isolated: None,
-            is_delisted: None,
-            margin_mode: None,
+            ..Default::default()
         });
         meta
     }
@@ -670,12 +668,12 @@ mod tests {
     /// exactly IOC/resting.
     #[test]
     fn compact_orders_map_onto_the_lane() {
-        let meta = eth_meta();
+        let resolve = eth_resolver();
         let action: OrderAction = serde_json::from_str(
             r#"{"a":0,"b":true,"p":"101.5","s":"2","t":{"limit":{"tif":"Ioc"}}}"#,
         )
         .unwrap();
-        let order = action.to_order(Some(&meta)).unwrap();
+        let order = action.to_order(&resolve).unwrap();
         assert_eq!(order.coin, "ETH");
         assert!(order.is_buy);
         assert_eq!(order.size, "2".parse().unwrap());
@@ -686,25 +684,23 @@ mod tests {
         // refused here.
         let market: OrderAction = serde_json::from_str(r#"{"a":0,"b":false,"s":"1"}"#).unwrap();
         assert_eq!(
-            market.to_order(Some(&meta)).unwrap().tif,
+            market.to_order(&resolve).unwrap().tif,
             crate::sim::order::Tif::Ioc
         );
         let gtc: OrderAction =
             serde_json::from_str(r#"{"a":0,"b":false,"s":"1","t":{"limit":{"tif":"Gtc"}}}"#)
                 .unwrap();
         assert_eq!(
-            gtc.to_order(Some(&meta)).unwrap().tif,
+            gtc.to_order(&resolve).unwrap().tif,
             crate::sim::order::Tif::Gtc
         );
         let bad: OrderAction =
             serde_json::from_str(r#"{"a":0,"b":false,"s":"1","t":{"limit":{"tif":"Fok"}}}"#)
                 .unwrap();
-        assert!(format!("{}", bad.to_order(Some(&meta)).unwrap_err()).contains("unknown tif"));
+        assert!(format!("{}", bad.to_order(&resolve).unwrap_err()).contains("unknown tif"));
         // An index past the meta is a named refusal.
         let oob: OrderAction = serde_json::from_str(r#"{"a":7,"b":false,"s":"1"}"#).unwrap();
-        assert!(
-            format!("{}", oob.to_order(Some(&meta)).unwrap_err()).contains("unknown asset index")
-        );
+        assert!(format!("{}", oob.to_order(&resolve).unwrap_err()).contains("unknown asset index"));
     }
 
     /// The docs' `expiresAfter` (the exchange page + the FAQ's "Action already
@@ -767,7 +763,7 @@ mod tests {
             r#"{"a":0,"b":true,"s":"1","t":{"trigger":{"isMarket":true,"triggerPx":"100","tpsl":"sl"}}}"#,
         )
         .unwrap();
-        let order = action.to_order(Some(&eth_meta())).unwrap();
+        let order = action.to_order(eth_resolver()).unwrap();
         let trigger = order.trigger.expect("a trigger order carries its trigger");
         assert!(trigger.is_market);
         assert_eq!(trigger.trigger_px, "100".parse().unwrap());

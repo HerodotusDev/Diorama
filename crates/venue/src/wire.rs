@@ -157,7 +157,7 @@ pub(crate) enum InfoRequest {
     MaxBuilderFee { user: Address, builder: Address },
     #[serde(rename = "preTransferCheck")]
     PreTransferCheck { user: Address, source: Address },
-    /// The metadata of every perp dex, in `perpDexs` order (one here).
+    /// The metadata of every perp dex, in `perpDexs` order.
     #[serde(rename = "allPerpMetas")]
     AllPerpMetas,
     /// `[[coin, {category, description, displayName, keywords}], ...]`.
@@ -204,8 +204,8 @@ impl InfoRequest {
         }
     }
 
-    /// The perp dex this request scopes to (empty/absent = the first dex).
-    /// Spot reads are only defined on the first dex.
+    /// The perp dex this request scopes to (empty/absent = the default dex).
+    /// Spot reads are only defined on the default dex.
     #[cfg(test)]
     fn dex(&self) -> &str {
         match self {
@@ -448,7 +448,7 @@ pub(crate) enum MarginMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AssetInfo {
     pub name: String,
@@ -462,6 +462,18 @@ pub(crate) struct AssetInfo {
     pub only_isolated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_delisted: Option<bool>,
+    /// Builder-dex rows only (the default dex's rows never carry it): the
+    /// asset's growth mode (`"enabled"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub growth_mode: Option<String>,
+    /// Builder-dex rows only: when the fee scale last changed (an ISO-like
+    /// timestamp string, kept verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fee_scale_change_time: Option<String>,
+    /// Builder-dex rows only: the deployer's fee scale (a decimal string,
+    /// kept verbatim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer_fee_scale: Option<String>,
 }
 
 /// `marginTable`: the leverage tiers. Maintenance margin is ½ the initial
@@ -561,17 +573,17 @@ pub(crate) fn funding_ctx(mark: &str, oracle: &str) -> AssetCtx {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct MetaAndAssetCtxs(pub Meta, pub Vec<AssetCtx>);
 
-/// `perpDexs`: `[null, …]` (the first dex is null). The sim serves the first
-/// dex only (multi-dex is deferred — docs/INTEGRATION.md).
+/// One non-default `perpDexs` entry (the answer is `[null, {…}, …]`: the
+/// default dex is `null`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PerpDex {
     pub name: String,
     pub full_name: String,
     pub deployer: Address,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Served as an explicit `null` when absent: the venue sends the key.
     pub oracle_updater: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Same: an explicit `null` when absent.
     pub fee_recipient: Option<Address>,
     /// Per-coin OI caps (the venue's credit terms; the sim's feed reads them).
     pub asset_to_streaming_oi_cap: Vec<(String, Decimal)>,
@@ -839,6 +851,52 @@ mod tests {
         assert_eq!(dex.asset_to_funding_multiplier[0].1.to_string(), "0.5");
         assert_eq!(dex.sub_deployers[0].0, "registerAsset");
         assert_eq!(dex.sub_deployers[0].1.len(), 1);
+    }
+
+    /// A builder dex's meta round-trips in the real shape: the three
+    /// builder-only row fields survive and a default-dex row never grows them;
+    /// `perpDexs` sends the absent updater/recipient as explicit nulls.
+    #[test]
+    fn a_builder_meta_and_perp_dex_round_trip_in_the_real_shape() {
+        let raw = serde_json::json!({
+            "universe": [{
+                "szDecimals": 3, "name": "xyz:TSLA", "maxLeverage": 10,
+                "marginTableId": 10, "onlyIsolated": true, "isDelisted": false,
+                "growthMode": "enabled",
+                "lastFeeScaleChangeTime": "2025-11-20T10:00:00.000000",
+                "deployerFeeScale": "1.0"
+            }],
+            "marginTables": [],
+            "collateralToken": 360
+        });
+        let meta: Meta = serde_json::from_value(raw.clone()).unwrap();
+        let row = &meta.universe[0];
+        assert_eq!(row.growth_mode.as_deref(), Some("enabled"));
+        assert_eq!(row.deployer_fee_scale.as_deref(), Some("1.0"));
+        let back = serde_json::to_value(&meta).unwrap();
+        assert_eq!(back["universe"][0], raw["universe"][0]);
+        assert_eq!(back["collateralToken"], 360);
+        // A default-dex row carries none of them.
+        let plain: Meta = serde_json::from_str(
+            r#"{"universe":[{"szDecimals":5,"name":"BTC","maxLeverage":40}],"marginTables":[],"collateralToken":0}"#,
+        )
+        .unwrap();
+        let plain = serde_json::to_value(&plain).unwrap();
+        assert!(plain["universe"][0].get("growthMode").is_none());
+        assert!(plain["universe"][0].get("deployerFeeScale").is_none());
+
+        let dex: PerpDex = serde_json::from_value(serde_json::json!({
+            "name": "xyz", "fullName": "XYZ",
+            "deployer": "0x0000000000000000000000000000000000000001",
+            "oracleUpdater": null, "feeRecipient": null,
+            "assetToStreamingOiCap": [], "subDeployers": []
+        }))
+        .unwrap();
+        let served = serde_json::to_value(&dex).unwrap();
+        assert_eq!(served["oracleUpdater"], serde_json::Value::Null);
+        assert_eq!(served["feeRecipient"], serde_json::Value::Null);
+        assert!(served.as_object().unwrap().contains_key("oracleUpdater"));
+        assert!(served.as_object().unwrap().contains_key("feeRecipient"));
     }
 
     #[test]
@@ -1224,23 +1282,20 @@ fn decimal_or_refuse(what: &str, s: &str) -> Result<Decimal> {
 }
 
 impl OrderAction {
-    /// The compact action → the lane's order: the asset index resolves
-    /// through the live meta (unknown = a named refusal), size and limit are
-    /// decimal strings; the tif decides what rests (the sim's `place` owns
-    /// the semantics).
+    /// The compact action → the lane's order: the asset id resolves through
+    /// `coin_of_asset` (the feed's one resolver: unknown = a named refusal),
+    /// size and limit are decimal strings; the tif decides what rests (the
+    /// sim's `place` owns the semantics).
     pub(crate) fn to_order(
         &self,
-        meta: Option<&crate::wire::Meta>,
+        coin_of_asset: impl Fn(u32) -> Option<String>,
     ) -> Result<crate::sim::order::Order> {
-        let coin = meta
-            .and_then(|m| m.universe.get(self.a as usize))
-            .map(|a| a.name.clone())
-            .ok_or_else(|| {
-                Error::bad_request(format!(
-                    "unknown asset index {} (the live meta has not landed, or is shorter)",
-                    self.a
-                ))
-            })?;
+        let coin = coin_of_asset(self.a).ok_or_else(|| {
+            Error::bad_request(format!(
+                "unknown asset index {} (the live meta has not landed, or is shorter)",
+                self.a
+            ))
+        })?;
         let size: Decimal = decimal_or_refuse("size", &self.s)?;
         let limit_px = match &self.p {
             Some(p) => Some(decimal_or_refuse("limit price", p)?),

@@ -415,19 +415,26 @@ impl WsClient {
     /// Classify the venue's error frame. A message that names a configured
     /// coin (and is not an allMids refusal) is that coin's subscription
     /// failing; anything else is session-level. Matching is by whole token,
-    /// so a coin like `ETH` does not match inside `METHOD`.
+    /// so a coin like `ETH` does not match inside `METHOD`. A token keeps its
+    /// `:` (`xyz:tsla` is one token, never `xyz` and `tsla`), so a builder
+    /// coin matches itself and `xyz:BTC` does not match the plain coin `BTC`;
+    /// a builder coin also matches as a whole substring, for a name whose
+    /// punctuation would split a token.
     fn classify_subscription_error(&self, data: &str) -> SubscriptionFailure {
         let lower = data.to_ascii_lowercase();
         if lower.contains("allmids") {
             return SubscriptionFailure::Session(data.to_string());
         }
         let tokens: Vec<&str> = lower
-            .split(|c: char| !c.is_ascii_alphanumeric())
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != ':')
+            .map(|token| token.trim_matches(':'))
             .filter(|token| !token.is_empty())
             .collect();
         for coin in &self.feed.markets {
             let coin_lower = coin.to_ascii_lowercase();
-            if tokens.iter().any(|token| *token == coin_lower) {
+            if tokens.iter().any(|token| *token == coin_lower)
+                || (coin_lower.contains(':') && lower.contains(&coin_lower))
+            {
                 return SubscriptionFailure::Coin(coin.clone());
             }
         }
@@ -564,6 +571,37 @@ mod tests {
         // Whole-token matching: a coin name inside another word is not it.
         assert!(matches!(
             client.classify_subscription_error("METHOD unsupported"),
+            SubscriptionFailure::Session(_)
+        ));
+    }
+
+    /// A builder coin's refusal names `dex:COIN`: it must isolate that coin
+    /// (tokenising on `:` split it into `xyz` and `tsla` and never matched, so
+    /// one refused builder coin rotated the whole socket), and must not be
+    /// mistaken for the plain coin of the same ticker.
+    #[test]
+    fn a_builder_coin_refusal_is_isolated_to_that_coin() {
+        let client = client(&["BTC", "xyz:TSLA", "xyz:BTC"]);
+        assert_eq!(
+            client.classify_subscription_error("Invalid subscription: activeAssetCtx xyz:TSLA"),
+            SubscriptionFailure::Coin("xyz:TSLA".into())
+        );
+        assert_eq!(
+            client.classify_subscription_error("xyz:tsla: unknown coin"),
+            SubscriptionFailure::Coin("xyz:TSLA".into())
+        );
+        assert_eq!(
+            client.classify_subscription_error("l2Book xyz:BTC refused"),
+            SubscriptionFailure::Coin("xyz:BTC".into())
+        );
+        // The plain ticker is still its own coin.
+        assert_eq!(
+            client.classify_subscription_error("l2Book BTC refused"),
+            SubscriptionFailure::Coin("BTC".into())
+        );
+        // A dex alone is not a coin.
+        assert!(matches!(
+            client.classify_subscription_error("unknown dex xyz"),
             SubscriptionFailure::Session(_)
         ));
     }

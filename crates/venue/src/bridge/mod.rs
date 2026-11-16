@@ -450,11 +450,7 @@ impl Bridge {
     /// The asset index -> coin map the CoreWriter actions address (`None` =
     /// an index the live meta does not carry: a named refusal upstream).
     fn coin_of(&self, asset: u32) -> Option<String> {
-        self.feed
-            .meta()?
-            .universe
-            .get(asset as usize)
-            .map(|a| a.name.clone())
+        self.feed.coin_of_asset(asset)
     }
 
     /// The CoreWriter limit order (id 1): prices and sizes arrive as 10^8 ×
@@ -472,7 +468,7 @@ impl Bridge {
             tracing::warn!(account = %caller, tif, "bridge: CoreWriter order with an unknown tif byte");
             return;
         };
-        let Some(order) = core_order(self.feed.meta().as_ref(), action, tif) else {
+        let Some(order) = core_order(|a| self.feed.coin_of_asset(a), action, tif) else {
             self.metrics.inc_refusals();
             tracing::warn!(account = %caller, asset, "bridge: CoreWriter order for an unknown asset refused");
             return;
@@ -849,11 +845,12 @@ fn walk_frame(frame: &CallFrame, out: &mut Vec<(Address, CoreAction)>) {
 }
 
 /// The CoreWriter order's units (docs, pinned): prices and sizes are 10^8 ×
-/// the human value, and the asset index resolves through the live meta
-/// (`None` = an index the meta does not carry — a named refusal upstream).
-/// The tif comes in already mapped (`Tif::from_corewriter`, one home).
+/// the human value, and the asset id resolves through the feed's one
+/// resolver, `coin_of_asset` (`None` = an id the live dexes do not carry, a
+/// named refusal upstream). The tif comes in already mapped
+/// (`Tif::from_corewriter`, one home).
 fn core_order(
-    meta: Option<&crate::wire::Meta>,
+    coin_of_asset: impl Fn(u32) -> Option<String>,
     action: &CoreAction,
     tif: crate::sim::order::Tif,
 ) -> Option<crate::sim::order::Order> {
@@ -869,7 +866,7 @@ fn core_order(
     else {
         return None;
     };
-    let coin = meta?.universe.get(*asset as usize)?.name.clone();
+    let coin = coin_of_asset(*asset)?;
     let scale = Decimal::from(100_000_000u64);
     Some(crate::sim::order::Order {
         coin,
@@ -906,10 +903,7 @@ mod tests {
             name: "ETH".into(),
             sz_decimals: 4,
             max_leverage: 20,
-            margin_table_id: None,
-            only_isolated: None,
-            is_delisted: None,
-            margin_mode: None,
+            ..Default::default()
         });
         let action = CoreAction::LimitOrder {
             asset: 0,
@@ -920,8 +914,10 @@ mod tests {
             tif: 3,
             cloid: 0,
         };
+        let registry = crate::feed::dex::DexRegistry::of_default(meta);
+        let resolve = |asset| registry.coin_of_asset(asset);
         let order =
-            core_order(Some(&meta), &action, crate::sim::order::Tif::Ioc).expect("a modeled order");
+            core_order(resolve, &action, crate::sim::order::Tif::Ioc).expect("a modeled order");
         assert_eq!(order.coin, "ETH");
         assert!(order.is_buy);
         assert_eq!(order.size, "2.5".parse().unwrap());
@@ -937,8 +933,8 @@ mod tests {
             tif: 3,
             cloid: 0,
         };
-        assert!(core_order(Some(&meta), &oob, crate::sim::order::Tif::Ioc).is_none());
-        assert!(core_order(None, &action, crate::sim::order::Tif::Ioc).is_none());
+        assert!(core_order(resolve, &oob, crate::sim::order::Tif::Ioc).is_none());
+        assert!(core_order(|_| None, &action, crate::sim::order::Tif::Ioc).is_none());
     }
 
     /// Action 7's unit rule: `ntl` is the *perp class's* USD (1e6), not the

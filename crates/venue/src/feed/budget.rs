@@ -41,14 +41,25 @@ impl Budget {
         self.used_at(Instant::now())
     }
 
+    /// Try to spend `weight` while leaving `reserve` of the window free: the
+    /// optional background reads (the builder dexes' contexts) use this so
+    /// they can never crowd out the default plane and the passthrough reads.
+    pub fn try_spend_keeping(&self, weight: u64, reserve: u64) -> bool {
+        self.try_spend_keeping_at(Instant::now(), weight, reserve)
+    }
+
     fn try_spend_at(&self, now: Instant, weight: u64) -> bool {
+        self.try_spend_keeping_at(now, weight, 0)
+    }
+
+    fn try_spend_keeping_at(&self, now: Instant, weight: u64, reserve: u64) -> bool {
         let mut spends = self
             .spends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::evict(&mut spends, now);
         let used: u64 = spends.iter().map(|(_, w)| w).sum();
-        if used + weight > CAPACITY {
+        if used + weight + reserve > CAPACITY {
             return false;
         }
         spends.push_back((now, weight));
@@ -91,6 +102,19 @@ mod tests {
         let t1 = t0 + Duration::from_secs(61);
         assert_eq!(b.used_at(t1), 0);
         assert!(b.try_spend_at(t1, 1200));
+    }
+
+    #[test]
+    fn a_reserve_is_left_free_for_the_other_readers() {
+        let b = Budget::default();
+        let t0 = Instant::now();
+        assert!(b.try_spend_at(t0, 900));
+        assert!(
+            !b.try_spend_keeping_at(t0, 20, 300),
+            "900 + 20 + 300 exceeds the window"
+        );
+        assert!(b.try_spend_keeping_at(t0, 20, 280), "920 + 280 fits");
+        assert!(b.try_spend_at(t0, 280), "the reserve is really free");
     }
 
     #[test]

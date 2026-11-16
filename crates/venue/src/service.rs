@@ -201,6 +201,7 @@ fn spawn_plane_heartbeat(
                 v_bridge_lag = bridge.lag_blocks(),
                 accounts = sim.metrics.accounts.load(std::sync::atomic::Ordering::Relaxed),
                 owned_levels = feed.owned_levels(),
+                dexs = feed.all_dexs().len(),
                 identity_violations = sim
                     .metrics
                     .identity_violations

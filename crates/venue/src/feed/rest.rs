@@ -13,9 +13,10 @@
 //! answer-vs-endpoint-fault boundary.
 use crate::error::{Error, Result};
 use crate::feed::MarketFeed;
-use crate::wire::{InfoRequest, L2Book, MetaAndAssetCtxs};
+use crate::wire::{InfoRequest, L2Book, Meta, MetaAndAssetCtxs, PerpDex};
 use diorama_anvil::{Attempt, AttemptOutcome, EndpointPool, PoolError, Scheme};
 use serde::de::DeserializeOwned;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -230,11 +231,32 @@ impl Attempt for RawAttempt<'_> {
     }
 }
 
+/// How often the slow reads refresh once they have landed: the spot token
+/// registry and the dex registry (`perpDexs` + `allPerpMetas`) change on a
+/// listing, not per tick. Until they have landed, every pass retries.
+const SLOW_REFRESH_MS: u64 = 60_000;
+
+/// Builder dexes whose contexts one pass refreshes (round-robin across
+/// passes). Each costs one heavy `metaAndAssetCtxs {dex}` (+ a light cap
+/// read), so two per pass keeps ten dexes inside a ~25 s sweep at a 5 s pass
+/// while the default plane's own cadence is untouched.
+const BUILDER_DEXES_PER_PASS: usize = 2;
+
+/// The budget the optional builder-dex reads leave free: the default plane
+/// (its `metaAndAssetCtxs`, books, mids) and the passthrough reads always
+/// fit, so the builder sweep slows down before anything else does.
+const BUILDER_RESERVE_WEIGHT: u64 = 300;
+
 /// The REST poller: one pass every `interval`, each call budget-gated.
 pub struct Poller {
     feed: Arc<MarketFeed>,
     api: RestClient,
     interval: Duration,
+    /// The round-robin cursor over the builder dexes.
+    cursor: AtomicUsize,
+    /// When the slow reads last ran (ms since the epoch; 0 = never).
+    spot_at_ms: AtomicU64,
+    registry_at_ms: AtomicU64,
 }
 
 impl Poller {
@@ -243,6 +265,9 @@ impl Poller {
             feed,
             api,
             interval,
+            cursor: AtomicUsize::new(0),
+            spot_at_ms: AtomicU64::new(0),
+            registry_at_ms: AtomicU64::new(0),
         }
     }
 
@@ -254,16 +279,32 @@ impl Poller {
         }
     }
 
-    /// One pass: meta+ctxs, spot meta, the configured books, allMids;
-    /// failures are logged and counted, never fatal (the WS lane may be
-    /// carrying the data).
+    /// One pass: the default dex's meta+ctxs, the slow registries (spot token
+    /// registry, dex registry), the configured books, allMids, the default
+    /// dex's caps, then a staggered slice of the builder dexes; failures are
+    /// logged and counted, never fatal (the WS lane may be carrying the data).
     async fn pass(&self) {
         self.meta_and_ctxs().await;
         self.spot_meta().await;
+        self.dex_registry().await;
         self.books().await;
         self.mids().await;
         self.oi_caps().await;
+        self.builder_dexs().await;
         self.feed.publish_metrics(crate::now_ms());
+    }
+
+    /// Whether a slow read is due: never run yet (or not landed), or its
+    /// refresh interval has passed. Stamps the attempt so a failing call is
+    /// retried at the slow cadence once it has ever landed, every pass before.
+    fn slow_due(stamp: &AtomicU64, landed: bool) -> bool {
+        let now = crate::now_ms();
+        let last = stamp.load(Ordering::Relaxed);
+        if landed && now.saturating_sub(last) < SLOW_REFRESH_MS {
+            return false;
+        }
+        stamp.store(now, Ordering::Relaxed);
+        true
     }
 
     /// `perpsAtOpenInterestCap`: the venue's cap list (light weight; the
@@ -283,6 +324,9 @@ impl Poller {
     }
 
     async fn spot_meta(&self) {
+        if !Self::slow_due(&self.spot_at_ms, self.feed.spot_registry_loaded()) {
+            return;
+        }
         if !self.gated(crate::feed::budget::weight::HEAVY) {
             return;
         }
@@ -293,6 +337,46 @@ impl Poller {
         {
             Ok(spot) => self.feed.put_spot_meta(spot),
             Err(e) => self.rest_fault("spotMeta", &e),
+        }
+    }
+
+    /// The dex registry: `perpDexs` (the dex list) and ONE `allPerpMetas`
+    /// (every dex's universe, index-aligned with the list), in place of a
+    /// `meta {dex}` per dex. Both must land: a registry built from one is
+    /// misaligned.
+    async fn dex_registry(&self) {
+        if !Self::slow_due(&self.registry_at_ms, self.feed.registry_loaded()) {
+            return;
+        }
+        if !self.gated(crate::feed::budget::weight::HEAVY)
+            || !self.gated(crate::feed::budget::weight::HEAVY)
+        {
+            return;
+        }
+        let listed = match self
+            .api
+            .info::<Vec<serde_json::Value>>(&InfoRequest::PerpDexs)
+            .await
+        {
+            Ok(listed) => listed,
+            Err(e) => {
+                self.rest_fault("perpDexs", &e);
+                return;
+            }
+        };
+        let metas = match self.api.info::<Vec<Meta>>(&InfoRequest::AllPerpMetas).await {
+            Ok(metas) => metas,
+            Err(e) => {
+                self.rest_fault("allPerpMetas", &e);
+                return;
+            }
+        };
+        let dexs = listed.into_iter().map(parse_perp_dex).collect();
+        if !self.feed.put_perp_dexs(dexs, metas, crate::now_ms()) {
+            self.feed.metrics.inc_rest_errors();
+            tracing::warn!(
+                "perpDexs and allPerpMetas are not aligned; keeping the previous registry"
+            );
         }
     }
 
@@ -307,13 +391,65 @@ impl Poller {
         {
             Ok(MetaAndAssetCtxs(meta, ctxs)) => {
                 let now = crate::now_ms();
-                // The ctxs array is positionally aligned with the universe.
-                for (asset, ctx) in meta.universe.iter().zip(ctxs) {
-                    self.feed.put_ctx(asset.name.clone(), ctx, now);
+                // The ctxs array is positionally aligned with the universe
+                // (equal lengths on the venue, delisted coins included): a
+                // slot lacking a ctx is skipped, never shifts the others.
+                for (index, asset) in meta.universe.iter().enumerate() {
+                    if let Some(ctx) = ctxs.get(index) {
+                        self.feed.put_ctx(asset.name.clone(), ctx.clone(), now);
+                    }
                 }
                 self.feed.put_meta(meta, now);
             }
             Err(e) => self.rest_fault("metaAndAssetCtxs", &e),
+        }
+    }
+
+    /// The builder dexes' contexts and caps: a round-robin slice per pass,
+    /// each read gated against the shared budget with a reserve kept free, so
+    /// the sweep stretches (never starves the default plane) when the window
+    /// is busy.
+    async fn builder_dexs(&self) {
+        let names: Vec<String> = self
+            .feed
+            .all_dexs()
+            .into_iter()
+            .filter(|d| !d.name.is_empty())
+            .map(|d| d.name)
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        for _ in 0..BUILDER_DEXES_PER_PASS.min(names.len()) {
+            let name = &names[self.cursor.fetch_add(1, Ordering::Relaxed) % names.len()];
+            if !self.gated_keeping(crate::feed::budget::weight::HEAVY) {
+                return;
+            }
+            let req = InfoRequest::MetaAndAssetCtxs {
+                dex: Some(name.clone()),
+            };
+            match self.api.info::<MetaAndAssetCtxs>(&req).await {
+                Ok(MetaAndAssetCtxs(meta, ctxs)) => {
+                    self.feed.put_dex_ctxs(name, meta, ctxs, crate::now_ms());
+                }
+                Err(e) => {
+                    self.rest_fault("metaAndAssetCtxs", &e);
+                    continue;
+                }
+            }
+            if !self.gated_keeping(crate::feed::budget::weight::LIGHT) {
+                continue;
+            }
+            match self
+                .api
+                .info::<Vec<String>>(&InfoRequest::PerpsAtOpenInterestCap {
+                    dex: Some(name.clone()),
+                })
+                .await
+            {
+                Ok(caps) => self.feed.put_oi_caps_of(name, caps),
+                Err(e) => self.rest_fault("perpsAtOpenInterestCap", &e),
+            }
         }
     }
 
@@ -345,13 +481,37 @@ impl Poller {
         }
     }
 
+    /// `allMids`. With builder dexes known, ONE `ALL_DEXS` read covers every
+    /// dex (cheaper than a read per dex, and the socket pushes only the
+    /// default dex's mids: the venue's `allMids {dex:"xyz"}` subscription
+    /// acks and never pushes), skipped while every builder dex's mids are
+    /// younger than one interval. With the default dex alone, the plain read
+    /// the socket may already have served.
     async fn mids(&self) {
         let now = crate::now_ms();
         let window = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
-        if self.feed.mids_age_ms(now).is_some_and(|age| age <= window) {
+        let builders = self.feed.all_dexs().iter().any(|d| !d.name.is_empty());
+        let fresh = if builders {
+            self.feed
+                .builder_mids_age_ms(now)
+                .is_some_and(|age| age <= window)
+        } else {
+            self.feed.mids_age_ms(now).is_some_and(|age| age <= window)
+        };
+        if fresh {
             return;
         }
         if !self.gated(crate::feed::budget::weight::LIGHT) {
+            return;
+        }
+        if builders {
+            let req = InfoRequest::AllMids {
+                dex: Some(crate::feed::dex::ALL_DEXS.to_string()),
+            };
+            match self.api.info::<crate::wire::AllMids>(&req).await {
+                Ok(mids) => self.feed.put_all_dexs_mids(mids.0, crate::now_ms()),
+                Err(e) => self.rest_fault("allMids", &e),
+            }
             return;
         }
         match self
@@ -373,17 +533,73 @@ impl Poller {
         false
     }
 
+    /// [`Self::gated`] for the optional builder-dex reads: the reserve stays
+    /// free for the default plane and the passthrough reads.
+    fn gated_keeping(&self, weight: u64) -> bool {
+        if self
+            .feed
+            .budget
+            .try_spend_keeping(weight, BUILDER_RESERVE_WEIGHT)
+        {
+            return true;
+        }
+        self.feed.metrics.inc_budget_skips();
+        false
+    }
+
     fn rest_fault(&self, what: &'static str, e: &Error) {
         self.feed.metrics.inc_rest_errors();
         tracing::warn!(call = what, error = %e, "market REST poll failed");
     }
 }
 
+/// One `perpDexs` entry: `null` is the default dex (`""`), an object is a
+/// builder dex named by its `name`. A record that does not parse as a
+/// [`PerpDex`] still names its dex (the registry needs the name to align with
+/// `allPerpMetas`); only its raw record is lost.
+fn parse_perp_dex(entry: serde_json::Value) -> (String, Option<PerpDex>) {
+    let Some(name) = entry
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+    else {
+        return (String::new(), None);
+    };
+    let raw = match serde_json::from_value::<PerpDex>(entry) {
+        Ok(raw) => Some(raw),
+        Err(error) => {
+            tracing::warn!(dex = %name, error = %error, "a perpDexs record does not parse; serving the dex without it");
+            None
+        }
+    };
+    (name, raw)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::venue_method_refusal;
+    use super::{parse_perp_dex, venue_method_refusal};
     use reqwest::StatusCode;
 
+    /// `null` is the default dex; a record names its dex even when its shape
+    /// drifts (the registry aligns by position and name).
+    #[test]
+    fn perp_dexs_entries_name_their_dex() {
+        assert_eq!(
+            parse_perp_dex(serde_json::Value::Null),
+            (String::new(), None)
+        );
+        let ok = serde_json::json!({
+            "name": "xyz", "fullName": "XYZ",
+            "deployer": "0x0000000000000000000000000000000000000001",
+            "oracleUpdater": null, "feeRecipient": null,
+            "assetToStreamingOiCap": [], "subDeployers": []
+        });
+        let (name, raw) = parse_perp_dex(ok);
+        assert_eq!(name, "xyz");
+        assert!(raw.is_some_and(|d| d.oracle_updater.is_none()));
+        let drifted = serde_json::json!({"name": "flx", "deployer": 7});
+        assert_eq!(parse_perp_dex(drifted), ("flx".to_string(), None));
+    }
     /// A bad request is the venue's answer; an endpoint wall is a failover.
     /// This is the boundary the old `raw_info` collapsed: it retried every
     /// non-2xx and then returned the last body as `Ok`, so an outage could

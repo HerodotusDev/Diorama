@@ -978,13 +978,27 @@ pub(crate) fn meta_of(assets: &[(&str, u32)]) -> crate::wire::Meta {
             name: (*coin).into(),
             sz_decimals: 4,
             max_leverage: *max_leverage,
-            margin_table_id: None,
-            only_isolated: None,
-            is_delisted: None,
-            margin_mode: None,
+            ..Default::default()
         });
     }
     m
+}
+
+/// The same fixture over several dexes: `(dex, assets)` pairs in `perpDexs`
+/// order, the default dex (`""`) first. Each dex's coins are `meta_of`'s, so a
+/// builder dex's assets are named with their prefix (`xyz:TSLA`). Marks are
+/// per coin as in [`feed_with`]; the registry's `perpDexs` record is absent
+/// (a fixture dex, not the venue's list).
+#[cfg(test)]
+pub(crate) fn feed_with_dexs(
+    marks: &[(&str, &str, &str)],
+    dexs: &[(&str, &[(&str, u32)])],
+) -> MarketFeed {
+    let feed = feed_with(marks);
+    for (dex, assets) in dexs {
+        feed.put_dex_meta(dex, meta_of(assets), 1);
+    }
+    feed
 }
 
 /// A `Meta` with one asset.
@@ -1003,9 +1017,7 @@ pub(crate) fn meta_with_table(coin: &str, max_leverage: u32) -> crate::wire::Met
             sz_decimals: 5,
             max_leverage,
             margin_table_id: Some(50),
-            only_isolated: None,
-            is_delisted: None,
-            margin_mode: None,
+            ..Default::default()
         }],
         margin_tables: vec![(
             50,
