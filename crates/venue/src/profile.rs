@@ -122,6 +122,7 @@ mod tests {
             chunk_size: 100,
             prepend_rounds: 0,
             status_log_interval_ms: 60_000,
+            mine_empty_blocks: true,
         };
         let p = policies(&loops);
         assert_eq!(p.clock, ClockPolicy::Native);

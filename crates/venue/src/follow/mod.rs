@@ -183,7 +183,8 @@ pub(crate) async fn step(ctx: &Ctx) -> Result<Option<FollowOutcome>> {
     pre_land_scan(ctx).await?;
     let applied = apply_window(ctx, &plan).await?;
     let (sampled, sampled_ok) = parity::parity_step(ctx, &plan.bal).await?;
-    advance_source_cursor(ctx, to).await?;
+    let end_ts = advance_source_cursor(ctx, to).await?;
+    mine_window_block(ctx, end_ts).await?;
     let stats = outcome(&plan, applied, (sampled, sampled_ok), started);
     report_applied(ctx, followed, to, source_head, &stats);
     Ok(Some(stats))
@@ -418,7 +419,9 @@ fn record_window_metrics(
 /// Advance the source cursor to `source_head` (recording the source's own
 /// block hash — the continuity check's anchor) and persist the state. The
 /// name says which cursor: the devnet cursor is the spine's `advance_cursor`.
-async fn advance_source_cursor(ctx: &Ctx, source_head: u64) -> Result<()> {
+/// Returns the fetched block's timestamp — the window end's source clock,
+/// which the block-production rule stamps onto V's next block.
+async fn advance_source_cursor(ctx: &Ctx, source_head: u64) -> Result<u64> {
     let head_block = ctx
         .source_rpc
         .block_by_number(source_head, diorama_anvil::Txs::Hashes)
@@ -427,12 +430,52 @@ async fn advance_source_cursor(ctx: &Ctx, source_head: u64) -> Result<()> {
         .state
         .set_source_last(source_head, head_block.header.hash)?;
     ctx.plane.save_state()?;
+    Ok(head_block.header.timestamp)
+}
+
+/// Mine one empty block stamped with the window's source-end timestamp: the
+/// mirror's idle-liveness rule. Without it V's head (and its clock) advance
+/// only when a devnet tx lands, so an idle deployment's freshness consumers
+/// — the indexer's head-age verdict, and every on-chain staleness check that
+/// reads `block.timestamp` (the RedStone feeds' own) — degrade against a
+/// frozen clock (measured live: 2.7 days of degraded health after the last
+/// E2E tx). The timestamp is the SOURCE's own clock, clamped monotonic to
+/// the fork's last block: a source timestamp behind the fork's clock (a
+/// deliberate `evm_increaseTime`, or a pin-era offset) must never produce a
+/// non-monotonic block — anvil would refuse the set and mine with its own
+/// default instead (the alignment rule, `align_context`'s clamp). Best
+/// effort: a failed mine is a warn, never a window failure — the compose
+/// already landed, and the next window mines the next block.
+async fn mine_window_block(ctx: &Ctx, source_ts: u64) -> Result<()> {
+    if !ctx.engine.loops.mine_empty_blocks {
+        return Ok(());
+    }
+    let head = ctx.anvil_v.block_number().await?;
+    let last_ts = ctx
+        .anvil_v
+        .block_by_number(head, diorama_anvil::Txs::Hashes)
+        .await?
+        .header
+        .timestamp;
+    let ts = next_block_timestamp(source_ts, last_ts);
+    if let Err(e) = ctx.anvil_v.anvil_set_next_block_timestamp(ts).await {
+        tracing::warn!(error = %e, ts, "window block timestamp set failed; mining with anvil's own clock");
+    }
+    if let Err(e) = ctx.anvil_v.anvil_mine(1).await {
+        tracing::warn!(error = %e, "window block mine failed; the next window retries");
+    }
     Ok(())
+}
+
+/// The mined block's timestamp: the source's clock, never behind the fork's
+/// own. Pure so the monotonicity rule is pinned by test.
+fn next_block_timestamp(source_ts: u64, last_ts: u64) -> u64 {
+    source_ts.max(last_ts.saturating_add(1))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::catchup_window;
+    use super::{catchup_window, next_block_timestamp};
 
     /// The catch-up window: one bounded window per pass — the policy's limit
     /// caps the width, never the following itself (the latching pause it
@@ -445,5 +488,21 @@ mod tests {
         assert_eq!(catchup_window(100, 132, Some(32)), 132);
         assert_eq!(catchup_window(100, 10_000, Some(300)), 400);
         assert_eq!(catchup_window(100, 10_000, None), 10_000);
+    }
+
+    /// The window block's timestamp tracks the source's clock, but never
+    /// behind the fork's own: monotonicity beats alignment (anvil refuses a
+    /// backwards set and mines with its own default instead, measured).
+    #[test]
+    fn the_window_block_timestamp_is_the_source_clock_clamped_monotonic() {
+        // The steady line: the source is ahead, the fork follows it.
+        assert_eq!(next_block_timestamp(2_000, 1_000), 2_000);
+        // A pin-era offset (the fork's clock ran ahead of the source's):
+        // monotonicity wins, the offset decays one block at a time.
+        assert_eq!(next_block_timestamp(2_000, 3_600), 3_601);
+        // Exactly equal: still +1, never a duplicate second.
+        assert_eq!(next_block_timestamp(2_000, 2_000), 2_001);
+        // A source timestamp at u64::MAX cannot overflow the clamp.
+        assert_eq!(next_block_timestamp(u64::MAX, u64::MAX), u64::MAX);
     }
 }

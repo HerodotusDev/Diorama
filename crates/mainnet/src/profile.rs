@@ -118,6 +118,7 @@ mod tests {
             chunk_size: 100,
             prepend_rounds: 3,
             status_log_interval_ms: 60_000,
+            mine_empty_blocks: false,
         };
         let p = policies(&loops);
         assert_eq!(p.clock, ClockPolicy::AlignToSource);

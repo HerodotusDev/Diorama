@@ -58,6 +58,12 @@ max_gap_blocks = 300
 prepend_rounds = 3
 # The follow-status heartbeat (one line per interval).
 status_log_interval_ms = 60000
+# Mine one empty block per composed window, stamped with the window's
+# source-end timestamp (clamped monotonic): the mirror's head and clock then
+# track the source's own, so an idle deployment's freshness consumers (head
+# age, on-chain feed staleness) stay healthy without waiting for a tx. The
+# venue instance keeps the default; a pinned demo sets false.
+mine_empty_blocks = true
 
 [services.engine.verifier]
 # Each applied block is verified against the source: the BAL carries the

@@ -71,8 +71,23 @@ base_slot = "0x3"
 topic_index = 2
 
 [[services.engine.closures.fixed]]
+# The RedStone relayer carries every feed's last round in its own storage
+# (the feeds delegatecall getLastUpdateDetails into it), and HyperEVM's
+# system txs update it invisibly to tx lists AND block access lists — so
+# the slots must be declared here or they never compose (measured
+# 2026-11-16: the undeclared slots froze at the Nov 13 pin era and
+# latestRoundData reverted once the staging clock ran past the frozen
+# updatedAt). One slot per feed the staging chainlink registry serves;
+# slots found by tracing getLastUpdateDetails's SLOADs per feed. The
+# WSTHYPE feed (0xd2b2…) delegates to the WHYPE feed's slot and needs no
+# row of its own.
 contract = "0xe4aE88743c3834d0c492eAbC47384c84BcADC6a6"
-slots = ["0x3e54e5ae16d7bdb0bade122edbe34ab784fcd78c6d535e29aff3bc7d357e7586"]
+slots = [
+  "0x3e54e5ae16d7bdb0bade122edbe34ab784fcd78c6d535e29aff3bc7d357e7586",
+  "0xb692dfd2cff8d1b91937faa2a326701955105f5602cc6a3241129c30300e44f1",
+  "0x7aada5bbdeff4f9b7fc0b59d57da790f37a4be5cb19d9d13155fc5338a92c8f0",
+  "0x7f593fea103ca6afe49df27814c60e9f233f40d08087af9391cecb61fb555f61",
+]
 
 [services.venue_sim]
 markets = ["BTC", "ETH", "HYPE", "SOL"]
@@ -112,6 +127,28 @@ note = "wstHYPE: the staked gas token"
 [[watchlist]]
 address = "0xe4aE88743c3834d0c492eAbC47384c84BcADC6a6"
 note = "RedStone multi-feed adapter: the HYPE/wstHYPE price words (see the fixed closure above)"
+
+# 2026-11-16: the four RedStone price feeds the staging chainlink registry
+# serves (deploy-staging's FEED_LABELS). The relayer's closure carries their
+# round slots; the feed contracts themselves are watched so their own state
+# (round ids, phase progress) follows the source too. The WSTHYPE feed is
+# catalog-dropped (owner decision D3) but stays registry-served, so it keeps
+# its row.
+[[watchlist]]
+address = "0xb60224122830FD6cF5119f548477a190310D2c94"
+note = "RedStone Price Feed WHYPE (999): the indexer's chainlink poller reads this directly"
+
+[[watchlist]]
+address = "0xd2b2bBCe4ec87B31277edA5AF7Aa585B2f7E4649"
+note = "RedStone Price Feed WSTHYPE (999): delegates to the WHYPE feed's slot"
+
+[[watchlist]]
+address = "0xEdC6287D3D41b322AF600317628D7E226DD3add4"
+note = "RedStone Price Feed USDC (999)"
+
+[[watchlist]]
+address = "0x61376924BAbe5A0Fa982FfF2c8be8013Be3D6Bb6"
+note = "RedStone Price Feed USDT (999)"
 
 # Extra client-facing env values rendered by
 # `diorama-config export-env --section client`. The generated endpoint block

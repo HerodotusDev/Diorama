@@ -359,6 +359,20 @@ pub struct LoopsSection {
     pub prepend_rounds: u8,
     /// Follow-status log cadence (the mirror's heartbeat).
     pub status_log_interval_ms: u64,
+    /// Mine one empty block per composed window, carrying the window's
+    /// source-end timestamp. This is the mirror's idle-liveness rule: without
+    /// it the chain head (and its clock) only advances when a devnet tx
+    /// lands, so an idle deployment's freshness consumers (head age, feed
+    /// staleness against `block.timestamp`) all degrade. The timestamp
+    /// tracks the source's own clock, clamped monotonic. Set false for a
+    /// pinned deployment that must keep its head frozen.
+    #[serde(default = "default_mine_empty_blocks")]
+    pub mine_empty_blocks: bool,
+}
+
+/// The mirror stays alive when idle: the default. A pinned demo opts out.
+fn default_mine_empty_blocks() -> bool {
+    true
 }
 
 impl LoopsSection {

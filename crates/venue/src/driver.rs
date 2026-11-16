@@ -213,8 +213,9 @@ async fn pass(ctx: &Ctx) -> Result<Pass> {
 
 /// V's block production (T's is the applier's), best-effort: the pool is
 /// mined once per pass, so the bridge's boot txs and relay mints land without
-/// waiting for a harness mine; an idle chain stays static. A fault is a warn —
-/// the next pass retries.
+/// waiting for a harness mine. Idle-liveness is the follow's job (one window
+/// block per composed window, `mine_empty_blocks`); this loop only drains the
+/// pool. A fault is a warn — the next pass retries.
 async fn mine_pending_best_effort(ctx: &Ctx) {
     if let Err(e) = mine_pending(ctx).await {
         tracing::warn!(error = %e, "pending-tx mine failed; the next pass retries");
@@ -280,13 +281,15 @@ async fn scan_and_advance(ctx: &Ctx, cursor: Option<&ChainCursor>, head: u64) ->
 }
 
 /// V's block production: T's producer is the applier (one block per applied
-/// parent block), while V's source windows land as cheatcode writes (no block
-/// per window) — so the engine mines a non-empty pool,
-/// once per pass. Without it the bridge's boot txs (the attester install, the
-/// wrapper deploy) and its relay mints sit in the pool forever on a chain
-/// nobody else mines (measured: `attester installation failed: … was not
-/// mined within 120s`); with it an idle chain stays static and the harness's
-/// own explicit mines are just extra (empty) blocks.
+/// parent block), while V's source windows land as cheatcode writes (no
+/// block per window) — so the engine mines a non-empty pool, once per pass.
+/// Without it the bridge's boot txs (the attester install, the wrapper
+/// deploy) and its relay mints sit in the pool forever on a chain nobody
+/// else mines (measured: `attester installation failed: … was not mined
+/// within 120s`). Idle-liveness is the follow's rule since the window-block
+/// policy (`mine_empty_blocks`): this drain only decides WHEN a pool tx
+/// lands relative to the window blocks, and the harness's own explicit
+/// mines are just extra (empty) blocks.
 async fn mine_pending(ctx: &Ctx) -> Result<()> {
     if ctx.mirror.policies().mine != MinePolicy::PoolDrain {
         return Ok(());
