@@ -270,7 +270,7 @@ fn every_surface_serves_the_same_liquidation_px() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let feed = Arc::new(crate::feed::MarketFeed::memory(vec!["ETH".to_string()]));
+    let feed = Arc::new(crate::feed::MarketFeed::memory());
     let now = crate::now_ms();
     feed.put_meta(crate::sim::meta_with("ETH", 10), now);
     feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 20)]), now);

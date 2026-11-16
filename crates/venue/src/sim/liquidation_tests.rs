@@ -50,11 +50,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let feed = MarketFeed::memory(vec![
-            "ETH".to_string(),
-            "BTC".to_string(),
-            "xyz:TSLA".to_string(),
-        ]);
+        let feed = MarketFeed::memory();
         let now = crate::now_ms();
         let mut default = meta_of(&[("ETH", 10), ("BTC", 20)]);
         with_table(&mut default, "BTC", 40, &[("0", 20), ("10000", 10)]);
