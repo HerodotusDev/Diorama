@@ -7,6 +7,7 @@
 //! mapping keeps the taxonomy's meaning on the wire: control refusals are
 //! 4xx, a warming market plane is 503, a venue fault is 502.
 pub(crate) mod control;
+pub(crate) mod cors;
 pub(crate) mod exchange;
 pub(crate) mod info;
 pub(crate) mod ws;
@@ -155,6 +156,10 @@ pub fn info_router(state: Arc<ApiState>) -> Router {
         .route("/exchange", axum::routing::post(exchange::exchange))
         // The venue's websocket lane ("info + WS" on this port).
         .route("/ws", axum::routing::get(ws::ws))
+        // Browsers call this port straight from the page (a JSON POST, so a
+        // preflight first): the info surface answers any origin, like the
+        // venue it mirrors. The control router stays closed to browsers.
+        .layer(axum::middleware::from_fn(cors::cors))
         .with_state(state)
 }
 
