@@ -1661,9 +1661,11 @@ mod tests {
             &format!(r#""destination":"{other:#x}","token":"{TOKEN}","amount":"25","time":{n}"#),
         );
         ok(&post(&state, signed(&me_key, &action, n)).await);
+        // `other` is a new account: the sender also pays the 1 USDC
+        // activation fee, the recipient gets the full 25.
         assert_eq!(
             (spot_usdc(&state, me), spot_usdc(&state, other)),
-            (dec("705"), dec("25"))
+            (dec("704"), dec("25"))
         );
         let n = nonce + 7;
         let action = user_signed(

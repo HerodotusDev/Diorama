@@ -26,8 +26,9 @@ pub(crate) mod system;
 
 use crate::error::{Error, Result};
 use crate::feed::MarketFeed;
+use crate::sim::fees::RowKind;
 use crate::sim::order::CancelSpeed;
-use crate::sim::transfer::{AssetSend, Wallet};
+use crate::sim::transfer::{AssetSend, CoreToEvm, Wallet};
 use crate::sim::{Applied, ClassTransfer, Direction};
 use crate::sim::{Sim, TokenRef};
 use crate::wire::UserAbstraction;
@@ -324,13 +325,14 @@ impl Bridge {
             }
             return Ok(());
         };
-        self.sim.credit_spot(
+        self.sim.credit_evm_deposit(
             credit.sender,
             TokenRef {
                 index: credit.token.index,
                 coin: &credit.token.name,
             },
             credit.amount,
+            &self.feed,
         )?;
         self.metrics.inc_credits();
         tracing::info!(
@@ -356,13 +358,14 @@ impl Bridge {
         let Some(credit) = system::hype_received_of(data, token) else {
             return Ok(());
         };
-        self.sim.credit_spot(
+        self.sim.credit_evm_deposit(
             credit.sender,
             TokenRef {
                 index: token.index,
                 coin: &token.name,
             },
             credit.amount,
+            &self.feed,
         )?;
         self.metrics.inc_credits();
         tracing::info!(from = %credit.sender, amount = %credit.amount, "bridge: EVM→Core HYPE credit");
@@ -387,7 +390,7 @@ impl Bridge {
                 wei,
             } => {
                 if let Some(info) = self.token_info(tokens, token) {
-                    self.spot_send(caller, destination, info, wei)?;
+                    self.spot_send((caller, destination), info, wei).await?;
                 }
             }
             CoreAction::SendAsset {
@@ -572,11 +575,12 @@ impl Bridge {
         None
     }
 
-    /// `spotSend`: spot→spot inside Core.
-    fn spot_send(
+    /// `spotSend`: spot→spot inside Core, or Core→EVM when the destination is
+    /// the token's system address (the real venue treats both spot sends and
+    /// `sendAsset` to a system address as the bridge leg).
+    async fn spot_send(
         &self,
-        caller: Address,
-        destination: Address,
+        (caller, destination): (Address, Address),
         info: &TokenInfo,
         wei: u64,
     ) -> Result<()> {
@@ -585,18 +589,23 @@ impl Bridge {
             tracing::warn!(wei, "bridge: spotSend amount is not representable; refused");
             return Ok(());
         };
+        if is_system_destination(destination, info) {
+            return self
+                .core_to_evm((caller, destination), info, amount, RowKind::SpotTransfer)
+                .await;
+        }
         let applied = self.sim.spot_send(
-            caller,
-            destination,
+            (caller, destination),
             TokenRef {
                 index: info.index,
                 coin: &info.name,
             },
             amount,
+            (RowKind::SpotTransfer, &self.feed),
         )?;
         if matches!(applied, Applied::Refused) {
             self.metrics.inc_refusals();
-            tracing::warn!(account = %caller, amount = %amount, "bridge: spot send refused (insufficient balance)");
+            tracing::warn!(account = %caller, amount = %amount, "bridge: spot send refused");
         }
         Ok(())
     }
@@ -671,40 +680,63 @@ impl Bridge {
             // A perp dex is an endpoint: the move is between ledgers (the
             // token-checked, margin-bounded `sendAsset` of the sim), never to
             // the EVM side.
-            if destination == system::system_address(u64::from(info.index)) {
+            if is_system_destination(destination, info) {
                 self.metrics.inc_refusals();
                 tracing::warn!(account = %caller, "bridge: sendAsset to a system address from a perp dex refused (Core→EVM leaves the spot wallet only)");
                 return Ok(());
             }
             return self.send_between_wallets((caller, destination), info, amount, route);
         }
-        if destination == system::system_address(u64::from(info.index)) {
-            if !self.core_to_evm_allowed(caller, info, amount)? {
-                return Ok(());
-            }
-            // Core→EVM: debit the caller, then complete on the EVM side.
-            let Some(_after) = self.sim.try_debit_spot(caller, info.index, amount)? else {
-                self.metrics.inc_refusals();
-                tracing::warn!(account = %caller, amount = %amount, "bridge: Core→EVM refused (insufficient balance)");
-                return Ok(());
-            };
-            self.complete_core_to_evm(&caller, info, amount).await?;
-        } else {
-            let applied = self.sim.spot_send(
-                caller,
-                destination,
-                TokenRef {
-                    index: info.index,
-                    coin: &info.name,
-                },
-                amount,
-            )?;
-            if matches!(applied, Applied::Refused) {
-                self.metrics.inc_refusals();
-                tracing::warn!(account = %caller, amount = %amount, "bridge: sendAsset refused (insufficient balance)");
-            }
+        if is_system_destination(destination, info) {
+            return self
+                .core_to_evm((caller, destination), info, amount, RowKind::Send)
+                .await;
+        }
+        let applied = self.sim.spot_send(
+            (caller, destination),
+            TokenRef {
+                index: info.index,
+                coin: &info.name,
+            },
+            amount,
+            (RowKind::Send, &self.feed),
+        )?;
+        if matches!(applied, Applied::Refused) {
+            self.metrics.inc_refusals();
+            tracing::warn!(account = %caller, amount = %amount, "bridge: sendAsset refused");
         }
         Ok(())
+    }
+
+    /// Core→EVM: the sim debits the amount, the HyperEVM gas and any owed
+    /// activation from the spot wallet (a refusal moves nothing), then the
+    /// transfer completes on the EVM side.
+    async fn core_to_evm(
+        &self,
+        (caller, destination): (Address, Address),
+        info: &TokenInfo,
+        amount: Decimal,
+        kind: RowKind,
+    ) -> Result<()> {
+        let debit = CoreToEvm {
+            from: caller,
+            destination,
+            token: TokenRef {
+                index: info.index,
+                coin: &info.name,
+            },
+            amount,
+            kind,
+        };
+        if matches!(
+            self.sim.debit_core_to_evm(&debit, &self.feed)?,
+            Applied::Refused
+        ) {
+            self.metrics.inc_refusals();
+            tracing::warn!(account = %caller, amount = %amount, "bridge: Core→EVM refused");
+            return Ok(());
+        }
+        self.complete_core_to_evm(&caller, info, amount).await
     }
 
     /// A `sendAsset` with a perp dex at either end: the sim moves the token
@@ -740,6 +772,7 @@ impl Bridge {
             amount,
             source,
             destination: target,
+            kind: RowKind::Send,
         };
         match self.sim.send_asset(&send, &self.feed) {
             Ok(()) => {
@@ -764,55 +797,10 @@ impl Bridge {
         self.feed.dex_name_at(dex).map(Wallet::Perp)
     }
 
-    /// The Core→EVM transfer bound: the venue's rule bounds the move by the
-    /// account's **spot available after maintenance**, not by the spot balance
-    /// and not by the perp class's `withdrawable`. A control-patched or
-    /// insolvent account can still hold spot cash while its equity is below
-    /// the transfer floor; 4a withdrew 0.55 with `withdrawable=0` one block
-    /// before its deficit deposit. But a unified account's spot principal is a
-    /// **separate ledger** from the perp wallet (the live `cf16` recovery:
-    /// 240.510247 spot against 0.000000455 perp), so the perp figure is the
-    /// wrong bound for a spot→EVM bridge — it refused the whole recovery leg.
-    /// The collateral token is bounded by `tokenToAvailableAfterMaintenance`;
-    /// other spot tokens are holdings, bounded by the balance alone.
-    fn core_to_evm_allowed(
-        &self,
-        caller: Address,
-        info: &TokenInfo,
-        amount: Decimal,
-    ) -> Result<bool> {
-        // Any perp dex's collateral token backs margin: USDC, USDH, ... A
-        // unified account's positions on every dex margining against it keep
-        // that much of the spot balance (pooled across the dexes sharing the
-        // token); other tokens are holdings.
-        if !self.feed.is_collateral_token(info.index) {
-            return Ok(true);
-        }
-        let Some(account) = self.sim.account(caller)? else {
-            self.metrics.inc_refusals();
-            tracing::warn!(account = %caller, amount = %amount, "bridge: Core→EVM refused (unknown account)");
-            return Ok(false);
-        };
-        if let Some(bound) =
-            crate::sim::account::spot_bridge_bound(&account, &self.feed, info.index)?
-        {
-            if amount > bound {
-                self.metrics.inc_refusals();
-                tracing::warn!(
-                    account = %caller,
-                    amount = %amount,
-                    available = %bound,
-                    "bridge: Core→EVM refused (amount exceeds spot available after maintenance)"
-                );
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     /// The completion tx: `transfer(caller, amount)` on the linked ERC20 from
-    /// the system address (auto-impersonate). It lands with the devnet's next
-    /// mined block, like the real chain's system tx.
+    /// the system address (auto-impersonate), or for HYPE the native value
+    /// from `0x2222…2`. It lands with the devnet's next mined block, like the
+    /// real chain's system tx.
     async fn complete_core_to_evm(
         &self,
         recipient: &Address,
@@ -822,26 +810,47 @@ impl Bridge {
         let Some(evm) = info.evm else {
             return Err(system::no_evm_link(info));
         };
-        let evm_decimals = info.wei_decimals as i32 + evm.extra_decimals;
+        let native = info.name == crate::sim::fees::GAS_TOKEN;
+        let evm_decimals = if native {
+            system::HYPE_EVM_DECIMALS
+        } else {
+            info.wei_decimals as i32 + evm.extra_decimals
+        };
         let Some(value) = system::human_to_evm(amount, evm_decimals) else {
             self.metrics.inc_refusals();
             tracing::warn!(amount = %amount, "bridge: Core→EVM amount is not representable in EVM wei; refused");
             return Ok(());
         };
-        let from = system::system_address(u64::from(info.index));
+        let from = if native {
+            system::HYPE_SYSTEM
+        } else {
+            system::system_address(u64::from(info.index))
+        };
         // The system address pays gas on V (the real chain's system txs do
         // not); fund it once, at the deployment's declared stipend, so the
-        // pool's balance check passes. A balance-read fault propagates: it
-        // must not be read as "empty" and funded over a broken RPC.
-        if self.anvil_v.balance_at(from, 0).await?.is_zero() {
-            self.anvil_v
-                .anvil_set_balance(from, self.system_gas_stipend)
-                .await?;
+        // pool's balance check passes (plus the value a native transfer
+        // moves). A balance-read fault propagates: it must not be read as
+        // "empty" and funded over a broken RPC.
+        let have = self.anvil_v.balance_at(from, 0).await?;
+        let need = if native {
+            self.system_gas_stipend.saturating_add(value)
+        } else {
+            self.system_gas_stipend
+        };
+        if (native && have < need) || have.is_zero() {
+            self.anvil_v.anvil_set_balance(from, need.max(have)).await?;
         }
-        let tx = TransactionRequest::default()
-            .from(from)
-            .to(evm.address)
-            .input(system::transfer_calldata(*recipient, value).into());
+        let tx = if native {
+            TransactionRequest::default()
+                .from(from)
+                .to(*recipient)
+                .value(value)
+        } else {
+            TransactionRequest::default()
+                .from(from)
+                .to(evm.address)
+                .input(system::transfer_calldata(*recipient, value).into())
+        };
         let hash = self.anvil_v.send_transaction(tx).await?;
         self.metrics.inc_completions();
         tracing::info!(
@@ -853,6 +862,13 @@ impl Bridge {
         );
         Ok(())
     }
+}
+
+/// Whether `destination` is `info`'s system address: the `0x20…` address
+/// carrying the token index, or `0x2222…2` for HYPE.
+fn is_system_destination(destination: Address, info: &TokenInfo) -> bool {
+    destination == system::system_address(u64::from(info.index))
+        || (info.name == crate::sim::fees::GAS_TOKEN && destination == system::HYPE_SYSTEM)
 }
 
 /// Action 7's `ntl` as the human decimal the sim keeps: the *perp class's*

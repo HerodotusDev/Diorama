@@ -191,6 +191,16 @@ pub(crate) enum InfoRequest {
         #[serde(rename = "endTime", default)]
         end_time: Option<u64>,
     },
+    /// The account's transfer ledger (`startTime` is optional on the real
+    /// venue: absent reads as the beginning).
+    #[serde(rename = "userNonFundingLedgerUpdates")]
+    UserNonFundingLedgerUpdates {
+        user: Address,
+        #[serde(rename = "startTime", default)]
+        start_time: u64,
+        #[serde(rename = "endTime", default)]
+        end_time: Option<u64>,
+    },
     #[serde(rename = "maxBuilderFee")]
     MaxBuilderFee { user: Address, builder: Address },
     #[serde(rename = "preTransferCheck")]
@@ -292,6 +302,7 @@ impl InfoRequest {
             InfoRequest::CandleSnapshot { .. } => "candleSnapshot",
             InfoRequest::UserFills { .. } => "userFills",
             InfoRequest::UserFunding { .. } => "userFunding",
+            InfoRequest::UserNonFundingLedgerUpdates { .. } => "userNonFundingLedgerUpdates",
             InfoRequest::MaxBuilderFee { .. } => "maxBuilderFee",
             InfoRequest::PreTransferCheck { .. } => "preTransferCheck",
             InfoRequest::FrontendOpenOrders { .. } => "frontendOpenOrders",
@@ -1037,10 +1048,15 @@ mod tests {
             }
         ));
         let r: InfoRequest = serde_json::from_str(
-            r#"{"type":"userNonFundingLedgerUpdates","user":"0x0000000000000000000000000000000000000001"}"#,
+            r#"{"type":"userFees","user":"0x0000000000000000000000000000000000000001"}"#,
         )
         .unwrap();
         assert_eq!(r, InfoRequest::Unrouted);
+        let r: InfoRequest = serde_json::from_str(
+            r#"{"type":"userNonFundingLedgerUpdates","user":"0x0000000000000000000000000000000000000001"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.kind(), "userNonFundingLedgerUpdates");
         for (body, kind) in [
             (r#"{"type":"allPerpMetas"}"#, "allPerpMetas"),
             (

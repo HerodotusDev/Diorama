@@ -29,6 +29,7 @@ const ARTIFACT: &str = "sim state";
 pub(crate) mod account;
 #[cfg(test)]
 mod dex_tests;
+pub(crate) mod fees;
 pub(crate) mod funding;
 pub(crate) mod ledger;
 pub(crate) mod metrics;
@@ -132,6 +133,25 @@ pub(crate) struct SimState {
     /// The previous tick's mark per coin (ADL closes at the previous mark).
     #[serde(default)]
     pub prev_marks: std::collections::BTreeMap<String, Decimal>,
+    /// The addresses that exist on the venue (they received or held
+    /// something): a send to any other pays the activation fee once. Every
+    /// account a state file already carries is folded in on load
+    /// ([`SimState::migrate`]), so an older file never bills an existing
+    /// account.
+    #[serde(default)]
+    pub activated: std::collections::BTreeSet<Address>,
+    /// Accounts a deposit created: Circle's rule, the 1 USDC activation is
+    /// earmarked and charged on the account's first outbound transfer.
+    #[serde(default)]
+    pub activation_owed: std::collections::BTreeSet<Address>,
+    /// The transfer ledger per account (`userNonFundingLedgerUpdates` rows
+    /// the sim writes): history only, bounded, never read by the account math.
+    #[serde(default)]
+    pub transfer_ledger:
+        std::collections::BTreeMap<Address, std::collections::VecDeque<fees::LedgerUpdate>>,
+    /// The ledger rows' hash counter.
+    #[serde(default)]
+    pub next_ledger_id: u64,
 }
 
 impl SimState {
@@ -143,6 +163,10 @@ impl SimState {
         for account in self.accounts.values_mut() {
             account.migrate_legacy();
         }
+        // Every address a saved state carries exists: only the accounts
+        // created from now on can be new destinations.
+        let known: Vec<Address> = self.accounts.keys().copied().collect();
+        self.activated.extend(known);
     }
 }
 
@@ -604,7 +628,11 @@ impl Sim {
 
     // ---- the Core↔EVM bridge's effects -----------------------------------
 
-    /// EVM→Core: credit a spot token (creates the account on first touch).
+    /// Credit a spot token (creates the account on first touch): the tests'
+    /// funding helper. The bridge's EVM→Core credit is
+    /// [`Sim::credit_evm_deposit`] (it owes the activation and writes the
+    /// ledger row).
+    #[cfg(test)]
     pub(crate) fn credit_spot(
         &self,
         address: Address,
@@ -619,35 +647,6 @@ impl Sim {
             account::credit_entry(account, token, amount, "spot credit")?;
             Ok(())
         })
-    }
-
-    /// Core→EVM / spot send: debit the spot balance; `None` when the account
-    /// or the balance is short (the bridge counts the refusal — a system
-    /// transfer never goes negative).
-    pub fn try_debit_spot(
-        &self,
-        address: Address,
-        token: u32,
-        amount: Decimal,
-    ) -> Result<Option<Decimal>> {
-        let debited = self.with_state(|state| {
-            let Some(account) = state.accounts.get_mut(&address) else {
-                return Ok(None);
-            };
-            let Some(entry) = account.spot.get_mut(&token) else {
-                return Ok(None);
-            };
-            if entry.total < amount {
-                return Ok(None);
-            }
-            entry.total = account::sub(entry.total, amount, "spot debit")?;
-            Ok(Some(entry.total))
-        })?;
-        let Some(after) = debited else {
-            return Ok(None);
-        };
-        self.touch();
-        Ok(Some(after))
     }
 
     /// USD class transfer (CoreWriter action 7): spot USDC ↔ perp wallet.
@@ -710,38 +709,19 @@ impl Sim {
             Ok(Applied::Applied)
         })?;
         if matches!(applied, Applied::Applied) {
+            let delta = serde_json::json!({
+                "type": "accountClassTransfer",
+                "usdc": fees::real_text(transfer.amount),
+                "toPerp": transfer.direction == Direction::ToPerp,
+            });
+            self.with_state(|state| {
+                state.activated.insert(address);
+                state.record_ledger(&[address], clock, &delta);
+                Ok(())
+            })?;
             self.touch();
         }
         Ok(applied)
-    }
-
-    /// Core spot send: debit the sender, credit the recipient. `Refused` when
-    /// the sender is short.
-    pub(crate) fn spot_send(
-        &self,
-        from: Address,
-        to: Address,
-        token: TokenRef<'_>,
-        amount: Decimal,
-    ) -> Result<Applied> {
-        let debited = self.with_state(|state| {
-            let Some(sender) = state.accounts.get_mut(&from) else {
-                return Ok(Applied::Refused);
-            };
-            let Some(entry) = sender.spot.get_mut(&token.index) else {
-                return Ok(Applied::Refused);
-            };
-            if entry.total < amount {
-                return Ok(Applied::Refused);
-            }
-            entry.total = account::sub(entry.total, amount, "spot send")?;
-            Ok(Applied::Applied)
-        })?;
-        if matches!(debited, Applied::Refused) {
-            return Ok(Applied::Refused);
-        }
-        self.credit_spot(to, token, amount)?;
-        Ok(Applied::Applied)
     }
 
     /// Record an API wallet (CoreWriter action 9).
@@ -854,6 +834,9 @@ impl Sim {
             state.liq_cooldown_until.clear();
             state.waterfall_retry_after.clear();
             state.prev_marks.clear();
+            state.activated.clear();
+            state.activation_owed.clear();
+            state.transfer_ledger.clear();
             state.next_oid = 0;
             state.clock_offset_ms = 0;
             state.epoch += 1;
@@ -1382,16 +1365,15 @@ mod tests {
             )
             .unwrap();
             sim.spot_send(
-                a,
-                Address::repeat_byte(0xbb),
+                (a, Address::repeat_byte(0xbb)),
                 TokenRef {
                     index: 0,
                     coin: "USDC",
                 },
                 Decimal::ONE,
+                (fees::RowKind::SpotTransfer, &feed),
             )
             .unwrap();
-            let _ = &feed;
             tx.send(()).unwrap();
         });
         // 20 s: a deadlock never answers, so the budget only has to outlast a
