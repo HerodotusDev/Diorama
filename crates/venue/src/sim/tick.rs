@@ -24,7 +24,7 @@ impl Sim {
     /// named simplification; no fee is charged (a settlement is not a trade).
     ///
     /// Every dex's delisted coins settle (a builder dex's `xyz:TSLA` as much
-    /// as the default dex's), not only the configured markets.
+    /// as the default dex's).
     fn settle_delisted(&self, feed: &MarketFeed) -> Result<()> {
         for coin in feed.delisted_coins() {
             let Some(oracle) = feed.oracle(&coin) else {
@@ -363,7 +363,7 @@ impl Sim {
     /// Record the marks the ADL step reads as "the previous mark".
     pub(super) fn record_marks(&self, feed: &MarketFeed) -> Result<()> {
         self.with_state(|st| {
-            // Every dex's coins, not only the configured markets: a builder
+            // Every dex's coins: a builder
             // dex's ADL close prices from the same previous mark.
             for coin in feed.all_coins() {
                 if let Some(mark) = feed.mark(&coin) {

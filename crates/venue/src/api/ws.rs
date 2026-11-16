@@ -7,7 +7,9 @@
 //! Protocol (`feed::ws`'s vocabulary, the client's own): the client subscribes
 //! with `{"method":"subscribe","subscription":{"type":…}}`, the server acks
 //! with a `subscriptionResponse` frame and pushes `{"channel":…,"data":…}` on
-//! each configured account-tick while the subscription is live; `{"method":"ping"}` answers
+//! each tick while the subscription is live (the market channels at the
+//! market push interval, about the venue's own cadence; the account channels
+//! at the account automaton's tick); `{"method":"ping"}` answers
 //! `{"channel":"pong"}`. An unsupported channel (or an unknown coin) is
 //! answered with the venue's `error` frame — never silence.
 //!
@@ -24,6 +26,7 @@ use super::candles::CandleSub;
 use super::ws_codec::{self, FastCtx};
 use super::ApiState;
 use crate::feed::dex::ALL_DEXS;
+use crate::feed::relay::Lease;
 use crate::sim::Sim;
 use crate::wire::{
     ActiveAssetData, AllMids, AssetCtx, ClearinghouseState, L2Book, MarginSummary,
@@ -320,26 +323,56 @@ enum Mem {
 pub(crate) struct Live {
     sub: Subscription,
     mem: Mem,
+    /// The interest this subscription holds in its coin: the upstream socket
+    /// carries the coin's streams while it lives (released on unsubscribe or
+    /// disconnect, when the subscription is dropped).
+    _lease: Option<Lease>,
 }
 
-/// One connection: read requests, push the subscribed channels on the 1 Hz
-/// tick (the automaton's own cadence), and push a subscription's first frame
-/// right after its ack (the real venue does).
+/// Whether a subscription is a market-data channel (pushed at the market
+/// interval) rather than an account or candle channel (pushed at the account
+/// automaton's tick).
+fn is_market_channel(sub: &Subscription) -> bool {
+    matches!(
+        sub,
+        Subscription::AllMids { .. }
+            | Subscription::ActiveAssetCtx { .. }
+            | Subscription::L2Book { .. }
+            | Subscription::L2 { .. }
+            | Subscription::FastAssetCtxs
+            | Subscription::Pac
+    )
+}
+
+/// The coin a subscription needs the upstream socket to carry, if any.
+fn coin_of(sub: &Subscription) -> Option<&str> {
+    match sub {
+        Subscription::ActiveAssetCtx { coin }
+        | Subscription::L2Book { coin, .. }
+        | Subscription::ActiveAssetData { coin, .. } => Some(coin),
+        Subscription::L2 { c, .. } => Some(c),
+        _ => None,
+    }
+}
+
+/// One connection: read requests, push the market channels on the market
+/// interval and the account channels on the account automaton's tick, and
+/// push a subscription's first frame right after its ack (the real venue
+/// does).
 async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
     let mut subs: Vec<Live> = Vec::new();
     let mut tick = tokio::time::interval(state.push_interval);
+    let mut market_tick = tokio::time::interval(state.market_push_interval);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                // One clock read per tick: every channel in this tick serves
-                // the same instant (a scripted book is stamped with it).
-                let now = crate::now_ms();
-                for live in &mut subs {
-                    for frame in pushes(live, &state, now) {
-                        if socket.send(Message::Text(frame.into())).await.is_err() {
-                            return;
-                        }
-                    }
+                if !push_channels(&mut socket, &mut subs, &state, false).await {
+                    return;
+                }
+            }
+            _ = market_tick.tick() => {
+                if !push_channels(&mut socket, &mut subs, &state, true).await {
+                    return;
                 }
             }
             msg = socket.recv() => {
@@ -368,6 +401,30 @@ async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
             }
         }
     }
+}
+
+/// Push one tick's frames for the market channels (`market`) or for every
+/// other channel. One clock read per tick: every channel in it serves the
+/// same instant (a scripted book is stamped with it). `false` when the socket
+/// is gone.
+async fn push_channels(
+    socket: &mut WebSocket,
+    subs: &mut [Live],
+    state: &ApiState,
+    market: bool,
+) -> bool {
+    let now = crate::now_ms();
+    for live in subs
+        .iter_mut()
+        .filter(|live| is_market_channel(&live.sub) == market)
+    {
+        for frame in pushes(live, state, now) {
+            if socket.send(Message::Text(frame.into())).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The venue's answer to a request it cannot parse: the request text echoed.
@@ -408,9 +465,13 @@ pub(super) fn request_reply(text: &str, subs: &mut Vec<Live>, state: &ApiState) 
                 Err(Refusal::Named(reason)) => return WsPush::Error { data: reason },
                 Err(Refusal::Silent) => return WsPush::Silent,
             };
+            // The coin's streams stay on the upstream socket while this
+            // subscription lives (a coin no dex lists holds no lease).
+            let lease = coin_of(&subscription).and_then(|coin| state.feed.lease_coin(coin));
             subs.push(Live {
                 sub: subscription.clone(),
                 mem,
+                _lease: lease,
             });
             WsPush::SubscriptionResponse {
                 data: SubscriptionAck {
@@ -472,8 +533,9 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
             })
         };
     let has_book = |coin: &str| {
-        // A coin outside the configured markets that a dex lists gets its book
-        // on demand (and stays wanted while it is subscribed).
+        // Every coin a dex lists is a market: its book is the relayed live
+        // one (the subscription's lease keeps the stream up), fetched once
+        // from the venue only when none has landed yet.
         if feed.book(coin, crate::now_ms()).is_some() || feed.warm_book(coin) {
             Ok(())
         } else {
@@ -484,7 +546,13 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
     };
     match sub {
         Subscription::AllMids { .. } => Ok(Mem::Whole),
-        Subscription::ActiveAssetCtx { coin } if feed.mark(coin).is_some() => Ok(Mem::Whole),
+        // A listed coin whose context has not landed yet is served as soon as
+        // it does (the push retries each tick); an unlisted coin is invalid.
+        Subscription::ActiveAssetCtx { coin }
+            if feed.mark(coin).is_some() || feed.meta_for_coin(coin).is_some() =>
+        {
+            Ok(Mem::Whole)
+        }
         Subscription::ActiveAssetCtx { .. } => Err(Refusal::Invalid),
         Subscription::L2Book {
             coin,
@@ -1084,7 +1152,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one frame-by-frame round-trip table: splitting it would hide the shape mapping
     fn pushes_round_trip_through_the_client_parser() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
@@ -1204,7 +1272,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one subscription-lifecycle table: splitting it would hide the ack/error ordering
     fn the_ws_acks_unsubscribes_and_answers_unserved_frames_with_an_error() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
         let state = api_state(feed.clone());
@@ -1334,7 +1402,7 @@ mod tests {
     /// consumption shows in the served size (the same read `/info` serves).
     #[test]
     fn l2_book_push_is_the_composed_book() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_book(test_book("BTC", "100"), 1_000);
         let state = api_state(feed.clone());
         let sub = book_sub("BTC");
@@ -1419,7 +1487,7 @@ mod tests {
     /// fill from the server's pushes (mark from `activeAssetCtx`).
     #[tokio::test]
     async fn ws_client_fills_its_cache_from_the_server() {
-        let server_feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let server_feed = Arc::new(MarketFeed::memory());
         server_feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         let state = api_state(server_feed);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1430,7 +1498,9 @@ mod tests {
                 .unwrap();
         });
 
-        let client_feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let client_feed = Arc::new(MarketFeed::memory());
+        // The client subscribes the contexts of the coins its registry lists.
+        client_feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         let ws_pool = diorama_anvil::EndpointPool::new(
             &[format!("ws://{addr}/ws")],
             diorama_anvil::Scheme::Ws,
@@ -1439,7 +1509,7 @@ mod tests {
         .unwrap();
         let client = crate::feed::ws::WsClient::new(client_feed.clone(), ws_pool);
         let task = tokio::spawn(client.run());
-        // 20 s: the server pushes on a 1 Hz tick; the budget only has to
+        // 20 s: the server pushes on its market tick; the budget only has to
         // outlast a loaded parallel test run (the same flake class as the
         // bridge's deadlock guard).
         let filled = 'wait: {
@@ -1468,7 +1538,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
@@ -1542,6 +1612,117 @@ mod tests {
         server.abort();
     }
 
+    /// A subscription holds the upstream relay's interest in its coin until
+    /// it unsubscribes (or the connection drops): two subscriptions on one
+    /// coin refcount, and the grace starts after the last one leaves.
+    #[test]
+    fn a_subscription_holds_a_lease_on_its_coin_until_it_leaves() {
+        use crate::feed::relay::GRACE_MS;
+        let feed = Arc::new(MarketFeed::memory());
+        feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
+        feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
+        feed.put_book(test_book("BTC", "100"), 1_000);
+        let state = api_state(feed.clone());
+        let mut subs: Vec<Live> = Vec::new();
+        let book = r#"{"type":"l2Book","coin":"BTC"}"#;
+        let ctx = r#"{"type":"activeAssetCtx","coin":"BTC"}"#;
+        let say = |method: &str, sub: &str, subs: &mut Vec<Live>| {
+            request_reply(
+                &format!(r#"{{"method":"{method}","subscription":{sub}}}"#),
+                subs,
+                &state,
+            )
+        };
+        let far = crate::now_ms() + 100 * GRACE_MS;
+        assert!(!feed.relay.is_wanted("BTC", far));
+        say("subscribe", book, &mut subs);
+        say("subscribe", ctx, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far), "leased by two");
+        say("unsubscribe", book, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far), "one lease left");
+        say("unsubscribe", ctx, &mut subs);
+        assert!(
+            !feed.relay.is_wanted("BTC", far),
+            "released: only the grace"
+        );
+        assert!(feed.relay.is_wanted("BTC", crate::now_ms() + 1_000));
+
+        // A dropped connection drops its subscriptions, and their leases.
+        say("subscribe", book, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far));
+        drop(subs);
+        assert!(!feed.relay.is_wanted("BTC", far));
+
+        // A coin no dex lists holds no lease (the venue would close the
+        // upstream socket on it).
+        let mut subs: Vec<Live> = Vec::new();
+        let reply = say("subscribe", r#"{"type":"l2Book","coin":"NOPE"}"#, &mut subs);
+        assert!(matches!(reply, WsPush::Error { .. }));
+        assert!(!feed.relay.is_wanted("NOPE", crate::now_ms()));
+    }
+
+    /// The market channels are pushed at the market interval (twice a
+    /// second), the account channels at the automaton's tick (once a second),
+    /// and the first frame still follows the ack at once.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one raw-socket session: the counting window is the test
+    async fn market_channels_push_twice_as_often_as_account_channels() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let feed = Arc::new(MarketFeed::memory());
+        feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
+        feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
+        feed.put_book(test_book("BTC", "100"), 1_000);
+        let state = api_state(feed.clone());
+        assert_eq!(state.push_interval, Duration::from_secs(1));
+        let user = Address::repeat_byte(0xaa);
+        fund_perp(&state, &feed, user);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::super::info_router(state))
+                .await
+                .unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        for sub in [
+            r#"{"type":"l2Book","coin":"BTC"}"#.to_string(),
+            format!(r#"{{"type":"webData3","user":"{user}"}}"#),
+        ] {
+            socket
+                .send(ClientMessage::Text(
+                    format!(r#"{{"method":"subscribe","subscription":{sub}}}"#).into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let (mut books, mut accounts) = (0u32, 0u32);
+        let started = tokio::time::Instant::now();
+        let window = Duration::from_millis(3_300);
+        while let Ok(Some(Ok(ClientMessage::Text(text)))) =
+            tokio::time::timeout(window.saturating_sub(started.elapsed()), socket.next()).await
+        {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match value["channel"].as_str() {
+                Some("l2Book") => books += 1,
+                Some("webData3") => accounts += 1,
+                _ => {}
+            }
+        }
+        // Over 3.3 s: the book is pushed immediately and about every 0.5 s
+        // (7 frames), the account state immediately and every second (4).
+        assert!(books >= 6, "books pushed at the market cadence: {books}");
+        assert!(
+            (3..=5).contains(&accounts),
+            "the account channel keeps the 1 s tick: {accounts}"
+        );
+        socket.close(None).await.ok();
+        server.abort();
+    }
+
     /// A venue with the default dex (`BTC`) and two builder dexes registered
     /// in the order xyz, flx (so the registry order is not the alphabetical
     /// one): `xyz` margins in USDC and lists `xyz:TSLA` and a coin with no
@@ -1549,7 +1730,7 @@ mod tests {
     /// and a resting order on xyz and a resting order on the default dex.
     #[allow(clippy::too_many_lines)] // one fixture world
     fn dex_world() -> (Arc<ApiState>, Address) {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into(), "xyz:TSLA".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("BTC", 10), now);
         feed.put_dex_meta(

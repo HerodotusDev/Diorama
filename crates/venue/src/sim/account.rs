@@ -1058,7 +1058,7 @@ pub(crate) fn isolated_only(coin: &str, meta: Option<&crate::wire::Meta>) -> boo
 }
 
 /// The coin's live max leverage — `None` when the live meta does not carry
-/// the coin (a seeded position outside the tracked markets: the feed is
+/// the coin (a seeded position in a coin no dex lists: the feed is
 /// warming). Callers pick their own bounded fallback; a fabricated default
 /// here would be a silent lie about a margin bound.
 pub(crate) fn max_leverage(coin: &str, meta: Option<&crate::wire::Meta>) -> Option<u32> {
@@ -1777,7 +1777,7 @@ mod tests {
         // servable (a zero would be a silent lie), so the WS lane skips the
         // push and retries on the next tick.
         use crate::feed::PriceOverride;
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         feed.own_price(
             "BTC",
             PriceOverride {

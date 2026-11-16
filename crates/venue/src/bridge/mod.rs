@@ -1149,7 +1149,7 @@ mod tests {
         let bridge = Bridge::new(
             Rpc::new("http://127.0.0.1:1", Duration::from_secs(1)).unwrap(),
             sim.clone(),
-            Arc::new(MarketFeed::memory(Vec::new())),
+            Arc::new(MarketFeed::memory()),
             Arc::new(BridgeMetrics::default()),
             BridgePolicy {
                 poll: Duration::from_secs(1),
@@ -1178,7 +1178,7 @@ mod tests {
         // The served read: `/info` `maxBuilderFee`, a bare JSON integer.
         let state = Arc::new(
             crate::api::ApiState::new(
-                Arc::new(MarketFeed::memory(Vec::new())),
+                Arc::new(MarketFeed::memory()),
                 sim.clone(),
                 crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap(),
                 None,
@@ -1237,7 +1237,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the transfers
     async fn a_corewriter_send_asset_moves_collateral_between_dexes() {
         let sim = Arc::new(Sim::memory());
-        let feed = Arc::new(MarketFeed::memory(Vec::new()));
+        let feed = Arc::new(MarketFeed::memory());
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);

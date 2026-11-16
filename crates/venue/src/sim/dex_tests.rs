@@ -45,7 +45,7 @@ fn spot_token(name: &str, index: u32) -> SpotToken {
 /// collateral is token 360 (`USDH`) listing `flx:TSLA` (10x). Both coins have
 /// a live mark and a book; the spot meta names the two tokens.
 fn two_dex_feed() -> MarketFeed {
-    let feed = MarketFeed::memory(vec!["ETH".to_string(), "flx:TSLA".to_string()]);
+    let feed = MarketFeed::memory();
     let now = crate::now_ms();
     feed.put_meta(meta_with("ETH", 10), now);
     let mut flx = meta_of(&[("flx:TSLA", 10)]);
@@ -233,7 +233,7 @@ fn funding_defers_per_dex_and_pays_into_the_dex_ledger() {
 /// account's healthy default-dex position and balance are not touched.
 #[test]
 fn a_builder_dex_liquidation_does_not_touch_the_default_dex() {
-    let feed = MarketFeed::memory(vec!["ETH".to_string(), "flx:TSLA".to_string()]);
+    let feed = MarketFeed::memory();
     let now = crate::now_ms();
     feed.put_meta(meta_with("ETH", 10), now);
     let mut flx = meta_of(&[("flx:TSLA", 10)]);
@@ -289,7 +289,7 @@ fn a_builder_dex_liquidation_does_not_touch_the_default_dex() {
 /// is not affected.
 #[test]
 fn a_unified_account_pools_spot_collateral_across_dexes_sharing_a_token() {
-    let feed = MarketFeed::memory(vec![]);
+    let feed = MarketFeed::memory();
     let now = crate::now_ms();
     feed.put_meta(meta_with("ETH", 10), now);
     for (dex, coin, token) in [

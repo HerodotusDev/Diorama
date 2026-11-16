@@ -155,7 +155,7 @@ fn world() -> (Arc<ApiState>, Address) {
 /// [`world`] with the venue's public API at `venue` (the pass-through target).
 #[allow(clippy::too_many_lines)] // one fixture world: dexes, funding, positions, resting orders, fills, funding hour
 fn world_on(venue: &str) -> (Arc<ApiState>, Address) {
-    let feed = Arc::new(MarketFeed::memory(vec!["ETH".to_string()]));
+    let feed = Arc::new(MarketFeed::memory());
     let now = crate::now_ms();
     feed.put_meta(crate::sim::meta_with_table("ETH", 10), now);
     feed.put_dex_meta("xyz", builder_meta("xyz:TSLA", 30, 0), now);

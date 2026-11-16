@@ -34,7 +34,7 @@ fn require_tracked(feed: &crate::feed::MarketFeed, coin: &str) -> Result<()> {
         return Ok(());
     }
     Err(Error::NotFound {
-        what: format!("coin `{coin}` (not in the venue's tracked markets)"),
+        what: format!("coin `{coin}` (not listed by the venue)"),
     })
 }
 
@@ -211,8 +211,8 @@ pub(crate) async fn order(
 ) -> Result<Json<OrderResponse>> {
     let address = req.address;
     let order: crate::sim::order::Order = req.into();
-    // The fill walks the coin's book: one outside the configured markets gets
-    // it on demand.
+    // The fill walks the coin's book: the relayed live one, read once from
+    // the venue when none has landed yet.
     let _ = state.feed.ensure_book(&order.coin).await;
     let fill = state.sim.order(&state.feed, address, &order)?;
     // The fill's provenance, so every fill is self-explaining: the levels it

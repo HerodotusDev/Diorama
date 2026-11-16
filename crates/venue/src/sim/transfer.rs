@@ -236,11 +236,7 @@ mod tests {
     /// The default dex (`ETH`), `xyz` (USDC collateral, `xyz:TSLA`) and `flx`
     /// (USDH collateral, `flx:TSLA`); both tokens are in the spot registry.
     fn feed() -> MarketFeed {
-        let feed = MarketFeed::memory(vec![
-            "ETH".to_string(),
-            "xyz:TSLA".to_string(),
-            "flx:TSLA".to_string(),
-        ]);
+        let feed = MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", meta_of(&[("xyz:TSLA", 10)]), now);

@@ -790,7 +790,7 @@ fn open_interest_caps(dex: &Option<String>, state: &ApiState) -> Result<Response
     Ok(Json(caps).into_response())
 }
 
-/// `l2Book`: the cached or scripted book for one coin, aggregated per the
+/// `l2Book`: the cached, relayed or scripted book for one coin, aggregated per the
 /// request's parameters (docs: `nSigFigs ∈ {2,3,4,5}`, `mantissa ∈ {1,2,5}`
 /// only with `nSigFigs = 5`). A parameter outside the documented set is a
 /// named 400 — never silently ignored.
@@ -801,22 +801,16 @@ async fn l2_book(
     state: &ApiState,
 ) -> Result<Response> {
     book_params_ok(n_sig_figs, mantissa)?;
-    let now = crate::now_ms();
-    // A configured market's book is the poller's; any other coin a dex lists
-    // (a builder dex's `xyz:TSLA`, a default-dex coin outside `markets`) gets
-    // its book on demand and stays wanted while it is asked for.
-    let configured = state.feed.markets.iter().any(|m| m == coin);
-    let book = if configured {
-        state.feed.book(coin, now)
-    } else {
-        state.feed.ensure_book(coin).await
-    };
+    // Every coin a dex lists (default or builder) is a market: its book is
+    // the relayed live one (the read keeps the coin's stream wanted), fetched
+    // once from the venue only when none has landed yet.
+    let book = state.feed.ensure_book(coin).await;
     let Some(book) = book else {
         // The venue's own absence shape (measured live: `l2Book` for an
         // unknown coin answers HTTP 500 `null`, builder dexes included). A
         // coin the venue lists with no book yet is a different fault: the
         // plane is warming (503).
-        return if configured || state.feed.meta_for_coin(coin).is_some() {
+        return if state.feed.meta_for_coin(coin).is_some() {
             Err(Error::Warming)
         } else {
             Ok(unknown_dex())

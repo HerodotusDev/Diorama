@@ -46,8 +46,8 @@ use std::sync::Arc;
 /// `sendAsset`, `spotSend`, `usdSend`) and the account setup (`approveAgent`,
 /// `approveBuilderFee`, `userSetAbstraction`, `agentSetAbstraction`) are
 /// `user_actions.rs`; the user-signed ones must be signed by the account's own
-/// key. Orders on a coin outside the configured markets read its book on
-/// demand (`ensure_books`), and every asset id of a builder dex resolves to
+/// key. An order reads its coin's book first when none has landed yet
+/// (`ensure_books`), and every asset id of a builder dex resolves to
 /// that dex's coins and ledger.
 pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
     let req = match parse(&body) {
@@ -119,8 +119,8 @@ fn parse(body: &[u8]) -> std::result::Result<ExchangeBody, Box<Response>> {
 /// The most books one request reads on demand (a batch spans few coins).
 const MAX_ENSURED_BOOKS: usize = 8;
 
-/// Orders walk the coin's book: read it once for a coin outside the
-/// configured markets (a builder dex's, say) before the action runs.
+/// Orders walk the coin's book: read it once when none has landed yet (and
+/// keep the coin's stream wanted) before the action runs.
 async fn ensure_books(state: &ApiState, action: &ExchangeAction) {
     let assets: Vec<u32> = match action {
         ExchangeAction::Order { orders, .. } => orders.iter().map(|o| o.a).collect(),
@@ -1029,7 +1029,7 @@ mod tests {
     /// sim with `OWNER` funded and `BUILDER` a simulated account.
     fn builder_state() -> Arc<ApiState> {
         use crate::wire::{L2Book, Level};
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_ctx("ETH".into(), crate::wire::test_ctx("101", "101"), now);
@@ -1485,7 +1485,7 @@ mod tests {
     /// (`USDC`), and a mark and a one-level book on both.
     fn dex_state() -> Arc<ApiState> {
         use crate::wire::{L2Book, Level};
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string(), "xyz:TSLA".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);
@@ -2060,15 +2060,15 @@ mod tests {
         format!(r#"{{"type":"order","orders":[{order}],"grouping":"na"}}"#)
     }
 
-    /// An order on a coin outside the configured markets reads its book on
-    /// demand before it fills: `xyz:TSLA` is not a market here, the mock
-    /// venue serves its `l2Book`, and the order fills against that book.
+    /// An order on a coin whose book has not landed reads it on demand
+    /// before it fills: the mock venue serves `xyz:TSLA`'s `l2Book`, and the
+    /// order fills against that book.
     #[tokio::test]
     async fn an_order_on_an_unconfigured_coin_reads_its_book_first() {
         use crate::sim::DealClass::Perp;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let url = crate::feed::tests::l2_server(hits.clone()).await;
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);

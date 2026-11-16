@@ -361,7 +361,7 @@ mod tests {
 
     /// A live feed serving `book` with the best ask as the mark.
     fn feed_with_book(book: L2Book, meta: Meta) -> crate::feed::MarketFeed {
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(meta, now);
         let mark = book.levels[1].first().map_or(Decimal::ONE, |l| l.px);

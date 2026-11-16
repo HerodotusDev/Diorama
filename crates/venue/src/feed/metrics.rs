@@ -2,10 +2,11 @@
 //! the per-coin staleness gauges ("per-coin staleness metric").
 //!
 //! The Prometheus conventions are `diorama-devnet`'s (its labeled wrappers:
-//! `push_gauge`/`push_counter`), a labeled series per configured market.
+//! `push_gauge`/`push_counter`), a labeled staleness series per live coin.
 use diorama_devnet::metrics::{push_counter, push_gauge};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct FeedMetrics {
@@ -19,8 +20,12 @@ pub(crate) struct FeedMetrics {
     budget_skips: AtomicU64,
     /// Weight spent in the rolling window (the poller publishes it).
     budget_used: AtomicU64,
-    /// Milliseconds since each coin's last live context update.
-    stale_ms: BTreeMap<String, AtomicU64>,
+    /// Milliseconds since each live coin's last context update (replaced
+    /// whole by the poller each pass).
+    stale_ms: Mutex<BTreeMap<String, u64>>,
+    /// Upstream streams the relay carries on the live socket, by channel.
+    relay_book_streams: AtomicU64,
+    relay_ctx_streams: AtomicU64,
     /// Devnet-owned book levels (the order lane's consumption records): live
     /// updates keep the consumed delta — the venue analogue of
     /// `diorama_shadowed_slots`.
@@ -34,16 +39,6 @@ pub(crate) struct FeedMetrics {
 }
 
 impl FeedMetrics {
-    pub fn new(markets: &[String]) -> Self {
-        Self {
-            stale_ms: markets
-                .iter()
-                .map(|m| (m.clone(), AtomicU64::new(0)))
-                .collect(),
-            ..Self::default()
-        }
-    }
-
     /// The WS link came up (the gauge renders it 0/1).
     pub fn mark_ws_up(&self) {
         self.ws_connected.store(true, Ordering::Relaxed);
@@ -52,6 +47,8 @@ impl FeedMetrics {
     /// The WS link dropped.
     pub fn mark_ws_down(&self) {
         self.ws_connected.store(false, Ordering::Relaxed);
+        // A dropped socket carries no streams.
+        self.set_relay_streams(0, 0);
     }
 
     pub fn inc_rest_errors(&self) {
@@ -70,10 +67,26 @@ impl FeedMetrics {
         self.budget_used.store(used, Ordering::Relaxed);
     }
 
-    pub fn set_stale(&self, coin: &str, ms: u64) {
-        if let Some(slot) = self.stale_ms.get(coin) {
-            slot.store(ms, Ordering::Relaxed);
-        }
+    /// Replace the per-coin staleness series.
+    pub fn set_stale_all(&self, stale: Vec<(String, u64)>) {
+        *self
+            .stale_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stale.into_iter().collect();
+    }
+
+    /// The streams the live socket carries (the session sets them as it
+    /// subscribes and unsubscribes; a dropped socket carries none).
+    pub fn set_relay_streams(&self, books: u64, ctxs: u64) {
+        self.relay_book_streams.store(books, Ordering::Relaxed);
+        self.relay_ctx_streams.store(ctxs, Ordering::Relaxed);
+    }
+
+    pub fn relay_streams(&self) -> (u64, u64) {
+        (
+            self.relay_book_streams.load(Ordering::Relaxed),
+            self.relay_ctx_streams.load(Ordering::Relaxed),
+        )
     }
 
     pub fn set_owned_levels(&self, levels: u64) {
@@ -159,16 +172,40 @@ impl FeedMetrics {
         );
         // One family, one HELP/TYPE, then every series (strict scrapers
         // reject a repeated header — the verifier caught it).
-        if !self.stale_ms.is_empty() {
+        // One family, one HELP/TYPE header, then both series.
+        out.push_str(
+            "# HELP venue_sim_relay_streams upstream streams the market socket carries, by channel
+",
+        );
+        out.push_str(
+            "# TYPE venue_sim_relay_streams gauge
+",
+        );
+        out.push_str(&format!(
+            "venue_sim_relay_streams{{channel=\"l2Book\"}} {}
+venue_sim_relay_streams{{channel=\"activeAssetCtx\"}} {}
+",
+            self.relay_book_streams.load(Ordering::Relaxed),
+            self.relay_ctx_streams.load(Ordering::Relaxed),
+        ));
+        let stale = self
+            .stale_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !stale.is_empty() {
             out.push_str(
-                "# HELP venue_sim_stale_ms ms since the coin's last live context update\n",
+                "# HELP venue_sim_stale_ms ms since the coin's last live context update
+",
             );
-            out.push_str("# TYPE venue_sim_stale_ms gauge\n");
+            out.push_str(
+                "# TYPE venue_sim_stale_ms gauge
+",
+            );
         }
-        for (coin, ms) in &self.stale_ms {
+        for (coin, ms) in stale.iter() {
             out.push_str(&format!(
-                "venue_sim_stale_ms{{coin=\"{coin}\"}} {}\n",
-                ms.load(Ordering::Relaxed)
+                "venue_sim_stale_ms{{coin=\"{coin}\"}} {ms}
+"
             ));
         }
     }

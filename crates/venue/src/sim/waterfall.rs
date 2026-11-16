@@ -1092,7 +1092,7 @@ mod tests {
     #[test]
     fn a_negative_value_is_book_closed_first() {
         let now = crate::now_ms();
-        let feed = MarketFeed::memory(vec!["BTC".to_string()]);
+        let feed = MarketFeed::memory();
         feed.put_meta(meta_with("BTC", 10), now);
         feed.put_ctx("BTC".into(), crate::wire::test_ctx("80", "80"), now);
         let level = |px: &str, sz: &str| crate::wire::Level {

@@ -1077,7 +1077,7 @@ fn stamp_funding_baseline(account: &mut Account, clock: u64) {
 /// share it through `super::*`.
 #[cfg(test)]
 pub(crate) fn feed_with(marks: &[(&str, &str, &str)]) -> MarketFeed {
-    let feed = MarketFeed::memory(marks.iter().map(|(c, _, _)| c.to_string()).collect());
+    let feed = MarketFeed::memory();
     for (coin, mark, oracle) in marks {
         feed.put_ctx(coin.to_string(), crate::wire::test_ctx(mark, oracle), 1);
     }
@@ -1591,7 +1591,7 @@ mod tests {
     /// clock still advances for funding/liquidation.
     #[test]
     fn served_time_is_wall_not_scenario_time() {
-        let feed = MarketFeed::memory(vec![]);
+        let feed = MarketFeed::memory();
         let sim = Sim::memory();
         assert_eq!(Sim::served_time(1_000), 1_000);
         sim.advance(&feed, 60, 1).unwrap();

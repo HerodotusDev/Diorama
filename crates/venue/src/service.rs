@@ -47,7 +47,6 @@ pub async fn sim_entry(args: Vec<String>) -> crate::Result<()> {
     tracing::info!(
         info = %format!("{}:{}", sim_section.info.addr, sim_section.info.port),
         control = %format!("{}:{}", sim_section.control.addr, sim_section.control.port),
-        markets = sim_section.markets.len(),
         api = %chain.api_urls,
         "venue simulator listening"
     );
@@ -78,9 +77,16 @@ fn build_planes(
     sim_section: &diorama_config::VenueSimSection,
 ) -> crate::Result<Planes> {
     let policy = cfg.endpoint_policy();
+    // Every coin of every dex is a market: the configured `markets` list
+    // (kept for config compatibility) selects nothing.
+    if !sim_section.markets.is_empty() {
+        tracing::info!(
+            markets = ?sim_section.markets,
+            "services.venue_sim.markets is ignored: every listed coin is a market"
+        );
+    }
     let feed = Arc::new(crate::feed::MarketFeed::load(
         sim_section.state_dir.join("feed.json"),
-        sim_section.markets.clone(),
     )?);
     let sim = Arc::new(crate::sim::Sim::load(
         sim_section.state_dir.join("sim.json"),
@@ -91,8 +97,8 @@ fn build_planes(
         policy,
         Duration::from_secs(sim_section.rest_timeout_secs),
     )?;
-    // The books on demand (an order or an l2Book read on a coin outside the
-    // configured markets) read through the same client and budget.
+    // The books on demand (the first read of a coin's book, before its
+    // stream delivers) read through the same client and budget.
     feed.attach_rest(api_client.clone());
     let ws_pool = diorama_anvil::EndpointPool::from_specs(
         cfg.endpoint_specs(chain.ws_urls.as_slice()),
@@ -110,6 +116,7 @@ fn build_planes(
             Duration::from_secs(sim_section.admin_timeout_secs),
             Duration::from_millis(sim_section.tick_interval_ms),
         )?
+        .with_market_push_interval(Duration::from_millis(sim_section.market_push_interval_ms))
         .with_ws_pool(ws_pool.clone()),
     );
     Ok(Planes {
@@ -160,11 +167,10 @@ fn spawn_market_plane(
     tokio::spawn(ws.run());
 }
 
-/// The market plane's heartbeat: one INFO line per configured interval naming
-/// the live
-/// market — each coin's mark and its age (the live-following visibility the
-/// WS connect line alone never gives; a scripted coin's mark reads
-/// `scripted`).
+/// The market plane's heartbeat: one INFO line per configured interval with
+/// the live market's health: how many coins have a fresh context and which
+/// streams the upstream socket carries (the live-following visibility the WS
+/// connect line alone never gives).
 fn spawn_plane_heartbeat(
     feed: &Arc<crate::feed::MarketFeed>,
     sim: &Arc<crate::sim::Sim>,
@@ -180,23 +186,18 @@ fn spawn_plane_heartbeat(
         loop {
             tokio::time::sleep(interval).await;
             let now = crate::now_ms();
-            let coins: Vec<String> = feed
-                .markets
-                .iter()
-                .map(|c| match (feed.mark(c), feed.stale_ms(c, now)) {
-                    (Some(m), age) => format!(
-                        "{c}={m}@{}",
-                        age.map(|a| format!("{a}ms"))
-                            .unwrap_or_else(|| "scripted".to_string())
-                    ),
-                    _ => format!("{c}=-"),
-                })
-                .collect();
+            // The live market in one line: how many coins have a fresh
+            // context, and what the upstream socket carries.
+            let (fresh, total) = feed.ctx_freshness(now, crate::feed::MarketFeed::MAX_STALE_MS);
+            let (book_streams, ctx_streams) = feed.metrics.relay_streams();
             // The account plane beside the market plane: the registered
             // accounts, the scenario-owned book levels, and the identity
             // violations (any nonzero value is a construction regression).
             tracing::info!(
-                coins = %coins.join(" "),
+                ctx_fresh = fresh,
+                coins = total,
+                book_streams,
+                ctx_streams,
                 via = %via,
                 // The chain side beside the market: 0 = the sim's own
                 // Core<->EVM bridge has consumed V's head (the market and

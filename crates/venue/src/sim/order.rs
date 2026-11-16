@@ -1770,7 +1770,7 @@ mod tests {
     /// The same feed before `perpsAtOpenInterestCap` has answered: the cap
     /// set is unknown.
     fn live_feed(book: L2Book, meta: Meta) -> MarketFeed {
-        let feed = MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = MarketFeed::memory();
         // Honest stamps: the lane's freshness gate reads the ctx age, and a
         // fixture stamped at the epoch would read as permanently stale.
         let now = crate::now_ms();
