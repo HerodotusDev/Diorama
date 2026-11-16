@@ -8,6 +8,7 @@
 //! move the same ledgers by the same rules.
 use super::exchange::{default_ok, err_envelope};
 use super::ApiState;
+use crate::sim::fees::RowKind;
 use crate::sim::transfer::{AssetSend, Wallet};
 use crate::sim::{Applied, ClassTransfer, Direction, TokenRef};
 use crate::wire::UserAbstraction;
@@ -82,13 +83,16 @@ fn transfer(
     (from, to): (Address, Address),
     (token, amount): (&str, &str),
     (source, destination): (Wallet, Wallet),
+    kind: RowKind,
 ) -> Result<(), String> {
     let (index, name) = state
         .feed
         .resolve_token(token)
         .ok_or_else(|| format!("venue-sim: unknown token `{token}`"))?;
     let amount = amount_of(amount)?;
-    if crate::bridge::system::token_index_of(to).is_some() {
+    if crate::bridge::system::token_index_of(to).is_some()
+        || to == crate::bridge::system::HYPE_SYSTEM
+    {
         return Err(
             "venue-sim: a token's system address is the Core to EVM path, not an \
                     /exchange destination; send it from the spot wallet with CoreWriter's \
@@ -106,6 +110,7 @@ fn transfer(
                 amount,
                 source,
                 destination,
+                kind,
             },
             &state.feed,
         )
@@ -141,6 +146,7 @@ pub(super) fn send_asset(state: &ApiState, account: Address, send: &SendAsset<'_
                 Wallet::of_dex_name(send.source_dex),
                 Wallet::of_dex_name(send.destination_dex),
             ),
+            RowKind::Send,
         )
     })())
 }
@@ -157,6 +163,7 @@ pub(super) fn spot_send(
         (account, destination),
         (token, amount),
         (Wallet::Spot, Wallet::Spot),
+        RowKind::SpotTransfer,
     ))
 }
 
@@ -172,6 +179,7 @@ pub(super) fn usd_send(
         (account, destination),
         (USDC.coin, amount),
         (Wallet::of_dex_name(""), Wallet::of_dex_name("")),
+        RowKind::Send,
     ))
 }
 

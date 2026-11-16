@@ -145,8 +145,13 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             start_time,
             end_time,
         } => user_funding(&state, body, user, start_time, end_time).await,
+        InfoRequest::UserNonFundingLedgerUpdates {
+            user,
+            start_time,
+            end_time,
+        } => ledger_updates(&state, body, user, (start_time, end_time)).await,
         InfoRequest::MaxBuilderFee { user, builder } => max_fee(&state, body, user, builder).await,
-        InfoRequest::PreTransferCheck { user, .. } => pre_transfer_check(&state, body, user).await,
+        InfoRequest::PreTransferCheck { user, source } => pre_transfer_check(&state, user, source),
     }
 }
 
@@ -273,6 +278,22 @@ async fn user_funding(
     Ok(Json(rows).into_response())
 }
 
+/// `userNonFundingLedgerUpdates`: a simulated account's transfer rows
+/// (`spotTransfer`, `send`, `accountClassTransfer`, `accountActivationGas`),
+/// oldest first, each `{time, hash, delta}`; the venue's verbatim for an
+/// untouched account.
+async fn ledger_updates(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    window: (u64, Option<u64>),
+) -> Result<Response> {
+    match state.sim.ledger_updates(user, window) {
+        Some(rows) => Ok(Json(rows).into_response()),
+        None => pass_through(state, &body).await,
+    }
+}
+
 /// The hash the venue stamps on funding ledger rows (they have no transaction).
 const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -287,20 +308,29 @@ fn deserialize_failure() -> Response {
         .into_response()
 }
 
-/// `preTransferCheck`: the venue's answer for a simulated account (known to
-/// the venue, never sanctioned, no transfer fee), the venue's verbatim for an
-/// untouched one.
-async fn pre_transfer_check(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
-    simulated(state, &body, user, |_| {
-        Ok(Json(serde_json::json!({
-            "isSanctioned": false,
-            "userExists": true,
-            "fee": "0.0",
-            "userHasSentTx": true,
-        }))
-        .into_response())
-    })
-    .await
+/// `preTransferCheck`: `user` is the destination, `source` the sender. The
+/// shape is the real venue's. The sim answers from its own state: `userExists`
+/// is whether the destination exists on the sim, `userHasSentTx` whether it
+/// exists and has paid its activation (it made its first outbound transfer, or
+/// was funded by a seed or `deal`), and `fee` is the 1 USDC activation the
+/// *source* would pay on this transfer (Circle's rule: charged once, on an
+/// account's first outbound action) or `0.0`. The real venue answers
+/// `fee: "1.0"` for a destination it has never seen; the sim does not tie the
+/// fee to the destination.
+fn pre_transfer_check(state: &ApiState, user: Address, source: Address) -> Result<Response> {
+    let check = state.sim.pre_transfer(user, source)?;
+    let fee = if check.source_owes {
+        crate::sim::fees::ACTIVATION_FEE
+    } else {
+        rust_decimal::Decimal::ZERO
+    };
+    Ok(Json(serde_json::json!({
+        "isSanctioned": false,
+        "userExists": check.destination_exists,
+        "fee": crate::sim::fees::real_text(fee),
+        "userHasSentTx": check.destination_has_sent,
+    }))
+    .into_response())
 }
 
 /// `clearinghouseState`: the sim's one-dex clearinghouse for a touched
