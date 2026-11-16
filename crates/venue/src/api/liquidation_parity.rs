@@ -250,3 +250,162 @@ fn the_maintenance_deduction_keeps_the_requirement_continuous() {
         "and below it"
     );
 }
+
+/// Every surface that serves an account's clearinghouse carries the same
+/// `liquidationPx` for the same position: the REST `clearinghouseState`, the
+/// `clearinghouseState` channel and the `allDexsClearinghouseState` channel
+/// (`webData3` carries no per-dex clearinghouse: the venue's public socket
+/// sends only the identity facts there, and the sim mirrors that).
+#[test]
+#[allow(clippy::too_many_lines)] // one world and the three surfaces read from it
+fn every_surface_serves_the_same_liquidation_px() {
+    use crate::api::ws::{pushes, request_reply, Live};
+    use crate::api::{info, ApiState};
+    use crate::sim::order::{Order, Tif};
+    use crate::sim::{Deal, DealClass};
+    use crate::wire::{L2Book, Level};
+    use alloy_primitives::Address;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let feed = Arc::new(crate::feed::MarketFeed::memory(vec!["ETH".to_string()]));
+    let now = crate::now_ms();
+    feed.put_meta(crate::sim::meta_with("ETH", 10), now);
+    feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 20)]), now);
+    feed.put_oi_caps(Vec::new());
+    feed.put_oi_caps_of("xyz", Vec::new());
+    for coin in ["ETH", "xyz:TSLA"] {
+        feed.put_ctx(coin.into(), crate::wire::test_ctx("100", "100"), now);
+        let level = |px: &str| Level {
+            px: px.parse().unwrap(),
+            sz: "1000".parse().unwrap(),
+            n: 1,
+        };
+        feed.put_book(
+            L2Book {
+                coin: coin.into(),
+                time: now,
+                levels: [vec![level("99.9")], vec![level("100.1")]],
+                spread: None,
+            },
+            now,
+        );
+    }
+    let api = crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+    let state = Arc::new(
+        ApiState::new(
+            feed.clone(),
+            Arc::new(crate::sim::Sim::memory()),
+            api,
+            None,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    );
+    let user = Address::repeat_byte(0xaa);
+    for dex in [None, Some("xyz".to_string())] {
+        state
+            .sim
+            .deal(
+                &feed,
+                &Deal {
+                    address: user,
+                    class: DealClass::Perp,
+                    coin: None,
+                    dex,
+                    amount: Decimal::from(150),
+                },
+            )
+            .unwrap();
+    }
+    for (coin, is_buy) in [("ETH", true), ("xyz:TSLA", false)] {
+        let order = Order {
+            coin: coin.into(),
+            is_buy,
+            size: "10".parse().unwrap(),
+            limit_px: None,
+            tif: Tif::Ioc,
+            reduce_only: false,
+            cloid: None,
+            trigger: None,
+        };
+        state.sim.order(&feed, user, &order).unwrap();
+    }
+
+    let rest = |dex: &'static str| {
+        let state = state.clone();
+        async move {
+            let body = serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex});
+            let response = info::info(State(state), Bytes::from(body.to_string()))
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    let prices = |clearinghouse: &Value| -> Vec<(String, Value)> {
+        clearinghouse["assetPositions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["position"]["coin"].as_str().unwrap().to_string(),
+                    row["position"]["liquidationPx"].clone(),
+                )
+            })
+            .collect()
+    };
+    let subscribe = |subscription: Value| -> Value {
+        let mut subs: Vec<Live> = Vec::new();
+        let request = serde_json::json!({"method": "subscribe", "subscription": subscription});
+        request_reply(&request.to_string(), &mut subs, &state);
+        let mut live = subs.pop().expect("subscribed");
+        let frame = pushes(&mut live, &state, crate::now_ms())
+            .into_iter()
+            .next()
+            .expect("a first frame");
+        serde_json::from_str(&frame).unwrap()
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (dex, coin) in [("", "ETH"), ("xyz", "xyz:TSLA")] {
+        let from_rest = prices(&runtime.block_on(rest(dex)));
+        assert_eq!(from_rest.len(), 1);
+        assert_eq!(from_rest[0].0, coin);
+        let px = from_rest[0]
+            .1
+            .as_str()
+            .expect("a cross position serves a price");
+        let long = coin == "ETH";
+        let px: Decimal = px.parse().unwrap();
+        assert_eq!(px > Decimal::from(100), !long, "{coin}: {px}");
+
+        let channel =
+            subscribe(serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}));
+        assert_eq!(channel["channel"], "clearinghouseState");
+        let from_channel = prices(&channel["data"]["clearinghouseState"]);
+        assert_eq!(from_channel, from_rest, "the channel for `{dex}`");
+    }
+    let all = subscribe(serde_json::json!({"type": "allDexsClearinghouseState", "user": user}));
+    let states = all["data"]["clearinghouseStates"].as_array().unwrap();
+    assert_eq!(states.len(), 2);
+    for entry in states {
+        let dex: &'static str = if entry[0] == "" { "" } else { "xyz" };
+        let from_rest = prices(&runtime.block_on(rest(dex)));
+        assert_eq!(
+            prices(&entry[1]),
+            from_rest,
+            "allDexsClearinghouseState `{dex}`"
+        );
+    }
+}
