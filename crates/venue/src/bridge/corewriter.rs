@@ -59,6 +59,10 @@ sol! {
         uint32 asset;
         uint128 cloid;
     }
+    struct ApproveBuilderFeePayload {
+        uint64 maxFeeRate;
+        address builder;
+    }
     struct SendAssetPayload {
         address destination;
         address subAccount;
@@ -108,6 +112,10 @@ pub(crate) enum CoreAction {
     CancelByOid { asset: u32, oid: u64 },
     /// 11: `(uint32 asset, uint128 cloid)`.
     CancelByCloid { asset: u32, cloid: u128 },
+    /// 12: `(uint64 maxFeeRate, address builder)`: approve a builder fee. The
+    /// rate is in tenths of a basis point (the `maxBuilderFee` unit); the
+    /// acting account is the CoreWriter caller (the margin agent).
+    ApproveBuilderFee { max_fee_rate: u64, builder: Address },
     /// 13: `(address destination, address subAccount, uint32 sourceDex, uint32 destinationDex, uint64 token, uint64 wei)`.
     SendAsset {
         destination: Address,
@@ -136,6 +144,7 @@ impl CoreAction {
             CoreAction::AddApiWallet { .. } => 9,
             CoreAction::CancelByOid { .. } => 10,
             CoreAction::CancelByCloid { .. } => 11,
+            CoreAction::ApproveBuilderFee { .. } => 12,
             CoreAction::SendAsset { .. } => 13,
             CoreAction::SetAbstraction { .. } => 16,
             CoreAction::Unmodeled { id } => *id,
@@ -171,6 +180,7 @@ pub(crate) fn decode(input: &[u8]) -> CoreAction {
         9 => decode_add_api_wallet(payload).unwrap_or(CoreAction::Malformed),
         10 => decode_cancel_by_oid(payload),
         11 => decode_cancel_by_cloid(payload),
+        12 => decode_approve_builder_fee(payload),
         13 => decode_send_asset(payload),
         16 => decode_set_abstraction(payload),
         other => CoreAction::Unmodeled { id: other },
@@ -241,6 +251,17 @@ fn decode_cancel_by_cloid(payload: &[u8]) -> CoreAction {
         Ok(v) => CoreAction::CancelByCloid {
             asset: v.asset,
             cloid: v.cloid,
+        },
+        Err(_) => CoreAction::Malformed,
+    }
+}
+
+/// Action 12: `approveBuilderFee`.
+fn decode_approve_builder_fee(payload: &[u8]) -> CoreAction {
+    match ApproveBuilderFeePayload::abi_decode_params(payload) {
+        Ok(v) => CoreAction::ApproveBuilderFee {
+            max_fee_rate: v.maxFeeRate,
+            builder: v.builder,
         },
         Err(_) => CoreAction::Malformed,
     }
@@ -329,6 +350,35 @@ mod tests {
                 wei: 1_000_000
             }
         );
+    }
+
+    /// Action 12 as `CoreWriterLib.approveBuilderFee` sends it:
+    /// `abi.encodePacked(uint8(1), uint24(12), abi.encode(uint64 maxFeeRate,
+    /// address builder))`, wrapped in `sendRawAction(bytes)` by the system
+    /// contract call.
+    #[test]
+    fn approve_builder_fee_decodes() {
+        let mut stream = vec![0x01, 0x00, 0x00, 0x0c];
+        stream.extend_from_slice(&U256::from(1_000u64).to_be_bytes::<32>());
+        stream.extend_from_slice(
+            &U256::from_be_bytes(Address::repeat_byte(0xcc).into_word().0).to_be_bytes::<32>(),
+        );
+        let expected = CoreAction::ApproveBuilderFee {
+            max_fee_rate: 1_000,
+            builder: Address::repeat_byte(0xcc),
+        };
+        let action = decode(&stream);
+        assert_eq!(action, expected);
+        assert_eq!(action.id(), 12);
+        // The same stream through the `sendRawAction(bytes)` wrapper.
+        let mut input = sendRawActionCall::SELECTOR.to_vec();
+        input.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>()); // offset
+        input.extend_from_slice(&U256::from(stream.len() as u64).to_be_bytes::<32>()); // len
+        input.extend_from_slice(&stream);
+        input.resize(input.len() + 28, 0); // ABI padding to a word
+        assert_eq!(decode_calldata(&input), expected);
+        // A short payload is malformed, never a guess.
+        assert_eq!(decode(&stream[..40]), CoreAction::Malformed);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! verified (the devnet has no keys — the anvil-impersonation analogue), and
 //! the depth is the served book's (the live book minus what the devnet
 //! already consumed, so a second order sees the first one's impact).
+use super::ledger::{FillRecord, Liquidity};
 use super::validate::{validate_order, validate_trigger_side};
 use super::Sim;
 use crate::error::{Error, Result};
@@ -421,6 +422,55 @@ pub(crate) fn maker_fee() -> Decimal {
     Decimal::new(15, 5)
 }
 
+/// The venue's perp builder-fee cap (docs: 0.1%), in the wire's unit of
+/// tenths of a basis point: an order may carry `f <= 100`.
+pub(crate) const MAX_PERP_BUILDER_FEE: u64 = 100;
+
+/// Tenths of a basis point per unit: the fee rate is `f / 100_000`.
+const BUILDER_FEE_DENOMINATOR: u64 = 100_000;
+
+/// The builder fee an order carries (docs: `{"b": address, "f": tenths of a
+/// basis point}`): every fill of the order charges `notional * f / 100_000`
+/// on top of the exchange fee. Stored on a resting order too, so a later
+/// maker fill charges it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BuilderFee {
+    pub builder: Address,
+    pub f: u64,
+}
+
+impl BuilderFee {
+    /// The charge a fill of `notional` owes this builder.
+    pub(crate) fn charge(self, notional: Decimal) -> Result<BuilderCharge> {
+        let rate = super::account::div(
+            Decimal::from(self.f),
+            Decimal::from(BUILDER_FEE_DENOMINATOR),
+            "builder fee rate",
+        )?;
+        Ok(BuilderCharge {
+            builder: self.builder,
+            amount: super::account::mul(notional, rate, "builder fee")?,
+        })
+    }
+}
+
+/// One fill's builder fee, computed: debited from the filled account with the
+/// exchange fee, credited to the builder's perp balance when the builder is a
+/// simulated account, and recorded on the ledger fill as `builderFee`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuilderCharge {
+    pub builder: Address,
+    pub amount: Decimal,
+}
+
+/// Who is placing, and the builder fee their order carries: the pair every
+/// placement step needs, kept as one argument.
+#[derive(Debug, Clone, Copy)]
+struct Placer {
+    address: Address,
+    builder: Option<BuilderFee>,
+}
+
 /// A resting order (the devnet's own book): the venue's openOrders row plus
 /// the account that placed it. Persisted with the scenario — a restart keeps
 /// the book.
@@ -455,6 +505,10 @@ pub(crate) struct RestingOrder {
     pub filled_sz: Decimal,
     #[serde(default)]
     pub filled_ntl: Decimal,
+    /// The builder fee the order was placed with: every later fill (a maker
+    /// fill on the book or the tick, a fired trigger) charges it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<BuilderFee>,
 }
 
 /// The venue's terminal order states (orderStatus): what happened to an order
@@ -520,6 +574,21 @@ impl Sim {
     /// orders (fees on both sides), the remainder resting (Gtc/Alo), or the
     /// trigger armed (no walk; the tick fires it when the mark crosses).
     pub(crate) fn place(&self, feed: &MarketFeed, address: Address, req: &Order) -> Result<Placed> {
+        self.place_with_builder(feed, address, req, None)
+    }
+
+    /// `place` for an order that carries a builder fee: the approval and the
+    /// cap are the caller's gate (`authorize_builder`); here the fee rides the
+    /// order into its fills (the immediate take) and its resting remainder
+    /// (the later maker fills).
+    pub(crate) fn place_with_builder(
+        &self,
+        feed: &MarketFeed,
+        address: Address,
+        req: &Order,
+        builder: Option<BuilderFee>,
+    ) -> Result<Placed> {
+        let placer = Placer { address, builder };
         let meta = feed.meta();
         validate_order(feed, meta.as_ref(), req)?;
         self.pre_place_refusals(feed, address, req, meta.as_ref())?;
@@ -531,7 +600,7 @@ impl Sim {
             validate_trigger_side(feed, req, &trigger)?;
             let px = req.limit_px.unwrap_or(trigger.trigger_px);
             self.require_order_margin(feed, address, req, (px, req.size))?;
-            let oid = self.rest_order(address, req, px, req.size)?;
+            let oid = self.rest_order(placer, req, (px, req.size))?;
             self.metrics
                 .triggers_armed_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -540,7 +609,7 @@ impl Sim {
         }
         // Post-only: a crossing order is canceled instead of matching (docs).
         if req.tif == Tif::Alo {
-            let oid = self.place_alo(feed, address, req)?;
+            let oid = self.place_alo(feed, placer, req)?;
             return Ok(resting_only(oid));
         }
         // The venue's self-trade rule: the taker's own crossing resting orders
@@ -550,12 +619,12 @@ impl Sim {
         // behavior: nothing to match, so the order simply joins the book).
         let take = req.tif == Tif::Ioc || crosses(feed, req, &self.resting_orders(None)?);
         let fill = if take {
-            Some(self.order(feed, address, req)?)
+            Some(self.order_with_builder(feed, placer, req)?)
         } else {
             None
         };
         let remainder = req.size - fill.as_ref().map(|f| f.total_sz).unwrap_or(Decimal::ZERO);
-        let resting = self.rest_remainder(feed, address, req, remainder)?;
+        let resting = self.rest_remainder(feed, placer, req, remainder)?;
         Ok(Placed { fill, resting })
     }
 
@@ -604,7 +673,7 @@ impl Sim {
     fn rest_remainder(
         &self,
         feed: &MarketFeed,
-        address: Address,
+        placer: Placer,
         req: &Order,
         remainder: Decimal,
     ) -> Result<Option<u64>> {
@@ -614,8 +683,8 @@ impl Sim {
         let Some(px) = req.limit_px else {
             return Ok(None); // a market order cannot rest
         };
-        self.require_order_margin(feed, address, req, (px, remainder))?;
-        Ok(Some(self.rest_order(address, req, px, remainder)?))
+        self.require_order_margin(feed, placer.address, req, (px, remainder))?;
+        Ok(Some(self.rest_order(placer, req, (px, remainder))?))
     }
 
     /// The venue's order margin (docs: `availableToTrade` accounts for open
@@ -741,11 +810,21 @@ impl Sim {
         let (legs, filled, avg_px) = walk_served_book(feed, meta.as_ref(), &req, &resting)?;
         let leverage = self.leverage_for(address, coin, meta.as_ref())?;
         let facts = super::account::FillFacts::close(coin, req.side(), filled, avg_px, leverage);
-        self.with_account_now(address, feed, |account| {
+        let effect = self.with_account_now(address, feed, |account| {
             super::account::apply_fill(account, &facts, meta.as_ref())
         })?;
-        self.settle_legs(feed, &req, &legs, meta.as_ref())?;
         let oid = self.next_oid()?;
+        self.record_fill(
+            address,
+            &FillRecord {
+                facts: &facts,
+                effect,
+                oid,
+                cloid: None,
+                liquidity: Liquidity::Taker,
+            },
+        )?;
+        self.settle_legs(feed, &req, &legs, meta.as_ref())?;
         self.mark_dirty()?;
         Ok(Fill {
             total_sz: filled,
@@ -791,13 +870,13 @@ impl Sim {
 
     /// A post-only placement: refuses with the venue's own string (and the
     /// bbo) when it would cross, else rests.
-    fn place_alo(&self, feed: &MarketFeed, address: Address, req: &Order) -> Result<u64> {
+    fn place_alo(&self, feed: &MarketFeed, placer: Placer, req: &Order) -> Result<u64> {
         let Some(px) = req.limit_px else {
             return Err(Error::bad_request(
                 "Post only order needs a limit price (a market order cannot rest).",
             ));
         };
-        let resting = self.resting_orders(Some(address))?;
+        let resting = self.resting_orders(Some(placer.address))?;
         if crosses(feed, req, &resting) {
             let bbo = bbo(feed, &req.coin, req.side())
                 .map(|p| p.to_string())
@@ -807,7 +886,7 @@ impl Sim {
                 "Post only order would have immediately matched, bbo was {bbo}."
             )));
         }
-        self.rest_order(address, req, px, req.size)
+        self.rest_order(placer, req, (px, req.size))
     }
 
     /// `order`: the immediate take — fill `req` for `address` against the
@@ -815,6 +894,21 @@ impl Sim {
     /// fee; each maker's account is settled at their own price with the maker
     /// fee (no opening probe: the venue reserves margin at placement).
     pub(crate) fn order(&self, feed: &MarketFeed, address: Address, req: &Order) -> Result<Fill> {
+        self.order_with_builder(
+            feed,
+            Placer {
+                address,
+                builder: None,
+            },
+            req,
+        )
+    }
+
+    /// `order` for a placer whose order carries a builder fee: the fee is
+    /// charged on this take's notional with the taker fee, and credited to
+    /// the builder when it is a simulated account.
+    fn order_with_builder(&self, feed: &MarketFeed, placer: Placer, req: &Order) -> Result<Fill> {
+        let address = placer.address;
         let meta = feed.meta();
         let resting = self.resting_orders(None)?;
         // The plan's rule: resting orders are re-margined at match time (the
@@ -832,10 +926,22 @@ impl Sim {
             leverage,
             reduce: req.reduce(),
             fee: super::account::mul(notional, taker_fee(), "taker fee")?,
+            builder: placer.builder.map(|b| b.charge(notional)).transpose()?,
         };
-        self.land_fill(feed, address, &facts, meta.as_ref())?;
-        let consumed = self.settle_legs(feed, req, &legs, meta.as_ref())?;
+        let effect = self.land_fill(feed, address, &facts, meta.as_ref())?;
+        self.credit_builder(facts.builder)?;
         let oid = self.next_oid()?;
+        self.record_fill(
+            address,
+            &FillRecord {
+                facts: &facts,
+                effect,
+                oid,
+                cloid: req.cloid,
+                liquidity: Liquidity::Taker,
+            },
+        )?;
+        let consumed = self.settle_legs(feed, req, &legs, meta.as_ref())?;
         self.metrics
             .orders_filled_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -871,18 +977,31 @@ impl Sim {
                 Candidate::Maker { oid, maker, px, sz } => {
                     let leverage = self.leverage_for(*maker, &req.coin, meta)?;
                     let notional = super::account::mul(*sz, *px, "maker notional")?;
+                    let (reduce, cloid, builder) = self.resting_traits(*oid)?;
                     let facts = super::account::FillFacts {
                         coin: req.coin.clone(),
                         side: req.side().flip(),
                         size: *sz,
                         px: *px,
                         leverage,
-                        reduce: self.resting_flag(*oid)?,
+                        reduce,
                         fee: super::account::mul(notional, maker_fee(), "maker fee")?,
+                        builder: builder.map(|b| b.charge(notional)).transpose()?,
                     };
-                    self.with_account_now(*maker, feed, |account| {
+                    let effect = self.with_account_now(*maker, feed, |account| {
                         super::account::apply_fill(account, &facts, meta)
                     })?;
+                    self.credit_builder(facts.builder)?;
+                    self.record_fill(
+                        *maker,
+                        &FillRecord {
+                            facts: &facts,
+                            effect,
+                            oid: *oid,
+                            cloid,
+                            liquidity: Liquidity::Maker,
+                        },
+                    )?;
                     self.fill_resting(*oid, *sz, *px)?;
                     tracing::info!(maker = %maker, oid, "resting order filled");
                 }
@@ -946,15 +1065,38 @@ impl Sim {
         Ok(())
     }
 
-    /// The taker's own resting flag (for a maker fill's reduce-only semantics).
-    fn resting_flag(&self, oid: u64) -> Result<Reduce> {
+    /// A resting order's reduce-only flag (a maker fill's reduce-only
+    /// semantics), client id (its ledger entry's) and builder fee (a maker
+    /// fill charges it too).
+    fn resting_traits(&self, oid: u64) -> Result<RestingTraits> {
         Ok(self
             .state
             .lock()?
             .resting
             .get(&oid)
-            .map(|r| r.reduce)
-            .unwrap_or(Reduce::Any))
+            .map_or((Reduce::Any, None, None), |r| {
+                (r.reduce, r.cloid, r.builder)
+            }))
+    }
+
+    /// Credit a fill's builder fee to the builder's perp balance. The builder
+    /// is paid only when it is a simulated account (a touched address); an
+    /// unsimulated builder is outside the sim, so the fee has already left the
+    /// payer and is credited nowhere (the venue's builder wallet is not
+    /// modeled). Never creates an account.
+    pub(crate) fn credit_builder(&self, charge: Option<BuilderCharge>) -> Result<()> {
+        let Some(charge) = charge else {
+            return Ok(());
+        };
+        self.with_state(|st| {
+            if let Some(account) = st.accounts.get_mut(&charge.builder) {
+                account.perp_balance =
+                    super::account::add(account.perp_balance, charge.amount, "builder fee credit")?;
+            }
+            Ok(())
+        })?;
+        self.touch();
+        Ok(())
     }
 
     /// `updateLeverage`: the account's per-coin setting (docs: "subject to
@@ -1094,7 +1236,9 @@ impl Sim {
     }
 
     /// Insert a resting order under a fresh oid.
-    fn rest_order(&self, account: Address, req: &Order, px: Decimal, sz: Decimal) -> Result<u64> {
+    fn rest_order(&self, placer: Placer, req: &Order, at: (Decimal, Decimal)) -> Result<u64> {
+        let (px, sz) = at;
+        let account = placer.address;
         let oid = self.next_oid()?;
         let order = RestingOrder {
             oid,
@@ -1111,6 +1255,7 @@ impl Sim {
             placed_ms: crate::now_ms(),
             filled_sz: Decimal::ZERO,
             filled_ntl: Decimal::ZERO,
+            builder: placer.builder,
         };
         self.mutate_state(|st| {
             st.resting.insert(oid, order);
@@ -1319,7 +1464,7 @@ impl Sim {
         address: Address,
         facts: &super::account::FillFacts,
         meta: Option<&crate::wire::Meta>,
-    ) -> Result<()> {
+    ) -> Result<super::ledger::FillEffect> {
         let coin = facts.coin.clone();
         // The venue settles funding at the trade: accrue to now on the
         // *pre-fill* size, then the size change restarts since-change. The
@@ -1403,6 +1548,9 @@ impl Sim {
         })
     }
 }
+
+/// A resting order's fill-time traits: reduce-only flag, client id, builder.
+type RestingTraits = (Reduce, Option<alloy_primitives::B128>, Option<BuilderFee>);
 
 /// One candidate the taker's walk can take: a live level (external liquidity,
 /// recorded as a consumption) or a devnet resting order (an internal trade
@@ -1728,6 +1876,7 @@ mod tests {
             placed_ms: 0,
             filled_sz: Decimal::ZERO,
             filled_ntl: Decimal::ZERO,
+            builder: None,
         };
         assert!(!sim.remargin_ok(&feed, &resting).unwrap());
     }
@@ -2738,5 +2887,302 @@ mod tests {
         let refused = sim.schedule_cancel(a, ScheduleCancel::At(now + 60_000));
         assert!(refused.is_err(), "the 11th trigger of the day is refused");
         assert!(refused.unwrap_err().to_string().contains("per day"));
+    }
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    /// The perp balance of a simulated account.
+    fn balance(sim: &Sim, who: Address) -> Decimal {
+        sim.account(who).unwrap().unwrap().perp_balance
+    }
+
+    /// Fund `who` with `amount` USDC on the perp side.
+    fn fund(sim: &Sim, feed: &MarketFeed, who: Address, amount: &str) {
+        sim.deal(
+            feed,
+            &Deal {
+                address: who,
+                class: DealClass::Perp,
+                coin: None,
+                amount: dec(amount),
+            },
+        )
+        .unwrap();
+    }
+
+    /// The gate: not approved, above the approval, above the perp cap, then
+    /// accepted; a later approval overwrites (up or down) and 0 revokes.
+    #[test]
+    fn the_builder_gate_follows_the_approval_and_the_cap() {
+        let sim = Sim::memory();
+        let owner = Address::repeat_byte(0xaa);
+        let builder = Address::repeat_byte(0xbb);
+        let refusal = |f: u64| {
+            sim.authorize_builder(owner, builder, f)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(refusal(10), "Builder fee has not been approved.");
+        assert_eq!(
+            sim.max_builder_fee(owner, builder).unwrap(),
+            None,
+            "untouched"
+        );
+
+        sim.approve_builder_fee(owner, builder, 50).unwrap();
+        assert_eq!(sim.max_builder_fee(owner, builder).unwrap(), Some(50));
+        assert_eq!(
+            sim.authorize_builder(owner, builder, 50).unwrap(),
+            BuilderFee { builder, f: 50 }
+        );
+        assert!(
+            refusal(51).contains("exceeds the 50 tenths of a basis point"),
+            "{}",
+            refusal(51)
+        );
+        // The perp cap is named even when the approval is larger (the agent
+        // contract approves up to 1000, the venue's perp orders cap at 100).
+        sim.approve_builder_fee(owner, builder, 1_000).unwrap();
+        assert!(
+            refusal(101).contains("perp builder fee cap of 100"),
+            "{}",
+            refusal(101)
+        );
+        assert!(sim.authorize_builder(owner, builder, 100).is_ok());
+        // The venue sets the maximum: a later approval overwrites.
+        sim.approve_builder_fee(owner, builder, 20).unwrap();
+        assert_eq!(sim.max_builder_fee(owner, builder).unwrap(), Some(20));
+        assert!(refusal(21).contains("exceeds the 20"));
+        // Another builder is not approved; 0 revokes.
+        let other = Address::repeat_byte(0xcc);
+        assert_eq!(
+            sim.authorize_builder(owner, other, 1)
+                .unwrap_err()
+                .to_string(),
+            "Builder fee has not been approved."
+        );
+        sim.approve_builder_fee(owner, builder, 0).unwrap();
+        assert_eq!(sim.max_builder_fee(owner, builder).unwrap(), Some(0));
+        assert_eq!(refusal(1), "Builder fee has not been approved.");
+    }
+
+    /// An immediate take with a builder charges `notional * f / 100_000` on
+    /// top of the taker fee, debits it from the placing account, credits a
+    /// simulated builder, and the ledger fill carries `builderFee`. An order
+    /// without a builder is exactly as before.
+    #[test]
+    fn a_builder_fee_is_charged_on_the_take_and_credited_to_the_builder() {
+        let feed = feed_with_book(
+            book("ETH", &[("100", "9")], &[("101", "9")]),
+            meta_with("ETH", 10),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        let builder = Address::repeat_byte(0xbb);
+        fund(&sim, &feed, builder, "10");
+        sim.approve_builder_fee(a, builder, 100).unwrap();
+        let carried = sim.authorize_builder(a, builder, 50).unwrap();
+
+        // A plain order first: no builder fee anywhere.
+        sim.place(&feed, a, &ioc(Side::Buy, "1")).unwrap();
+        let taker = dec("101") * taker_fee();
+        assert_eq!(balance(&sim, a), dec("1000") - taker);
+        assert_eq!(balance(&sim, builder), dec("10"));
+        let plain = sim.user_fills(a).unwrap().remove(0);
+        assert_eq!(plain.builder_fee, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("builderFee")
+            .is_none());
+
+        // 2 at 101 = 202 notional; 50 tenths of a bp = 0.05% = 0.101.
+        sim.place_with_builder(&feed, a, &ioc(Side::Buy, "2"), Some(carried))
+            .unwrap();
+        let fee_taker = dec("202") * taker_fee();
+        let fee_builder = dec("0.101");
+        assert_eq!(
+            balance(&sim, a),
+            dec("1000") - taker - fee_taker - fee_builder
+        );
+        assert_eq!(balance(&sim, builder), dec("10") + fee_builder);
+        let fill = sim.user_fills(a).unwrap().remove(1);
+        assert_eq!(fill.fee, fee_taker, "the exchange fee is unchanged");
+        assert_eq!(fill.builder_fee, Some(fee_builder));
+        assert_eq!(
+            serde_json::to_value(&fill).unwrap()["builderFee"],
+            "0.101",
+            "served as a decimal string"
+        );
+    }
+
+    /// A builder that is not a simulated account is not credited anywhere (and
+    /// is not created), but the placing account still pays.
+    #[test]
+    fn an_unsimulated_builder_is_not_credited() {
+        let feed = feed_with_book(
+            book("ETH", &[("100", "9")], &[("101", "9")]),
+            meta_with("ETH", 10),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        let builder = Address::repeat_byte(0xcc);
+        let carried = BuilderFee { builder, f: 100 };
+        sim.place_with_builder(&feed, a, &ioc(Side::Buy, "1"), Some(carried))
+            .unwrap();
+        // 101 notional at 0.1% = 0.101.
+        assert_eq!(
+            balance(&sim, a),
+            dec("1000") - dec("101") * taker_fee() - dec("0.101")
+        );
+        assert!(sim.account(builder).unwrap().is_none(), "never created");
+    }
+
+    /// A resting order keeps its builder: the maker fill that a later taker
+    /// makes charges it (with the maker fee), and the taker, who carried none,
+    /// pays none.
+    #[test]
+    fn a_resting_order_charges_its_builder_on_the_maker_fill() {
+        // No served bids: the resting bid is the only liquidity.
+        let feed = feed_with_book(book("ETH", &[], &[("101", "5")]), meta_with("ETH", 10));
+        let (sim, maker) = funded_sim(&feed, "1000");
+        let taker = Address::repeat_byte(0xdd);
+        fund(&sim, &feed, taker, "1000");
+        let builder = Address::repeat_byte(0xbb);
+        fund(&sim, &feed, builder, "0");
+        let carried = BuilderFee { builder, f: 20 };
+        let rest = Order {
+            limit_px: Some(dec("100")),
+            tif: Tif::Gtc,
+            ..ioc(Side::Buy, "1")
+        };
+        let oid = sim
+            .place_with_builder(&feed, maker, &rest, Some(carried))
+            .unwrap()
+            .resting
+            .unwrap();
+        assert_eq!(
+            sim.resting_orders(Some(maker)).unwrap()[0].builder,
+            Some(carried),
+            "the resting order keeps its builder"
+        );
+        assert_eq!(balance(&sim, maker), dec("1000"), "resting charges nothing");
+
+        let hit = Order {
+            limit_px: Some(dec("100")),
+            ..ioc(Side::Sell, "1")
+        };
+        sim.place(&feed, taker, &hit).unwrap();
+        // 100 notional: maker fee 0.015, builder fee 100 * 20 / 100000 = 0.02.
+        assert_eq!(
+            balance(&sim, maker),
+            dec("1000") - dec("100") * maker_fee() - dec("0.02")
+        );
+        assert_eq!(balance(&sim, builder), dec("0.02"));
+        let m = sim.user_fills(maker).unwrap().remove(0);
+        assert_eq!((m.oid, m.crossed), (oid, false));
+        assert_eq!(m.builder_fee, Some(dec("0.02")));
+        let t = sim.user_fills(taker).unwrap().remove(0);
+        assert_eq!(t.builder_fee, None, "the taker carried no builder");
+        assert_eq!(balance(&sim, taker), dec("1000") - dec("100") * taker_fee());
+    }
+
+    /// The tick's passive fill (the live book crossing a resting order)
+    /// charges the resting order's builder too.
+    #[test]
+    fn a_passive_tick_fill_charges_the_builder() {
+        let feed = feed_with_book(
+            book("ETH", &[("99", "5")], &[("101", "5")]),
+            meta_with("ETH", 10),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        let builder = Address::repeat_byte(0xbb);
+        fund(&sim, &feed, builder, "0");
+        let carried = BuilderFee { builder, f: 100 };
+        let rest = Order {
+            limit_px: Some(dec("100")),
+            tif: Tif::Gtc,
+            ..ioc(Side::Buy, "1")
+        };
+        sim.place_with_builder(&feed, a, &rest, Some(carried))
+            .unwrap();
+        feed.put_book(
+            book("ETH", &[("99", "5")], &[("100", "5")]),
+            crate::now_ms(),
+        );
+        sim.evaluate(&feed).unwrap();
+
+        let fill = sim.user_fills(a).unwrap().remove(0);
+        assert!(!fill.crossed);
+        assert_eq!(fill.builder_fee, Some(dec("0.1")), "100 at 0.1%");
+        assert_eq!(
+            balance(&sim, a),
+            dec("1000") - dec("100") * maker_fee() - dec("0.1")
+        );
+        assert_eq!(balance(&sim, builder), dec("0.1"));
+    }
+
+    /// State written before builder fees existed still loads: no approvals,
+    /// no builder on a resting order, no `builderFee` on a fill; and the new
+    /// fields round-trip when set (and are omitted when not).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one persistence round trip: splitting it would hide the field-to-line mapping
+    fn an_old_state_file_loads_without_the_builder_fields() {
+        let old = r#"{"accounts": {
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {"perp_balance": "12"}}}"#;
+        let state: crate::sim::SimState = serde_json::from_str(old).unwrap();
+        let a = Address::repeat_byte(0xaa);
+        assert!(state.accounts[&a].builder_approvals.is_empty());
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(
+            json["accounts"]["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+                .get("builder_approvals")
+                .is_none(),
+            "an account with no approvals persists exactly as before"
+        );
+
+        let builder = Address::repeat_byte(0xbb);
+        let mut state = state;
+        state
+            .accounts
+            .get_mut(&a)
+            .unwrap()
+            .builder_approvals
+            .insert(builder, 70);
+        let resting = RestingOrder {
+            oid: 1,
+            account: a,
+            coin: "ETH".into(),
+            side: Side::Buy,
+            px: dec("100"),
+            sz: dec("1"),
+            orig_sz: dec("1"),
+            reduce: Reduce::Any,
+            tif: Tif::Gtc,
+            cloid: None,
+            trigger: None,
+            placed_ms: 0,
+            filled_sz: Decimal::ZERO,
+            filled_ntl: Decimal::ZERO,
+            builder: None,
+        };
+        // A resting order without a builder omits the key; one written by an
+        // older build (no key) reads back with none.
+        let plain = serde_json::to_value(&resting).unwrap();
+        assert!(plain.get("builder").is_none());
+        let back: RestingOrder = serde_json::from_value(plain).unwrap();
+        assert_eq!(back.builder, None);
+        let with = RestingOrder {
+            builder: Some(BuilderFee { builder, f: 5 }),
+            ..resting
+        };
+        state.resting.insert(1, with);
+        let text = serde_json::to_string(&state).unwrap();
+        let loaded: crate::sim::SimState = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.accounts[&a].builder_approvals[&builder], 70);
+        assert_eq!(
+            loaded.resting[&1].builder,
+            Some(BuilderFee { builder, f: 5 })
+        );
     }
 }

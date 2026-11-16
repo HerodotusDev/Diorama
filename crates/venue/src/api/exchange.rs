@@ -4,6 +4,7 @@
 //! shapes in `wire.rs`.
 use super::ApiState;
 use crate::error::{Error, Result};
+use crate::sim::order::BuilderFee;
 use crate::wire::{
     ActionTag, CancelAction, CancelByCloidAction, CancelData, CancelResponseBody, CancelStatus,
     DefaultBody, ErrorStatus, ExchangeAction, ExchangeBody, ExchangeOk, ExchangeResponse,
@@ -25,8 +26,10 @@ use std::sync::Arc;
 /// identity (I3) holds by construction: an order moves the *book*, never the
 /// *mark*; the mark moves only by an explicit crash. An unmodeled action tag
 /// is refused by name in the venue's own `err` envelope (HTTP 200 — the shape
-/// their client parses), as are the TP/SL groupings and builder fees the sim
-/// does not model. The signature is accepted, never verified (the devnet has
+/// their client parses), as are the TP/SL groupings the sim does not model. An
+/// order action's `builder` is accepted when the account approved that builder
+/// for at least `f` (CoreWriter `approveBuilderFee`) and charged on every fill
+/// (see `order_builder`). The signature is accepted, never verified (the devnet has
 /// no keys — the anvil-impersonation analogue), and the acting account is
 /// read from `user` — or from
 /// `vaultAddress`, which routes the action to that vault or subaccount
@@ -299,6 +302,10 @@ fn order_action(
         Ok(parts) => parts,
         Err(reason) => return err_envelope(reason),
     };
+    let builder = match order_builder(state, owner, &req.action) {
+        Ok(builder) => builder,
+        Err(reason) => return err_envelope(reason),
+    };
     tracing::info!(
         owner = %owner,
         nonce = ?req.nonce,
@@ -308,6 +315,7 @@ fn order_action(
         vault = ?req.vault_address,
         group = ?grouping,
         orders = orders.len(),
+        builder = ?builder,
         "exchange order action accepted (the signature is accepted, never verified)"
     );
     let meta = state.feed.meta();
@@ -323,7 +331,7 @@ fn order_action(
     }
     let statuses = orders
         .iter()
-        .map(|action| fill_status(state, owner, meta.as_ref(), action))
+        .map(|action| fill_status(state, (owner, builder), meta.as_ref(), action))
         .collect();
     order_response(statuses)
 }
@@ -496,18 +504,40 @@ fn noop_response(req: &ExchangeBody) -> Response {
     ok_envelope(DefaultBody { r#type: "default" })
 }
 
+/// The order action's builder fee, gated: the account must have approved the
+/// builder (CoreWriter `approveBuilderFee`, read back by `maxBuilderFee`) for at
+/// least `f` tenths of a basis point, and `f` must be within the venue's perp
+/// cap. `Err` is the refusal the err envelope carries (the whole action is
+/// refused, as the venue's is); `Ok(None)` is an order without a builder.
+fn order_builder(
+    state: &ApiState,
+    owner: Address,
+    action: &ExchangeAction,
+) -> Result<Option<BuilderFee>, String> {
+    let ExchangeAction::Order {
+        builder: Some(builder),
+        ..
+    } = action
+    else {
+        return Ok(None);
+    };
+    state
+        .sim
+        .authorize_builder(owner, builder.b, builder.f)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// The action's orders after the boundary checks, or the refusal reason the
 /// err envelope carries: the unmodeled tag (read alone so the reason *names*
-/// it) and the builder fee (fees are a research lane — a fill that silently
-/// skipped the fee would lie).
+/// it) and the TP/SL groupings. The builder fee is gated separately
+/// (`order_builder`: it needs the account's approvals).
 fn order_parts<'a>(
     body: &Bytes,
     action: &'a ExchangeAction,
 ) -> Result<(&'a [OrderAction], Option<Grouping>), String> {
     let ExchangeAction::Order {
-        orders,
-        grouping,
-        builder,
+        orders, grouping, ..
     } = action
     else {
         let tag = serde_json::from_slice::<ActionTag>(body)
@@ -517,14 +547,6 @@ fn order_parts<'a>(
             "venue-sim: `{tag}` is not an order action; {MODELED_ACTIONS}"
         ));
     };
-    if let Some(builder) = builder {
-        return Err(format!(
-            "venue-sim: builder fees are not modeled (fees are a research lane) \
-             — the order would fill without charging {} its {} tenths of a basis point. See \
-             docs/INTEGRATION.md.",
-            builder.b, builder.f
-        ));
-    }
     // The grouping's association semantics are not modeled: a `normalTpsl`
     // parent's children are placed only when it fully fills (or is
     // margin-canceled — the docs' exception), and `positionTpsl` orders
@@ -556,12 +578,15 @@ fn err_envelope(response: String) -> Response {
 }
 
 /// One order's status: the fill, or its refusal, in the venue's own shapes.
+/// `acting` is the acting account and the builder fee the action carries
+/// (every order of the action charges it on its fills).
 fn fill_status(
     state: &ApiState,
-    user: Address,
+    acting: (Address, Option<BuilderFee>),
     meta: Option<&crate::wire::Meta>,
     action: &OrderAction,
 ) -> OrderStatus {
+    let (user, builder) = acting;
     if let Some(cloid) = action.c {
         tracing::info!(
             cloid = %cloid,
@@ -571,7 +596,7 @@ fn fill_status(
     }
     match action
         .to_order(meta)
-        .and_then(|o| state.sim.place(&state.feed, user, &o))
+        .and_then(|o| state.sim.place_with_builder(&state.feed, user, &o, builder))
     {
         Ok(placed) => match (placed.fill, placed.resting) {
             (Some(fill), _) => OrderStatus::Filled(FilledInfo {
@@ -713,13 +738,13 @@ mod tests {
         let req: ExchangeBody = serde_json::from_slice(&body).unwrap();
         let err = order_parts(&body, &req.action).unwrap_err();
         assert!(err.contains("`cancel`"), "{err}");
-        // A builder fee is refused with its numbers.
+        // A builder fee parses and passes the boundary: its approval gate
+        // needs the account (`order_builder`), tested end to end below.
         let body = Bytes::from(
             r#"{"action":{"type":"order","orders":[],"builder":{"b":"0x00000000000000000000000000000000000000e1","f":10}},"user":"0x00000000000000000000000000000000000000e1"}"#,
         );
         let req: ExchangeBody = serde_json::from_slice(&body).unwrap();
-        let err = order_parts(&body, &req.action).unwrap_err();
-        assert!(err.contains("builder fees"), "{err}");
+        assert!(order_parts(&body, &req.action).is_ok());
         // The TP/SL groupings are refused by name (the parent/child
         // lifecycle and the position-linked resizing are not modeled);
         // `"na"` is the plain path.
@@ -827,5 +852,159 @@ mod tests {
         })
         .unwrap();
         assert_eq!(err["status"], "err");
+    }
+
+    const OWNER: &str = "0x00000000000000000000000000000000000000aa";
+    const BUILDER: &str = "0x00000000000000000000000000000000000000bb";
+
+    /// A state serving one ETH book (bids 100, asks 101) over an in-memory
+    /// sim with `OWNER` funded and `BUILDER` a simulated account.
+    fn builder_state() -> Arc<ApiState> {
+        use crate::wire::{L2Book, Level};
+        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let now = crate::now_ms();
+        feed.put_meta(crate::sim::meta_with("ETH", 10), now);
+        feed.put_ctx("ETH".into(), crate::wire::test_ctx("101", "101"), now);
+        let level = |px: &str| Level {
+            px: px.parse().unwrap(),
+            sz: "9".parse().unwrap(),
+            n: 1,
+        };
+        feed.put_book(
+            L2Book {
+                coin: "ETH".into(),
+                time: 0,
+                levels: [vec![level("100")], vec![level("101")]],
+                spread: None,
+            },
+            now,
+        );
+        feed.put_oi_caps(Vec::new());
+        let sim = Arc::new(crate::sim::Sim::memory());
+        for (who, amount) in [(OWNER, "1000"), (BUILDER, "0")] {
+            sim.deal(
+                &feed,
+                &crate::sim::Deal {
+                    address: who.parse().unwrap(),
+                    class: crate::sim::DealClass::Perp,
+                    coin: None,
+                    amount: amount.parse().unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        let api = crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+        Arc::new(
+            ApiState::new(
+                Arc::new(feed),
+                sim,
+                api,
+                None,
+                None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// POST an order action carrying `builder` (a JSON object, or `null`) and
+    /// return the envelope.
+    async fn post_order(state: &Arc<ApiState>, builder: &str) -> serde_json::Value {
+        let body = format!(
+            r#"{{"action":{{"type":"order","orders":[{{"a":0,"b":true,"p":"105","s":"2","t":{{"limit":{{"tif":"Ioc"}}}}}}],"grouping":"na","builder":{builder}}},"user":"{OWNER}"}}"#
+        );
+        let response = exchange(State(state.clone()), Bytes::from(body))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn balance(state: &ApiState, who: &str) -> rust_decimal::Decimal {
+        state
+            .sim
+            .account(who.parse().unwrap())
+            .unwrap()
+            .unwrap()
+            .perp_balance
+    }
+
+    /// The frontend flow end to end: an order carrying a builder the account
+    /// never approved is refused with the venue's string; once approved it is
+    /// accepted, fills, charges the account and credits the builder; a fee
+    /// above the approval, or above the perp cap, is refused by name; an
+    /// order without a builder is unchanged.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the refusals
+    async fn a_builder_order_is_refused_until_approved_then_charged() {
+        let state = builder_state();
+        let owner: Address = OWNER.parse().unwrap();
+        let builder: Address = BUILDER.parse().unwrap();
+        let carried = format!(r#"{{"b":"{BUILDER}","f":50}}"#);
+
+        // Nothing approved yet.
+        let out = post_order(&state, &carried).await;
+        assert_eq!(out["status"], "err");
+        assert_eq!(out["response"], "Builder fee has not been approved.");
+        assert_eq!(balance(&state, OWNER), "1000".parse().unwrap(), "no fill");
+
+        // Approved up to 40: 50 is above it.
+        state.sim.approve_builder_fee(owner, builder, 40).unwrap();
+        let out = post_order(&state, &carried).await;
+        assert_eq!(out["status"], "err");
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds the 40 tenths of a basis point"),
+            "{out}"
+        );
+
+        // Approved up to 1000 (the agent's cap): 101 is above the perp cap.
+        state
+            .sim
+            .approve_builder_fee(owner, builder, 1_000)
+            .unwrap();
+        let out = post_order(&state, &format!(r#"{{"b":"{BUILDER}","f":101}}"#)).await;
+        assert_eq!(out["status"], "err");
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("perp builder fee cap of 100"),
+            "{out}"
+        );
+
+        // 50 is within both: 2 at 101 = 202; builder fee 0.101, taker 0.0909.
+        let out = post_order(&state, &carried).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
+            "2"
+        );
+        let taker =
+            "202".parse::<rust_decimal::Decimal>().unwrap() * crate::sim::order::taker_fee();
+        let fee: rust_decimal::Decimal = "0.101".parse().unwrap();
+        assert_eq!(
+            balance(&state, OWNER),
+            "1000".parse::<rust_decimal::Decimal>().unwrap() - taker - fee
+        );
+        assert_eq!(balance(&state, BUILDER), fee);
+        let fill = state.sim.user_fills(owner).unwrap().remove(0);
+        assert_eq!(fill.builder_fee, Some(fee));
+
+        // Without a builder (`null` is the absent value): no builder fee.
+        let out = post_order(&state, "null").await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            balance(&state, BUILDER),
+            fee,
+            "the builder is not paid again"
+        );
+        let fills = state.sim.user_fills(owner).unwrap();
+        assert_eq!(fills[1].builder_fee, None);
     }
 }

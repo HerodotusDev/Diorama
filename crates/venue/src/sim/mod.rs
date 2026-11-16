@@ -2,9 +2,10 @@
 //! persistence, and the self-advance automaton.
 //!
 //! The modules: `account` (the account math and the position totals), `seed`
-//! (the served-shape patch), `funding` (the hourly interval), `order` (the
-//! matching lane), `validate` (the lane's rules), `waterfall` (the liquidation
-//! ladder), `tick` (the self-advance automaton), `metrics` (the registry).
+//! (the served-shape patch), `funding` (the hourly interval), `ledger` (the
+//! per-account fill and funding history), `order` (the matching lane),
+//! `validate` (the lane's rules), `waterfall` (the liquidation ladder), `tick`
+//! (the self-advance automaton), `metrics` (the registry).
 //!
 //! Untouched accounts are not the sim's business — the API layer passes those
 //! reads through to the real venue. A *touched* account (dealt funds, seeded,
@@ -26,6 +27,7 @@ const ARTIFACT: &str = "sim state";
 
 pub(crate) mod account;
 pub(crate) mod funding;
+pub(crate) mod ledger;
 pub(crate) mod metrics;
 pub(crate) mod order;
 pub(crate) mod seed;
@@ -89,6 +91,11 @@ pub(crate) struct SimState {
     /// The matching lane's order-id counter (monotonic across the scenario).
     #[serde(default)]
     pub next_oid: u64,
+    /// The fill ledger's trade-id counter: unique and strictly increasing
+    /// across the sim (a reset does not rewind it: a consumer that dedupes
+    /// by `tid` must never see one reused).
+    #[serde(default)]
+    pub next_tid: u64,
     #[serde(default)]
     pub accounts: Accounts,
     /// The devnet's resting book (the venue's open orders): keyed by oid.
@@ -626,6 +633,69 @@ impl Sim {
             }
             Ok(())
         })
+    }
+
+    /// Record a builder-fee approval (CoreWriter action 12, the margin
+    /// agent's `approveBuilderFee`): the account's approved maximum for
+    /// `builder`, in tenths of a basis point. The venue *sets* the maximum, so
+    /// a later approval for the same builder overwrites the earlier one; an
+    /// approval of 0 revokes it.
+    pub(crate) fn approve_builder_fee(
+        &self,
+        address: Address,
+        builder: Address,
+        max_fee_rate: u64,
+    ) -> Result<()> {
+        self.mutate_account(address, |account| {
+            if max_fee_rate == 0 {
+                account.builder_approvals.remove(&builder);
+            } else {
+                account.builder_approvals.insert(builder, max_fee_rate);
+            }
+            Ok(())
+        })
+    }
+
+    /// The account's approved maximum builder fee for `builder` (the info
+    /// `maxBuilderFee` answer: 0 when never approved); `None` when the sim
+    /// never touched the account.
+    pub(crate) fn max_builder_fee(
+        &self,
+        address: Address,
+        builder: Address,
+    ) -> Result<Option<u64>> {
+        self.with_state(|state| {
+            Ok(state
+                .accounts
+                .get(&address)
+                .map(|a| a.builder_approvals.get(&builder).copied().unwrap_or(0)))
+        })
+    }
+
+    /// The builder-fee gate of an order action: the fee must be within the
+    /// venue's perp cap and within what the account approved for the builder.
+    /// The refusals are the venue's envelope text (`err` response).
+    pub(crate) fn authorize_builder(
+        &self,
+        address: Address,
+        builder: Address,
+        f: u64,
+    ) -> Result<order::BuilderFee> {
+        if f > order::MAX_PERP_BUILDER_FEE {
+            return Err(Error::bad_request(format!(
+                "venue-sim: the builder fee {f} exceeds the perp builder fee cap of {} \
+                 tenths of a basis point (0.1%).",
+                order::MAX_PERP_BUILDER_FEE
+            )));
+        }
+        match self.max_builder_fee(address, builder)?.unwrap_or(0) {
+            0 => Err(Error::bad_request("Builder fee has not been approved.")),
+            max if f > max => Err(Error::bad_request(format!(
+                "venue-sim: the builder fee {f} exceeds the {max} tenths of a basis point \
+                 the account approved for builder {builder}."
+            ))),
+            _ => Ok(order::BuilderFee { builder, f }),
+        }
     }
 
     /// Set the account's abstraction mode (CoreWriter action 16). Portfolio

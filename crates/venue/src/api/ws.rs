@@ -17,10 +17,13 @@
 //! account's served state: `clearinghouseState`, `spotState`, `assetCtxs`
 //! (omitted while the meta is warming — never an invented empty list), and
 //! `user`.
+use super::candles::CandleSub;
+use super::ws_codec::{self, FastCtx, PacCtx};
 use super::ApiState;
 use crate::sim::Sim;
 use crate::wire::{
-    AllMids, AssetCtx, ClearinghouseState, L2Book, MarginSummary, SpotClearinghouseState,
+    ActiveAssetData, AllMids, AssetCtx, ClearinghouseState, L2Book, MarginSummary,
+    SpotClearinghouseState,
 };
 use alloy_primitives::Address;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -28,11 +31,12 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// One subscription the sim serves. `l2Book` pushes the composed book on the
-/// session's tick; `webData2` pushes the account's served clearinghouse/spot
-/// state (the real venue's own account channel).
+/// One subscription the sim serves, in the real venue's vocabulary. The ack
+/// echoes the subscription with the venue's defaults filled in (`nSigFigs:
+/// null`, `fast: false`, `dex: ""`, ...), exactly as the real venue does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum Subscription {
@@ -41,24 +45,81 @@ pub(crate) enum Subscription {
     #[serde(rename = "activeAssetCtx")]
     ActiveAssetCtx { coin: String },
     #[serde(rename = "l2Book")]
-    L2Book { coin: String },
+    L2Book {
+        coin: String,
+        #[serde(rename = "nSigFigs", default)]
+        n_sig_figs: Option<u8>,
+        #[serde(default)]
+        mantissa: Option<u8>,
+        #[serde(default)]
+        fast: bool,
+    },
+    /// The legacy account channel, kept beside the current ones.
     #[serde(rename = "webData2")]
     WebData2 { user: Address },
     /// The real venue's per-dex account state channel (`{dex, user,
-    /// clearinghouseState}`), the current vocabulary beside the legacy
-    /// `webData2` alias.
+    /// clearinghouseState}`).
     #[serde(rename = "clearinghouseState")]
-    ClearinghouseState { user: Address },
+    ClearinghouseState {
+        #[serde(default)]
+        dex: String,
+        user: Address,
+    },
     /// The real venue's open-orders channel (`{dex, user, orders}`).
     #[serde(rename = "openOrders")]
-    OpenOrders { user: Address },
+    OpenOrders {
+        #[serde(default)]
+        dex: String,
+        user: Address,
+    },
     /// The real venue's spot-state channel (`{user, spotState}`).
     #[serde(rename = "spotState")]
-    SpotState { user: Address },
+    SpotState {
+        user: Address,
+        #[serde(rename = "ignorePortfolioMargin", default)]
+        ignore_portfolio_margin: bool,
+    },
+    /// Every perp's mark and mid, deflate-compressed, changed fields after the
+    /// first frame.
+    #[serde(rename = "fastAssetCtxs")]
+    FastAssetCtxs,
+    /// Every perp's full context, per dex, deflate-compressed, changed fields
+    /// after the first frame.
+    #[serde(rename = "pac")]
+    Pac,
+    /// The order book: a full book first, compressed diffs after it.
+    #[serde(rename = "l2")]
+    L2 {
+        c: String,
+        #[serde(default)]
+        s: Option<u8>,
+        #[serde(default)]
+        m: Option<u8>,
+    },
+    #[serde(rename = "candle")]
+    Candle { coin: String, interval: String },
+    /// The account's state on every perp dex (`[[dex, state], ...]`).
+    #[serde(rename = "allDexsClearinghouseState")]
+    AllDexsClearinghouseState { user: Address },
+    #[serde(rename = "userFills")]
+    UserFills {
+        user: Address,
+        #[serde(rename = "aggregateByTime", default)]
+        aggregate_by_time: bool,
+    },
+    #[serde(rename = "userFundings")]
+    UserFundings { user: Address },
+    #[serde(rename = "activeAssetData")]
+    ActiveAssetData { user: Address, coin: String },
 }
 
+/// The candle intervals the venue accepts.
+const CANDLE_INTERVALS: [&str; 14] = [
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w", "1M",
+];
+
 /// One client request (the client's `Subscribe`/`Ping` shapes, plus
-/// `unsubscribe` — the venue's own method set).
+/// `unsubscribe`: the venue's own method set).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method", rename_all = "lowercase")]
 pub(crate) enum WsRequest {
@@ -86,6 +147,22 @@ pub(crate) enum WsPush {
     OpenOrders { data: OpenOrdersData },
     #[serde(rename = "spotState")]
     SpotState { data: SpotStateData },
+    /// Base64 of a raw deflate stream (see `ws_codec`).
+    #[serde(rename = "fastAssetCtxs")]
+    FastAssetCtxs { data: String },
+    #[serde(rename = "pac")]
+    Pac { data: String },
+    /// `{"s": book}` first, `{"c": compressed diff}` after.
+    #[serde(rename = "l2")]
+    L2 { data: serde_json::Value },
+    #[serde(rename = "allDexsClearinghouseState")]
+    AllDexsClearinghouseState { data: serde_json::Value },
+    #[serde(rename = "userFills")]
+    UserFills { data: serde_json::Value },
+    #[serde(rename = "userFundings")]
+    UserFundings { data: serde_json::Value },
+    #[serde(rename = "activeAssetData")]
+    ActiveAssetData { data: ActiveAssetData },
     #[serde(rename = "subscriptionResponse")]
     SubscriptionResponse { data: SubscriptionAck },
     #[serde(rename = "pong")]
@@ -135,7 +212,7 @@ pub(crate) struct ClearinghouseStateData {
 pub(crate) struct OpenOrdersData {
     dex: String,
     user: Address,
-    orders: Vec<super::info::OpenOrder>,
+    orders: Vec<super::info::FrontendOpenOrder>,
 }
 
 /// The real venue's `spotState` channel payload.
@@ -167,10 +244,34 @@ pub async fn ws(
     upgrade.on_upgrade(move |socket| session(state, socket))
 }
 
+/// What a live subscription remembers between pushes: the previous state the
+/// next diff is computed against, or the relay it listens to.
+enum Mem {
+    /// A channel that pushes its whole state every tick.
+    Whole,
+    /// Nothing pushed yet on a diffing channel.
+    Fresh,
+    Fast(BTreeMap<String, FastCtx>),
+    Pac(Vec<Option<PacCtx>>),
+    L2(L2Book),
+    Candle(CandleSub),
+    /// The newest fill id (`tid`) already pushed.
+    Fills(Option<u64>),
+    /// The newest funding `(time, coin)` already pushed.
+    Fundings(Option<(u64, String)>),
+}
+
+/// One live subscription and what it remembers.
+pub(crate) struct Live {
+    sub: Subscription,
+    mem: Mem,
+}
+
 /// One connection: read requests, push the subscribed channels on the 1 Hz
-/// tick (the automaton's own cadence).
+/// tick (the automaton's own cadence), and push a subscription's first frame
+/// right after its ack (the real venue does).
 async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
-    let mut subs: Vec<Subscription> = Vec::new();
+    let mut subs: Vec<Live> = Vec::new();
     let mut tick = tokio::time::interval(state.push_interval);
     loop {
         tokio::select! {
@@ -178,10 +279,11 @@ async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
                 // One clock read per tick: every channel in this tick serves
                 // the same instant (a scripted book is stamped with it).
                 let now = crate::now_ms();
-                for sub in &subs {
-                    let Some(frame) = push_frame(sub, &state, now) else { continue };
-                    if socket.send(Message::Text(frame.into())).await.is_err() {
-                        return;
+                for live in &mut subs {
+                    for frame in pushes(live, &state, now) {
+                        if socket.send(Message::Text(frame.into())).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -190,37 +292,63 @@ async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
                     if msg.is_none() || matches!(msg, Some(Err(_))) { return; }
                     continue; // binary/ping/pong frames: nothing to answer
                 };
+                let before = subs.len();
                 let reply = request_reply(&text, &mut subs, &state);
-                let Ok(text) = serde_json::to_string(&reply) else { continue };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                let Ok(reply_text) = serde_json::to_string(&reply) else { continue };
+                if socket.send(Message::Text(reply_text.into())).await.is_err() {
                     return;
+                }
+                if subs.len() > before {
+                    if let Some(live) = subs.last_mut() {
+                        for frame in pushes(live, &state, crate::now_ms()) {
+                            if socket.send(Message::Text(frame.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// One request's answer: the ack, the error, or the pong. A subscription is
-/// added at most once; unsubscribing a subscription that is not live is still
-/// acked (idempotent, the venue's own contract).
-fn request_reply(text: &str, subs: &mut Vec<Subscription>, state: &ApiState) -> WsPush {
-    let request = match serde_json::from_str::<WsRequest>(text) {
-        Ok(request) => request,
-        Err(e) => {
-            return WsPush::Error {
-                data: format!("unparsable request: {e}"),
-            };
-        }
+/// The venue's answer to a request it cannot parse: the request text echoed.
+fn parse_error(text: &str) -> WsPush {
+    WsPush::Error {
+        data: format!("Error parsing JSON into valid websocket request: {text}"),
+    }
+}
+
+/// One request's answer: the ack or the error, or the pong. A subscription is
+/// added at most once and removed at most once: the venue answers a repeat of
+/// either with an error frame naming the subscription, not an ack.
+pub(super) fn request_reply(text: &str, subs: &mut Vec<Live>, state: &ApiState) -> WsPush {
+    let Ok(request) = serde_json::from_str::<WsRequest>(text) else {
+        return parse_error(text);
     };
     match request {
         WsRequest::Ping => WsPush::Pong,
         WsRequest::Subscribe { subscription } => {
-            if let Err(reason) = unsupported(&subscription, state) {
-                return WsPush::Error { data: reason };
+            let named = subscription_json(&subscription);
+            if subs.iter().any(|live| live.sub == subscription) {
+                return WsPush::Error {
+                    data: format!("Already subscribed: {named}"),
+                };
             }
-            if !subs.contains(&subscription) {
-                subs.push(subscription.clone());
-            }
+            let mem = match admit(&subscription, state) {
+                Ok(mem) => mem,
+                Err(Refusal::Parse) => return parse_error(text),
+                Err(Refusal::Invalid) => {
+                    return WsPush::Error {
+                        data: format!("Invalid subscription {named}"),
+                    };
+                }
+                Err(Refusal::Named(reason)) => return WsPush::Error { data: reason },
+            };
+            subs.push(Live {
+                sub: subscription.clone(),
+                mem,
+            });
             WsPush::SubscriptionResponse {
                 data: SubscriptionAck {
                     method: "subscribe",
@@ -229,7 +357,13 @@ fn request_reply(text: &str, subs: &mut Vec<Subscription>, state: &ApiState) -> 
             }
         }
         WsRequest::Unsubscribe { subscription } => {
-            subs.retain(|s| s != &subscription);
+            let before = subs.len();
+            subs.retain(|live| live.sub != subscription);
+            if subs.len() == before {
+                return WsPush::Error {
+                    data: format!("Already unsubscribed: {}", subscription_json(&subscription)),
+                };
+            }
             WsPush::SubscriptionResponse {
                 data: SubscriptionAck {
                     method: "unsubscribe",
@@ -240,37 +374,195 @@ fn request_reply(text: &str, subs: &mut Vec<Subscription>, state: &ApiState) -> 
     }
 }
 
-/// Why the sim cannot serve a subscription; `Err` = the refusal.
-fn unsupported(sub: &Subscription, state: &ApiState) -> Result<(), String> {
+/// A subscription as the venue's error frames print it.
+fn subscription_json(sub: &Subscription) -> String {
+    serde_json::to_string(sub).unwrap_or_default()
+}
+
+/// Why a subscription is refused.
+enum Refusal {
+    /// The request does not parse as a valid one (the venue's parse error).
+    Parse,
+    /// A well-formed subscription the venue does not serve (unknown coin).
+    Invalid,
+    /// A refusal that names its own reason (the sim's own lanes).
+    Named(String),
+}
+
+/// Admit a subscription: `Ok` with the memory its pushes diff against, or the
+/// refusal. A bookless coin is refused at subscribe time, never left silent:
+/// the composed book is the same one `/info`'s `l2Book` serves.
+#[allow(clippy::too_many_lines)] // one match over the served subscriptions: splitting it would hide which channel refuses what
+fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
     let feed = &state.feed;
-    match sub {
-        Subscription::AllMids => Ok(()),
-        Subscription::ActiveAssetCtx { coin } if feed.mark(coin).is_some() => Ok(()),
-        Subscription::ActiveAssetCtx { coin } => Err(format!(
-            "coin `{coin}` is not in the venue's tracked markets"
-        )),
-        // A bookless coin is refused at subscribe time, never left silent:
-        // the composed book is the same one `/info`'s `l2Book` serves.
-        Subscription::L2Book { coin } if feed.book(coin, crate::now_ms()).is_some() => Ok(()),
-        Subscription::L2Book { coin } => {
-            Err(format!("coin `{coin}` has no book in the venue's feed"))
+    // The account plane is addressable from the API state: a touched account
+    // is computed from the sim, an untouched one is served the venue's empty
+    // shape (the same contract `/info`'s passthrough holds). Only a state
+    // read fault refuses the subscription.
+    let account_ok =
+        |user: &Address| {
+            state.sim.account(*user).map(|_| ()).map_err(|e| {
+                Refusal::Named(format!("account state for `{user}` is unavailable: {e}"))
+            })
+        };
+    let has_book = |coin: &str| {
+        if feed.book(coin, crate::now_ms()).is_some() {
+            Ok(())
+        } else {
+            Err(Refusal::Named(format!(
+                "coin `{coin}` has no book in the venue's feed"
+            )))
         }
-        // The account plane is addressable from the API state: a touched account
-        // is computed from the sim, an untouched one is served the venue's empty
-        // shape (the same contract `/info`'s passthrough holds). Only a state
-        // read fault refuses the subscription.
+    };
+    match sub {
+        Subscription::AllMids => Ok(Mem::Whole),
+        Subscription::ActiveAssetCtx { coin } if feed.mark(coin).is_some() => Ok(Mem::Whole),
+        Subscription::ActiveAssetCtx { .. } => Err(Refusal::Invalid),
+        Subscription::L2Book {
+            coin,
+            n_sig_figs,
+            mantissa,
+            ..
+        } => {
+            super::info::book_params_ok(*n_sig_figs, *mantissa).map_err(|_| Refusal::Invalid)?;
+            has_book(coin)?;
+            Ok(Mem::Whole)
+        }
+        Subscription::L2 { c, s, m } => {
+            super::info::book_params_ok(*s, *m).map_err(|_| Refusal::Invalid)?;
+            has_book(c)?;
+            Ok(Mem::Fresh)
+        }
         Subscription::WebData2 { user }
-        | Subscription::ClearinghouseState { user }
-        | Subscription::OpenOrders { user }
-        | Subscription::SpotState { user } => match state.sim.account(*user) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("account state for `{user}` is unavailable: {e}")),
-        },
+        | Subscription::ClearinghouseState { user, .. }
+        | Subscription::OpenOrders { user, .. }
+        | Subscription::SpotState { user, .. }
+        | Subscription::AllDexsClearinghouseState { user } => {
+            account_ok(user)?;
+            Ok(Mem::Whole)
+        }
+        Subscription::ActiveAssetData { user, coin } => {
+            account_ok(user)?;
+            if feed.mark(coin).is_none() {
+                return Err(Refusal::Invalid);
+            }
+            Ok(Mem::Whole)
+        }
+        Subscription::FastAssetCtxs | Subscription::Pac => Ok(Mem::Fresh),
+        Subscription::Candle { coin, interval } => {
+            if !CANDLE_INTERVALS.contains(&interval.as_str()) {
+                return Err(Refusal::Parse);
+            }
+            state
+                .candles
+                .subscribe(coin, interval)
+                .map(Mem::Candle)
+                .ok_or_else(|| {
+                    Refusal::Named("the venue's candle stream is unavailable".to_string())
+                })
+        }
+        Subscription::UserFills { user, .. } => {
+            account_ok(user)?;
+            Ok(Mem::Fills(None))
+        }
+        Subscription::UserFundings { user } => {
+            account_ok(user)?;
+            Ok(Mem::Fundings(None))
+        }
     }
 }
 
-/// The frame one subscription pushes, from the composed cache. `None` = the
-/// coin has no ctx yet (the feed is warming; the tick retries) — a
+/// The frames one live subscription pushes on this tick: none while a diffing
+/// channel has nothing new, one for the whole-state channels.
+#[allow(clippy::too_many_lines)] // one match over the channels: the diffing state lives in the arms
+pub(super) fn pushes(live: &mut Live, state: &ApiState, now_ms: u64) -> Vec<String> {
+    let feed = &state.feed;
+    match (&live.sub, &mut live.mem) {
+        (Subscription::FastAssetCtxs, mem) => {
+            let next = ws_codec::fast_snapshot(feed);
+            if next.is_empty() {
+                // The meta has not landed: nothing to push yet, retry.
+                return Vec::new();
+            }
+            let prev = match mem {
+                Mem::Fast(prev) => Some(&*prev),
+                _ => None,
+            };
+            let Some(frame) = ws_codec::fast_frame(prev, &next) else {
+                return Vec::new();
+            };
+            *mem = Mem::Fast(next);
+            encode(&WsPush::FastAssetCtxs { data: frame })
+        }
+        (Subscription::Pac, mem) => {
+            let Some(next) = ws_codec::pac_snapshot(feed) else {
+                return Vec::new();
+            };
+            let prev = match mem {
+                Mem::Pac(prev) => Some(&*prev),
+                _ => None,
+            };
+            let Some(frame) = ws_codec::pac_frame(prev, &next) else {
+                return Vec::new();
+            };
+            *mem = Mem::Pac(next);
+            encode(&WsPush::Pac { data: frame })
+        }
+        (Subscription::L2 { c, s, m }, mem) => {
+            let Some(book) = feed.book(c, now_ms) else {
+                return encode(&WsPush::Error {
+                    data: format!("coin `{c}` has no book in the venue's feed"),
+                });
+            };
+            let next = match s {
+                Some(_) => super::info::aggregate_book(book, *s, m.unwrap_or(1)),
+                None => book,
+            };
+            let data = match mem {
+                Mem::L2(prev) => {
+                    let Some(diff) = ws_codec::l2_diff(prev, &next) else {
+                        return Vec::new();
+                    };
+                    serde_json::json!({ "c": ws_codec::deflate_b64(&diff) })
+                }
+                _ => serde_json::json!({ "s": next }),
+            };
+            *mem = Mem::L2(next);
+            encode(&WsPush::L2 { data })
+        }
+        (Subscription::Candle { .. }, Mem::Candle(candles)) => {
+            let mut frames = Vec::new();
+            if let Some(first) = candles.take_first() {
+                frames.push(first);
+            }
+            if let Some(latest) = candles.latest() {
+                frames.push(latest);
+            }
+            frames
+        }
+        (Subscription::UserFills { user, .. }, Mem::Fills(cursor)) => {
+            user_fills_push(state, *user, cursor)
+        }
+        (Subscription::UserFundings { user }, Mem::Fundings(cursor)) => {
+            user_fundings_push(state, *user, cursor)
+        }
+        (sub, _) => push_frame(sub, state, now_ms).into_iter().collect(),
+    }
+}
+
+fn encode(push: &WsPush) -> Vec<String> {
+    match serde_json::to_string(push) {
+        Ok(frame) => vec![frame],
+        Err(e) => {
+            tracing::warn!(error = %e, "ws push serialization failed");
+            Vec::new()
+        }
+    }
+}
+
+/// The frame a whole-state subscription pushes, from the composed cache.
+/// `None` = the coin has no ctx yet (the feed is warming; the tick retries) or
+/// the channel is one of the diffing ones (`pushes` owns those): a
 /// serialization fault on these plain shapes is a bug, named here.
 fn push_frame(sub: &Subscription, state: &ApiState, now_ms: u64) -> Option<String> {
     let feed = &state.feed;
@@ -287,17 +579,30 @@ fn push_frame(sub: &Subscription, state: &ApiState, now_ms: u64) -> Option<Strin
             },
         },
         // The composed book: scripted override over the live remainder, stamped
-        // exactly as the REST read stamps it (`feed.book` owns that rule).
-        Subscription::L2Book { coin } => match feed.book(coin, now_ms) {
-            Some(book) => WsPush::L2Book { data: book },
+        // exactly as the REST read stamps it (`feed.book` owns that rule),
+        // aggregated per the subscription's parameters.
+        Subscription::L2Book {
+            coin,
+            n_sig_figs,
+            mantissa,
+            ..
+        } => match feed.book(coin, now_ms) {
+            Some(book) => WsPush::L2Book {
+                data: match n_sig_figs {
+                    Some(_) => {
+                        super::info::aggregate_book(book, *n_sig_figs, mantissa.unwrap_or(1))
+                    }
+                    None => book,
+                },
+            },
             // A book that vanished after the ack is an error frame, not
             // silence (the subscriber must know its channel stopped serving).
             None => WsPush::Error {
                 data: format!("coin `{coin}` has no book in the venue's feed"),
             },
         },
-        // The account plane's four channels share one body; the channel name
-        // only selects the frame shape.
+        // The account plane's channels share one body; the channel name only
+        // selects the frame shape.
         _ => account_push(sub, state)?,
     };
     match serde_json::to_string(&push) {
@@ -311,6 +616,7 @@ fn push_frame(sub: &Subscription, state: &ApiState, now_ms: u64) -> Option<Strin
 
 /// The account-plane frame for one subscription. `None` only for a non-account
 /// variant (the caller's match has already handled the market channels).
+#[allow(clippy::too_many_lines)] // one match over the account channels
 fn account_push(sub: &Subscription, state: &ApiState) -> Option<WsPush> {
     let push = match sub {
         Subscription::WebData2 { user } => match web_data2(state, *user) {
@@ -319,10 +625,10 @@ fn account_push(sub: &Subscription, state: &ApiState) -> Option<WsPush> {
                 data: format!("webData2 for `{user}` is unavailable: {e}"),
             },
         },
-        Subscription::ClearinghouseState { user } => match account_states(state, *user) {
-            Ok((clearinghouse_state, _)) => WsPush::ClearinghouseState {
+        Subscription::ClearinghouseState { dex, user } => match dex_state(state, *user, dex) {
+            Ok(clearinghouse_state) => WsPush::ClearinghouseState {
                 data: ClearinghouseStateData {
-                    dex: String::new(),
+                    dex: dex.clone(),
                     user: *user,
                     clearinghouse_state,
                 },
@@ -331,40 +637,145 @@ fn account_push(sub: &Subscription, state: &ApiState) -> Option<WsPush> {
                 data: format!("clearinghouseState for `{user}` is unavailable: {e}"),
             },
         },
-        Subscription::OpenOrders { user } => open_orders_push(*user, state),
-        Subscription::SpotState { user } => spot_state_push(*user, state),
-        Subscription::AllMids
-        | Subscription::ActiveAssetCtx { .. }
-        | Subscription::L2Book { .. } => return None,
+        Subscription::AllDexsClearinghouseState { user } => match dex_state(state, *user, "") {
+            Ok(first) => WsPush::AllDexsClearinghouseState {
+                data: serde_json::json!({
+                    "user": user,
+                    "clearinghouseStates": [["", first]],
+                }),
+            },
+            Err(e) => WsPush::Error {
+                data: format!("allDexsClearinghouseState for `{user}` is unavailable: {e}"),
+            },
+        },
+        Subscription::OpenOrders { dex, user } => open_orders_push(*user, dex, state),
+        Subscription::SpotState { user, .. } => spot_state_push(*user, state),
+        Subscription::ActiveAssetData { user, coin } => match state.sim.account(*user) {
+            Ok(Some(account)) => {
+                match super::info::active_asset_data(state, *user, &account, coin) {
+                    Ok(data) => WsPush::ActiveAssetData { data },
+                    Err(e) => WsPush::Error {
+                        data: format!("activeAssetData for `{user}` is unavailable: {e}"),
+                    },
+                }
+            }
+            Ok(None) => WsPush::Error {
+                data: format!(
+                    "activeAssetData for `{user}` is unavailable: not a simulated account"
+                ),
+            },
+            Err(e) => WsPush::Error {
+                data: format!("activeAssetData for `{user}` is unavailable: {e}"),
+            },
+        },
+        _ => return None,
     };
     Some(push)
 }
 
+/// The account's perp state on one dex: the served read for the first dex, the
+/// empty shape for any other (the sim serves the first dex only).
+fn dex_state(
+    state: &ApiState,
+    user: Address,
+    dex: &str,
+) -> crate::error::Result<ClearinghouseState> {
+    if !dex.is_empty() {
+        return Ok(empty_clearinghouse(Sim::served_time(crate::now_ms())));
+    }
+    Ok(account_states(state, user)?.0)
+}
+
 /// The `openOrders` channel's frame: the sim's resting rows in the venue's
-/// `{dex, user, orders}` shape.
-fn open_orders_push(user: Address, state: &ApiState) -> WsPush {
+/// `{dex, user, orders}` shape (the same rows `frontendOpenOrders` serves).
+fn open_orders_push(user: Address, dex: &str, state: &ApiState) -> WsPush {
+    if !dex.is_empty() {
+        return WsPush::OpenOrders {
+            data: OpenOrdersData {
+                dex: dex.to_string(),
+                user,
+                orders: Vec::new(),
+            },
+        };
+    }
     match state.sim.resting_orders(Some(user)) {
         Ok(rows) => WsPush::OpenOrders {
             data: OpenOrdersData {
                 dex: String::new(),
                 user,
-                orders: rows
-                    .into_iter()
-                    .map(|r| super::info::OpenOrder {
-                        coin: r.coin.clone(),
-                        limit_px: r.px.to_string(),
-                        oid: r.oid,
-                        side: super::info::side_letter(r.side),
-                        sz: r.sz.to_string(),
-                        timestamp: r.placed_ms,
-                    })
-                    .collect(),
+                orders: rows.iter().map(super::info::frontend_row).collect(),
             },
         },
         Err(e) => WsPush::Error {
             data: format!("openOrders for `{user}` is unavailable: {e}"),
         },
     }
+}
+
+/// The most a `userFills` or `userFundings` snapshot carries.
+const SNAPSHOT_PAGE: usize = 2_000;
+
+/// The `userFills` frames: the account's recent fills as a snapshot on the
+/// first push, each new fill after it. The ledger is the sim's own; an
+/// address the sim never touched has none.
+fn user_fills_push(state: &ApiState, user: Address, cursor: &mut Option<u64>) -> Vec<String> {
+    let fills = state.sim.user_fills(user).unwrap_or_default();
+    let (fresh, snapshot): (Vec<_>, bool) = match *cursor {
+        None => {
+            let skip = fills.len().saturating_sub(SNAPSHOT_PAGE);
+            (fills.into_iter().skip(skip).collect(), true)
+        }
+        Some(last) => (fills.into_iter().filter(|f| f.tid > last).collect(), false),
+    };
+    if !snapshot && fresh.is_empty() {
+        return Vec::new();
+    }
+    if let Some(newest) = fresh.last() {
+        *cursor = Some(newest.tid);
+    } else {
+        // An empty snapshot still counts as pushed.
+        *cursor = Some(0);
+    }
+    let mut data = serde_json::json!({ "user": user, "fills": fresh });
+    if snapshot {
+        data["isSnapshot"] = serde_json::Value::Bool(true);
+    }
+    encode(&WsPush::UserFills { data })
+}
+
+/// The `userFundings` frames: same contract as the fills, for funding payments
+/// (served flat, without the info route's ledger wrapper).
+fn user_fundings_push(
+    state: &ApiState,
+    user: Address,
+    cursor: &mut Option<(u64, String)>,
+) -> Vec<String> {
+    let all = state.sim.user_fundings(user, 0).unwrap_or_default();
+    let (fresh, snapshot): (Vec<_>, bool) = match cursor.as_ref() {
+        None => {
+            let skip = all.len().saturating_sub(SNAPSHOT_PAGE);
+            (all.into_iter().skip(skip).collect(), true)
+        }
+        Some((time, coin)) => (
+            all.into_iter()
+                .filter(|f| (f.time, f.coin.as_str()) > (*time, coin.as_str()))
+                .collect(),
+            false,
+        ),
+    };
+    if !snapshot && fresh.is_empty() {
+        return Vec::new();
+    }
+    *cursor = Some(
+        fresh
+            .last()
+            .map_or((0, String::new()), |f| (f.time, f.coin.clone())),
+    );
+    let mut data = serde_json::json!({ "user": user, "fundings": fresh });
+    if snapshot {
+        data["isSnapshot"] = serde_json::Value::Bool(true);
+    }
+    encode(&WsPush::UserFundings { data })
 }
 
 /// The `spotState` channel's frame: the same balances `/info` serves, in the
@@ -488,6 +899,15 @@ mod tests {
         )
     }
 
+    fn book_sub(coin: &str) -> Subscription {
+        Subscription::L2Book {
+            coin: coin.into(),
+            n_sig_figs: None,
+            mantissa: None,
+            fast: false,
+        }
+    }
+
     /// One two-sided book (the same shape `/info`'s `l2Book` serves).
     fn test_book(coin: &str, px: &str) -> L2Book {
         let bid: Decimal = px.parse().unwrap();
@@ -579,11 +999,35 @@ mod tests {
                 2_000,
             )
             .unwrap(),
-            push_frame(&Subscription::L2Book { coin: "BTC".into() }, &state, 2_000).unwrap(),
+            push_frame(&book_sub("BTC"), &state, 2_000).unwrap(),
             push_frame(&Subscription::WebData2 { user }, &state, 2_000).unwrap(),
-            push_frame(&Subscription::ClearinghouseState { user }, &state, 2_000).unwrap(),
-            push_frame(&Subscription::OpenOrders { user }, &state, 2_000).unwrap(),
-            push_frame(&Subscription::SpotState { user }, &state, 2_000).unwrap(),
+            push_frame(
+                &Subscription::ClearinghouseState {
+                    dex: String::new(),
+                    user,
+                },
+                &state,
+                2_000,
+            )
+            .unwrap(),
+            push_frame(
+                &Subscription::OpenOrders {
+                    dex: String::new(),
+                    user,
+                },
+                &state,
+                2_000,
+            )
+            .unwrap(),
+            push_frame(
+                &Subscription::SpotState {
+                    user,
+                    ignore_portfolio_margin: false,
+                },
+                &state,
+                2_000,
+            )
+            .unwrap(),
             serde_json::to_string(&WsPush::Pong).unwrap(),
             serde_json::to_string(&WsPush::Error { data: "x".into() }).unwrap(),
         ];
@@ -664,7 +1108,7 @@ mod tests {
         let state = api_state(feed.clone());
         let user = Address::repeat_byte(0xaa);
         fund_perp(&state, &feed, user);
-        let mut subs = Vec::new();
+        let mut subs: Vec<Live> = Vec::new();
 
         let ack = request_reply(
             r#"{"method":"subscribe","subscription":{"type":"allMids"}}"#,
@@ -672,12 +1116,16 @@ mod tests {
             &state,
         );
         assert!(matches!(ack, WsPush::SubscriptionResponse { .. }));
-        request_reply(
+        let repeat = request_reply(
             r#"{"method":"subscribe","subscription":{"type":"allMids"}}"#,
             &mut subs,
             &state,
         );
         assert_eq!(subs.len(), 1, "a duplicate subscribe is not queued twice");
+        assert!(
+            matches!(&repeat, WsPush::Error { data } if data == r#"Already subscribed: {"type":"allMids"}"#),
+            "{repeat:?}"
+        );
 
         let ack = request_reply(
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#,
@@ -741,13 +1189,16 @@ mod tests {
             &state,
         );
         assert_eq!(subs.len(), 3);
-        // Unsubscribing something that is not live is still acked.
-        let ack = request_reply(
+        // Unsubscribing something that is not live is the venue's own error.
+        let error = request_reply(
             r#"{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#,
             &mut subs,
             &state,
         );
-        assert!(matches!(ack, WsPush::SubscriptionResponse { .. }));
+        assert!(
+            matches!(&error, WsPush::Error { data } if data.starts_with("Already unsubscribed: ")),
+            "{error:?}"
+        );
         request_reply(
             r#"{"method":"unsubscribe","subscription":{"type":"allMids"}}"#,
             &mut subs,
@@ -772,7 +1223,7 @@ mod tests {
         let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
         feed.put_book(test_book("BTC", "100"), 1_000);
         let state = api_state(feed.clone());
-        let sub = Subscription::L2Book { coin: "BTC".into() };
+        let sub = book_sub("BTC");
         let live = push_frame(&sub, &state, 5_000).unwrap();
         let value: serde_json::Value = serde_json::from_str(&live).unwrap();
         assert_eq!(value["channel"], "l2Book");
@@ -799,14 +1250,7 @@ mod tests {
             "scripted − consumed"
         );
 
-        let missing = push_frame(
-            &Subscription::L2Book {
-                coin: "NOPE".into(),
-            },
-            &state,
-            5_000,
-        )
-        .unwrap();
+        let missing = push_frame(&book_sub("NOPE"), &state, 5_000).unwrap();
         let value: serde_json::Value = serde_json::from_str(&missing).unwrap();
         assert_eq!(value["channel"], "error");
     }

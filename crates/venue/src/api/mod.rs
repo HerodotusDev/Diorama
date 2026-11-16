@@ -6,11 +6,15 @@
 //! venue for untouched ones), the control router drives scenarios. The error
 //! mapping keeps the taxonomy's meaning on the wire: control refusals are
 //! 4xx, a warming market plane is 503, a venue fault is 502.
+pub(crate) mod candles;
 pub(crate) mod control;
 pub(crate) mod cors;
 pub(crate) mod exchange;
 pub(crate) mod info;
+#[cfg(test)]
+mod parity;
 pub(crate) mod ws;
+pub(crate) mod ws_codec;
 
 use crate::error::Result;
 use crate::feed::rest::RestClient;
@@ -39,6 +43,9 @@ pub struct ApiState {
     /// The venue websocket's push cadence (the account automaton's configured
     /// tick, not a second hardcoded second).
     pub push_interval: std::time::Duration,
+    /// The relayed candle streams (the venue serves candles; the sim has no
+    /// trade tape to build them from).
+    pub candles: Arc<candles::CandleHub>,
 }
 
 impl ApiState {
@@ -67,6 +74,7 @@ impl ApiState {
             bridge,
             ws_pool: None,
             push_interval,
+            candles: Arc::new(candles::CandleHub::default()),
         })
     }
 
@@ -74,6 +82,7 @@ impl ApiState {
     /// per-endpoint health. One pool per lane, not a second policy.
     #[must_use]
     pub fn with_ws_pool(mut self, pool: diorama_anvil::EndpointPool) -> Self {
+        self.candles.set_pool(pool.clone());
         self.ws_pool = Some(pool);
         self
     }

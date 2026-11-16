@@ -7,6 +7,7 @@
 //! account.rs).
 use super::account::{self, Liquidation};
 use super::funding;
+use super::ledger::{FillRecord, Liquidity};
 use super::Sim;
 use crate::error::Result;
 use crate::feed::{MarketFeed, Prices};
@@ -88,9 +89,19 @@ impl Sim {
                 oracle,
                 position.leverage_value.max(1),
             );
-            self.with_account_now(address, feed, |account| {
+            let effect = self.with_account_now(address, feed, |account| {
                 account::apply_fill(account, &facts, Some(meta))
             })?;
+            self.record_fill(
+                address,
+                &FillRecord {
+                    facts: &facts,
+                    effect,
+                    oid: 0,
+                    cloid: None,
+                    liquidity: Liquidity::Taker,
+                },
+            )?;
             tracing::info!(account = %address, coin = %coin, %size, %oracle, "delisted position settled at the oracle");
         }
         Ok(())
@@ -203,7 +214,7 @@ impl Sim {
                 cloid: r.cloid,
                 trigger: None,
             };
-            match self.place(feed, r.account, &order) {
+            match self.place_with_builder(feed, r.account, &order, r.builder) {
                 Ok(placed) => {
                     self.metrics
                         .triggers_fired_total
@@ -286,10 +297,22 @@ impl Sim {
             leverage,
             reduce: r.reduce,
             fee: crate::sim::account::mul(notional, crate::sim::order::maker_fee(), "maker fee")?,
+            builder: r.builder.map(|b| b.charge(notional)).transpose()?,
         };
-        self.with_account_now(r.account, feed, |account| {
+        let effect = self.with_account_now(r.account, feed, |account| {
             crate::sim::account::apply_fill(account, &facts, feed.meta().as_ref())
         })?;
+        self.credit_builder(facts.builder)?;
+        self.record_fill(
+            r.account,
+            &FillRecord {
+                facts: &facts,
+                effect,
+                oid: r.oid,
+                cloid: r.cloid,
+                liquidity: Liquidity::Maker,
+            },
+        )?;
         feed.consume(crate::feed::Consumption {
             coin: r.coin.clone(),
             side: r.side.book_index() as u8,

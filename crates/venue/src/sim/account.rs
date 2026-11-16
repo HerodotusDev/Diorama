@@ -13,6 +13,7 @@
 //! ```
 //!
 //! (verified exact on the live sample, `wire::tests::live_sample_identity_holds`).
+use super::ledger::FillEffect;
 use super::seed::AccountSeed;
 use crate::error::{Error, Result};
 use crate::feed::{MarketFeed, Prices};
@@ -60,6 +61,14 @@ pub(crate) struct Account {
     /// API wallets the CoreWriter registered for this account.
     #[serde(default)]
     pub agents: Vec<AgentWallet>,
+    /// The builder fees this account approved (CoreWriter action 12 /
+    /// `approveBuilderFee`): builder address to the approved maximum fee rate,
+    /// in tenths of a basis point. A later approval for the same builder
+    /// overwrites; an approval of 0 revokes (the entry is removed). A plain
+    /// map, not an `Arc`: an account approves a handful of builders, so the
+    /// clone every read takes is a few entries (unlike the ledgers below).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub builder_approvals: BTreeMap<Address, u64>,
     /// The UTC day (epoch days) of the last scheduled-cancel fire, and the
     /// day's count — the venue caps triggers at 10 per day, reset at 00:00
     /// UTC (docs).
@@ -78,6 +87,22 @@ pub(crate) struct Account {
     /// `/info` never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<AccountSeed>,
+    /// The fills this account made, oldest first, bounded (`userFills`).
+    /// History only: nothing in the account math reads it.
+    #[serde(
+        default,
+        with = "crate::sim::ledger::shared",
+        skip_serializing_if = "crate::sim::ledger::shared::is_empty"
+    )]
+    pub fills: std::sync::Arc<std::collections::VecDeque<crate::sim::ledger::UserFill>>,
+    /// The funding payments made to or by this account, oldest first, bounded
+    /// (`userFunding`).
+    #[serde(
+        default,
+        with = "crate::sim::ledger::shared",
+        skip_serializing_if = "crate::sim::ledger::shared::is_empty"
+    )]
+    pub fundings: std::sync::Arc<std::collections::VecDeque<crate::sim::ledger::UserFunding>>,
 }
 
 fn default_mode() -> UserAbstraction {
@@ -367,7 +392,10 @@ fn position_row(
             leverage: Leverage {
                 kind: p.leverage,
                 value: p.leverage_value,
-                raw_usd: Some(p.margin_used - facts.value),
+                // The isolated carve-out only: the venue omits it on a cross
+                // position.
+                raw_usd: (p.leverage == LeverageType::Isolated)
+                    .then(|| p.margin_used - facts.value),
             },
             liquidation_px,
             margin_used: p.margin_used,
@@ -883,6 +911,10 @@ pub(crate) struct FillFacts {
     /// The trading fee (venue base tier; charged on top of the fill — the
     /// plan's `closedPnl = fee + side·(mark−entry)·size`).
     pub fee: Decimal,
+    /// The builder fee the fill's order carries, computed (`None` for an
+    /// order without a builder, and for every liquidation, ADL and
+    /// settlement fill). Debited with the trading fee, on top of it.
+    pub builder: Option<crate::sim::order::BuilderCharge>,
 }
 
 impl FillFacts {
@@ -903,15 +935,18 @@ impl FillFacts {
             leverage,
             reduce: crate::sim::order::Reduce::Only,
             fee: Decimal::ZERO,
+            builder: None,
         }
     }
 }
 
+/// Apply one fill to the account; the effect (the size before, the realized
+/// PnL of the closed part, the direction) is what the ledger records.
 pub(crate) fn apply_fill(
     account: &mut Account,
     fill: &FillFacts,
     meta: Option<&crate::wire::Meta>,
-) -> Result<()> {
+) -> Result<FillEffect> {
     let signed = fill.size * fill.side.sign();
     let old = account
         .positions
@@ -923,32 +958,38 @@ pub(crate) fn apply_fill(
         .positions
         .entry(fill.coin.clone())
         .or_insert_with(|| fresh_position(fill));
-    let closed = if same_direction(old, signed) {
+    let (closed, realized) = if same_direction(old, signed) {
         apply_increase(position, old, fill)?;
-        Decimal::ZERO
+        (Decimal::ZERO, Decimal::ZERO)
     } else {
         let closed = old.abs().min(fill.size);
         let realized = apply_reduction(position, old, fill)?;
         account.perp_balance = add(account.perp_balance, realized, "realized PnL")?;
-        closed
+        (closed, realized)
     };
     // The trading fee (the venue's base tier): charged on the fill's notional,
     // on both sides of a trade, in USDC — so a closing fill pays it too.
     if !fill.fee.is_zero() {
         account.perp_balance = sub(account.perp_balance, fill.fee, "trading fee")?;
     }
+    // The builder fee rides on top of the trading fee (the order's `builder`),
+    // debited from the same balance; the builder's credit is the caller's.
+    if let Some(charge) = &fill.builder {
+        account.perp_balance = sub(account.perp_balance, charge.amount, "builder fee")?;
+    }
     // The position's last use: the borrow ends here, so the release (which
     // re-looks the position up) can borrow the account whole.
     let flat = position.szi.is_zero();
     release_isolated_margin(account, &fill.coin, old, closed, meta)?;
+    let effect = FillEffect::of(old, signed, realized);
     if flat {
         account.positions.remove(&fill.coin);
-        return Ok(());
+        return Ok(effect);
     }
     if let Some(position) = account.positions.get_mut(&fill.coin) {
         settle_margin(position)?;
     }
-    Ok(())
+    Ok(effect)
 }
 
 /// The margin a close releases (docs): a fully closed isolated position

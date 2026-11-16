@@ -11,8 +11,8 @@
 //!   contract-internal, via the callTracer — a contract's action is
 //!   attributed to the contract) decodes to a typed action; the sim applies
 //!   the ones it models (limit orders, cancels by oid and cloid, USD class
-//!   transfer, spot send, sendAsset, add API wallet, set abstraction), counts
-//!   the rest;
+//!   transfer, spot send, sendAsset, add API wallet, approve builder fee, set
+//!   abstraction), counts the rest;
 //! - **Core→EVM**: a `sendAsset` naming a token's system address is completed
 //!   the way the chain does it — a `transfer(recipient, amount)` call on the
 //!   linked ERC20 **from** the system address (V runs auto-impersonate).
@@ -389,6 +389,10 @@ impl Bridge {
             CoreAction::SetAbstraction { user, abstraction } => {
                 self.set_abstraction(user, abstraction);
             }
+            CoreAction::ApproveBuilderFee {
+                max_fee_rate,
+                builder,
+            } => self.approve_builder_fee(caller, builder, max_fee_rate)?,
             order @ CoreAction::LimitOrder { .. } => self.limit_order(caller, &order),
             action @ (CoreAction::CancelByOid { .. } | CoreAction::CancelByCloid { .. }) => {
                 self.core_cancel(caller, &action);
@@ -604,6 +608,22 @@ impl Bridge {
     fn add_api_wallet(&self, caller: Address, wallet: Address, name: &str) -> Result<()> {
         self.sim.note_agent(caller, wallet, name)?;
         tracing::info!(account = %caller, wallet = %wallet, name, "bridge: API wallet registered");
+        Ok(())
+    }
+
+    /// `approveBuilderFee` (action 12): the caller (the margin agent) approves
+    /// `builder` up to `max_fee_rate` tenths of a basis point. The venue sets
+    /// the maximum, so a later approval overwrites; orders carrying that
+    /// builder on `/exchange` are then accepted up to it.
+    fn approve_builder_fee(
+        &self,
+        caller: Address,
+        builder: Address,
+        max_fee_rate: u64,
+    ) -> Result<()> {
+        self.sim
+            .approve_builder_fee(caller, builder, max_fee_rate)?;
+        tracing::info!(account = %caller, builder = %builder, max_fee_rate, "bridge: builder fee approved");
         Ok(())
     }
 
@@ -1045,6 +1065,97 @@ mod tests {
         assert!(
             matches!(calls[5], CoreAction::LimitOrder { tif: 3, .. }),
             "the book-sending orders close the block, in the proposed order"
+        );
+    }
+
+    /// A margin agent's `approveBuilderFee` reaches the sim: the CoreWriter
+    /// call decodes (selector wrapper, action 12) and applies to the *caller*,
+    /// is counted under its id, and a later approval for the same builder
+    /// overwrites.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one call-to-read script: splitting it would hide the path from calldata to the served answer
+    async fn a_decoded_approve_builder_fee_is_recorded_on_the_caller() {
+        let sim = Arc::new(Sim::memory());
+        let bridge = Bridge::new(
+            Rpc::new("http://127.0.0.1:1", Duration::from_secs(1)).unwrap(),
+            sim.clone(),
+            Arc::new(MarketFeed::memory(Vec::new())),
+            Arc::new(BridgeMetrics::default()),
+            BridgePolicy {
+                poll: Duration::from_secs(1),
+                system_gas_stipend: U256::ZERO,
+            },
+        )
+        .unwrap();
+        let agent = Address::repeat_byte(0x0a);
+        let builder = Address::repeat_byte(0x0b);
+        let call = |rate: u64| {
+            // `CoreWriterLib.approveBuilderFee`: version 1, action 12, then
+            // `abi.encode(uint64 maxFeeRate, address builder)`.
+            let mut stream = vec![0x01, 0x00, 0x00, 0x0c];
+            stream.extend_from_slice(&U256::from(rate).to_be_bytes::<32>());
+            stream
+                .extend_from_slice(&U256::from_be_bytes(builder.into_word().0).to_be_bytes::<32>());
+            use alloy_sol_types::SolCall as _;
+            let mut input = corewriter::sendRawActionCall::SELECTOR.to_vec();
+            input.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+            input.extend_from_slice(&U256::from(stream.len() as u64).to_be_bytes::<32>());
+            input.extend_from_slice(&stream);
+            input.resize(input.len() + 28, 0);
+            corewriter::decode_calldata(&input)
+        };
+
+        // The served read: `/info` `maxBuilderFee`, a bare JSON integer.
+        let state = Arc::new(
+            crate::api::ApiState::new(
+                Arc::new(MarketFeed::memory(Vec::new())),
+                sim.clone(),
+                crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap(),
+                None,
+                None,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let served = |user: Address| {
+            let state = state.clone();
+            async move {
+                let body =
+                    format!(r#"{{"type":"maxBuilderFee","user":"{user}","builder":"{builder}"}}"#);
+                let response = crate::api::info::info(
+                    axum::extract::State(state),
+                    axum::body::Bytes::from(body),
+                )
+                .await
+                .unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        assert_eq!(sim.max_builder_fee(agent, builder).unwrap(), None);
+        bridge.apply_action(agent, call(1_000), &[]).await.unwrap();
+        assert_eq!(sim.max_builder_fee(agent, builder).unwrap(), Some(1_000));
+        assert_eq!(served(agent).await, serde_json::json!(1_000));
+        bridge.apply_action(agent, call(25), &[]).await.unwrap();
+        assert_eq!(
+            sim.max_builder_fee(agent, builder).unwrap(),
+            Some(25),
+            "the venue sets the maximum: the later approval overwrites"
+        );
+        assert_eq!(served(agent).await, serde_json::json!(25));
+        assert!(bridge
+            .metrics
+            .render()
+            .contains("venue_bridge_actions_total{id=\"12\"} 2"));
+        // Another account's approval is its own.
+        assert_eq!(
+            sim.max_builder_fee(Address::repeat_byte(0x0c), builder)
+                .unwrap(),
+            None
         );
     }
 }

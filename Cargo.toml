@@ -8,7 +8,7 @@ resolver = "2"
 # The image tag the staging pipeline derives: ghcr.io/herodotusdev/<app>-stg:<version>.
 # Bump per deploy-worthy change set; the pipeline also creates the matching
 # git tag (plain `0.2.0`, distinct from the legacy `v0.1.0`).
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -60,6 +60,9 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 # Stream/Sink adapters for the venue websocket client.
 futures-util = "0.3"
+# The venue websocket serves its fast channels as base64 of a raw deflate stream (the frontend inflates them).
+base64 = "0.22"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # alloy-rpc-types-engine's `jwt` feature pulls jsonwebtoken but selects no
 # crypto provider, so signing panics at runtime ("Could not automatically
 # determine the process-level CryptoProvider"). alloy has no rust-crypto

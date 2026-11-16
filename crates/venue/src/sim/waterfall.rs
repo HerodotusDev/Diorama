@@ -12,7 +12,8 @@
 //! ADL's opposite side is the sim's accounts, not the real venue's whole
 //! book — an empty ranking leaves the position for the next tick (named in
 //! the log).
-use super::account::{self, Liquidation};
+use super::account::{self, FillFacts, Liquidation};
+use super::ledger::{self, FillEffect, FillRecord, Liquidity};
 use super::{Account, Sim, BACKSTOP};
 use crate::error::Result;
 use crate::feed::MarketFeed;
@@ -352,6 +353,8 @@ impl Sim {
     /// is named.
     fn vault_take(&self, pass: &Pass<'_>, leg: Leg<'_>) -> Result<Vec<String>> {
         let mut closed = Vec::new();
+        // The ledger's stamp: read before the lock (`clock()` takes it).
+        let clock = self.clock(crate::now_ms())?;
         self.with_state(|st| {
             let mut me = st.accounts.remove(&pass.address).unwrap_or_default();
             let mut vault = st.accounts.remove(&BACKSTOP).unwrap_or_default();
@@ -368,8 +371,9 @@ impl Sim {
                     continue;
                 }
                 held = Held::Any;
+                let stamp = (&mut st.next_tid, clock);
                 if let Some(taken) =
-                    vault_take_coin(&mut vault, &mut me, pass.address, &coin, pass.feed)
+                    vault_take_coin(&mut vault, &mut me, (pass.address, &coin), pass.feed, stamp)
                 {
                     margin = account::add(margin, taken, "backstop margin")?;
                     closed.push(coin);
@@ -483,8 +487,20 @@ impl Sim {
         meta: Option<&crate::wire::Meta>,
     ) -> Result<()> {
         let (own, theirs) = fills;
-        self.with_account(address, |a| account::apply_fill(a, own, meta))?;
-        self.with_account(other, |a| account::apply_fill(a, theirs, meta))?;
+        let own_effect = self.with_account(address, |a| account::apply_fill(a, own, meta))?;
+        let their_effect = self.with_account(other, |a| account::apply_fill(a, theirs, meta))?;
+        for (who, facts, effect) in [(address, own, own_effect), (other, theirs, their_effect)] {
+            self.record_fill(
+                who,
+                &FillRecord {
+                    facts,
+                    effect,
+                    oid: 0,
+                    cloid: None,
+                    liquidity: Liquidity::Taker,
+                },
+            )?;
+        }
         self.metrics
             .adl_closes_total
             .fetch_add(1, Ordering::Relaxed);
@@ -607,13 +623,21 @@ enum Rescue {
 /// same side, entered there) and the position's own isolated margin moves
 /// with it. A refused transfer names itself and moves nothing — the
 /// position stays for the next pass.
+///
+/// Both sides' ledgers record the takeover at the mark: the vault's is an open
+/// (it is the resting side, `crossed: false`), the account's the close of the
+/// position it lost, its `closedPnl` the position's pnl at that mark (the
+/// takeover moves no pnl into the balance: the margin goes with the position).
+/// `stamp` is the sim's trade-id counter and the sim clock (ms).
 fn vault_take_coin(
     vault: &mut Account,
     me: &mut Account,
-    address: Address,
-    coin: &str,
+    target: (Address, &str),
     feed: &MarketFeed,
+    stamp: (&mut u64, u64),
 ) -> Option<Decimal> {
+    let (address, coin) = target;
+    let (next_tid, time) = stamp;
     let (taken, direction, size, entry_px, leverage) = me.positions.get(coin).map(|p| {
         (
             p.isolated_margin,
@@ -623,6 +647,7 @@ fn vault_take_coin(
             p.leverage_value,
         )
     })?;
+    let szi = me.positions.get(coin).map_or(Decimal::ZERO, |p| p.szi);
     let facts = account::FillFacts {
         coin: coin.to_string(),
         // The vault takes the position on the same side (entered at the mark).
@@ -632,13 +657,60 @@ fn vault_take_coin(
         leverage,
         reduce: crate::sim::order::Reduce::Any,
         fee: Decimal::ZERO,
+        builder: None,
     };
-    if let Err(e) = account::apply_fill(vault, &facts, feed.meta().as_ref()) {
-        tracing::warn!(account = %address, coin = %coin, error = %e, "backstop transfer refused");
-        return None;
-    }
+    let vault_effect = match account::apply_fill(vault, &facts, feed.meta().as_ref()) {
+        Ok(effect) => effect,
+        Err(e) => {
+            tracing::warn!(account = %address, coin = %coin, error = %e, "backstop transfer refused");
+            return None;
+        }
+    };
+    let vault_fill = FillRecord {
+        facts: &facts,
+        effect: vault_effect,
+        oid: 0,
+        cloid: None,
+        liquidity: Liquidity::Maker,
+    };
+    ledger::record_fill(vault, next_tid, time, &vault_fill);
+    let lost = LostPosition { szi, entry_px };
+    record_loss(me, &facts, &lost, (next_tid, time));
     me.positions.remove(coin);
     Some(taken)
+}
+
+/// The position a backstop takeover removed from an account.
+struct LostPosition {
+    szi: Decimal,
+    entry_px: Decimal,
+}
+
+/// The account's ledger entry for the position it lost: the closing fill (the
+/// vault's fill flipped) at the takeover price, its `closedPnl` the position's
+/// pnl there.
+fn record_loss(
+    me: &mut Account,
+    vault_fill: &FillFacts,
+    lost: &LostPosition,
+    stamp: (&mut u64, u64),
+) {
+    let (next_tid, time) = stamp;
+    let pnl = account::sub(vault_fill.px, lost.entry_px, "backstop pnl")
+        .and_then(|d| account::mul(lost.szi, d, "backstop pnl"))
+        .unwrap_or(Decimal::ZERO);
+    let closing = FillFacts {
+        side: vault_fill.side.flip(),
+        ..vault_fill.clone()
+    };
+    let my_fill = FillRecord {
+        facts: &closing,
+        effect: FillEffect::of(lost.szi, closing.size * closing.side.sign(), pnl),
+        oid: 0,
+        cloid: None,
+        liquidity: Liquidity::Taker,
+    };
+    ledger::record_fill(me, next_tid, time, &my_fill);
 }
 
 fn rescue_step(equity: Decimal, maintenance: Decimal) -> Rescue {
@@ -828,6 +900,19 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+        // The takeover is on both ledgers, at the mark (40): the vault opens
+        // the position it is handed, the account closes the one it lost at
+        // its pnl there (1 * (40 - 50)).
+        let lost = a_acc.fills.back().expect("the account's close is recorded");
+        assert_eq!(lost.dir, "Close Long");
+        assert_eq!(lost.px, Decimal::from(40));
+        assert_eq!(lost.closed_pnl, Decimal::from(-10));
+        assert_eq!(lost.start_position, Decimal::ONE);
+        assert!(lost.crossed);
+        let taken = vault.fills.back().expect("the vault's open is recorded");
+        assert_eq!(taken.dir, "Open Long");
+        assert!(!taken.crossed);
+        assert_ne!(taken.tid, lost.tid);
     }
 
     /// **A unified account's spot collateral backs the cross leg.** The same

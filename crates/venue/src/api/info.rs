@@ -72,13 +72,18 @@ pub(crate) async fn readyz(State(state): State<Arc<ApiState>>) -> Response {
 
 /// `POST /info`: parse the typed request, dispatch, or pass through.
 pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
-    // A malformed body is the caller's fault (400), not a server fault: the
-    // verifier measured a 500 here, which reads as "the sim is broken".
-    let req: InfoRequest = serde_json::from_slice(&body)
-        .map_err(|source| Error::bad_request(format!("invalid info request: {source}")))?;
+    // A body the venue cannot deserialize is the caller's fault, answered the
+    // way the real API answers it: HTTP 422 with a plain-text reason (measured
+    // live). The verifier once measured a 500 here, which reads as "the sim
+    // is broken".
+    let Ok(req) = serde_json::from_slice::<InfoRequest>(&body) else {
+        return Ok(deserialize_failure());
+    };
     match req {
-        // hl_mock's contract for types it does not route.
-        InfoRequest::Unrouted => Ok(Json("unrouted").into_response()),
+        // A type the sim does not serve is a type the real API does not know:
+        // the same 422 (never a 200 with a bare string, which a typed client
+        // would parse as data).
+        InfoRequest::Unrouted => Ok(deserialize_failure()),
         // ---- account-scoped: the sim's, or the venue's -------------------
         InfoRequest::ClearinghouseState { user, dex } => {
             clearinghouse(&state, body, user, dex).await
@@ -99,12 +104,6 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         InfoRequest::Meta { dex } => meta(&dex, &state),
         InfoRequest::MetaAndAssetCtxs { dex } => meta_and_ctxs(&dex, &state),
         InfoRequest::PerpDexs => Ok(Json(vec![None::<crate::wire::PerpDex>]).into_response()),
-        InfoRequest::AllPerpMetas => all_perp_metas(&state),
-        // The sim holds no coin annotations or categories; the real API lists
-        // only the coins that have one, so the empty list is a valid answer.
-        InfoRequest::PerpConciseAnnotations | InfoRequest::PerpCategories => {
-            Ok(Json(Vec::<()>::new()).into_response())
-        }
         InfoRequest::L2Book {
             coin,
             n_sig_figs,
@@ -116,7 +115,126 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             Ok(Json(state.feed.spot_meta().ok_or(Error::Warming)?).into_response())
         }
         InfoRequest::AllMids { .. } => Ok(Json(state.feed.all_mids()).into_response()),
+        InfoRequest::AllPerpMetas => all_perp_metas(&state),
+        // The sim holds no coin annotations or categories, and the real API
+        // lists only the builder-deployed coins that have one (the first dex
+        // has none), so the empty list is the real answer for the first dex.
+        InfoRequest::PerpConciseAnnotations | InfoRequest::PerpCategories => {
+            Ok(Json(Vec::<()>::new()).into_response())
+        }
+        // Market data: the same candles for every consumer, answered by the
+        // venue the marks come from.
+        InfoRequest::CandleSnapshot { .. } => pass_through(&state, &body).await,
+        InfoRequest::UserFills { user, .. } => user_fills(&state, body, user).await,
+        InfoRequest::UserFunding {
+            user,
+            start_time,
+            end_time,
+        } => user_funding(&state, body, user, start_time, end_time).await,
+        InfoRequest::MaxBuilderFee { user, builder } => max_fee(&state, body, user, builder).await,
+        InfoRequest::PreTransferCheck { user, .. } => pre_transfer_check(&state, body, user).await,
     }
+}
+
+/// `maxBuilderFee`: the maximum fee (tenths of a basis point) a simulated
+/// account approved for `builder` through CoreWriter `approveBuilderFee`, as a
+/// bare JSON integer (0 when never approved, as the venue answers); the venue's
+/// verbatim for an untouched account.
+async fn max_fee(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    builder: Address,
+) -> Result<Response> {
+    simulated(state, &body, user, |account| {
+        let max = account
+            .builder_approvals
+            .get(&builder)
+            .copied()
+            .unwrap_or(0);
+        Ok(Json(max).into_response())
+    })
+    .await
+}
+
+/// The most `userFills` serves (the venue's own page: the newest 2000).
+const USER_FILLS_PAGE: usize = 2_000;
+
+/// `userFills`: a simulated account's fills, newest first (the venue's
+/// order), or the venue's verbatim for an untouched one.
+async fn user_fills(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
+    match state.sim.user_fills(user) {
+        Some(mut fills) => {
+            fills.reverse();
+            fills.truncate(USER_FILLS_PAGE);
+            Ok(Json(fills).into_response())
+        }
+        None => pass_through(state, &body).await,
+    }
+}
+
+/// `userFunding`: a simulated account's funding payments from `startTime`
+/// (to `endTime` when given), oldest first, each wrapped as the venue's ledger
+/// update; the venue's verbatim for an untouched account.
+async fn user_funding(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    start_time: u64,
+    end_time: Option<u64>,
+) -> Result<Response> {
+    let Some(fundings) = state.sim.user_fundings(user, start_time) else {
+        return pass_through(state, &body).await;
+    };
+    let rows: Vec<serde_json::Value> = fundings
+        .into_iter()
+        .filter(|f| end_time.is_none_or(|end| f.time <= end))
+        .map(|f| {
+            serde_json::json!({
+                "time": f.time,
+                "hash": ZERO_HASH,
+                "delta": {
+                    "type": "funding",
+                    "coin": f.coin,
+                    "usdc": crate::wire::decimal_nano::text(&f.usdc),
+                    "szi": crate::wire::decimal_nano::text(&f.szi),
+                    "fundingRate": crate::wire::decimal_nano::text(&f.funding_rate),
+                    "nSamples": f.n_samples,
+                },
+            })
+        })
+        .collect();
+    Ok(Json(rows).into_response())
+}
+
+/// The hash the venue stamps on funding ledger rows (they have no transaction).
+const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The real API's answer to a request it cannot deserialize (an unknown
+/// `type`, a missing field): HTTP 422, plain text.
+fn deserialize_failure() -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "Failed to deserialize the JSON body into the target type",
+    )
+        .into_response()
+}
+
+/// `preTransferCheck`: the venue's answer for a simulated account (known to
+/// the venue, never sanctioned, no transfer fee), the venue's verbatim for an
+/// untouched one.
+async fn pre_transfer_check(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
+    simulated(state, &body, user, |_| {
+        Ok(Json(serde_json::json!({
+            "isSanctioned": false,
+            "userExists": true,
+            "fee": "0.0",
+            "userHasSentTx": true,
+        }))
+        .into_response())
+    })
+    .await
 }
 
 /// `clearinghouseState`: the sim's for a touched account (the first perp dex
@@ -176,6 +294,9 @@ pub(crate) struct OpenOrder {
     pub side: &'static str,
     pub sz: String,
     pub timestamp: u64,
+    pub orig_sz: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<alloy_primitives::B128>,
 }
 
 /// One `frontendOpenOrders` row (the docs' fuller shape).
@@ -197,6 +318,11 @@ pub(crate) struct FrontendOpenOrder {
     /// venue's own vocabulary; ours names the condition).
     pub trigger_condition: String,
     pub trigger_px: String,
+    /// TP/SL children (the sim never creates them; the shape is the venue's).
+    pub children: Vec<ChildOrder>,
+    /// `null` for a trigger order, the limit's time in force otherwise.
+    pub tif: Option<&'static str>,
+    pub cloid: Option<alloy_primitives::B128>,
 }
 
 pub(crate) fn side_letter(side: crate::sim::order::Side) -> &'static str {
@@ -242,6 +368,8 @@ async fn open_orders(state: &ApiState, body: Bytes, user: Address) -> Result<Res
                 side: side_letter(r.side),
                 sz: r.sz.to_string(),
                 timestamp: r.placed_ms,
+                orig_sz: r.orig_sz.to_string(),
+                cloid: r.cloid,
             })
             .collect();
         Ok(Json(rows).into_response())
@@ -325,7 +453,7 @@ fn tif_name(tif: crate::sim::order::Tif) -> &'static str {
 /// One resting order's frontend-row fields: the single mapping the two served
 /// shapes share (`frontendOpenOrders` uses it whole; `orderStatus` extends it
 /// with its own fields).
-fn frontend_row(r: &crate::sim::order::RestingOrder) -> FrontendOpenOrder {
+pub(crate) fn frontend_row(r: &crate::sim::order::RestingOrder) -> FrontendOpenOrder {
     FrontendOpenOrder {
         coin: r.coin.clone(),
         is_position_tpsl: false,
@@ -343,6 +471,13 @@ fn frontend_row(r: &crate::sim::order::RestingOrder) -> FrontendOpenOrder {
             .trigger
             .map(|t| t.trigger_px.to_string())
             .unwrap_or_else(|| "0.0".into()),
+        children: Vec::new(),
+        tif: if r.trigger.is_some() {
+            None
+        } else {
+            Some(tif_name(r.tif))
+        },
+        cloid: r.cloid,
     }
 }
 
@@ -491,7 +626,7 @@ fn l2_book(
 }
 
 /// The documented parameter set, refused by name otherwise.
-fn book_params_ok(n_sig_figs: Option<u8>, mantissa: Option<u8>) -> Result<()> {
+pub(crate) fn book_params_ok(n_sig_figs: Option<u8>, mantissa: Option<u8>) -> Result<()> {
     if let Some(n) = n_sig_figs {
         if !(2..=5).contains(&n) {
             return Err(Error::bad_request(format!(
@@ -515,7 +650,7 @@ fn book_params_ok(n_sig_figs: Option<u8>, mantissa: Option<u8>) -> Result<()> {
 /// is `mantissa × 10^(integer digits − n)`), levels at the same rounded price
 /// merge (sizes and counts sum, saturating — a merge never panics), and each
 /// side keeps its order (bids descending, asks ascending).
-fn aggregate_book(
+pub(crate) fn aggregate_book(
     book: crate::wire::L2Book,
     n_sig_figs: Option<u8>,
     mantissa: u8,
@@ -724,7 +859,7 @@ fn expect_default_dex(dex: &Option<String>) -> Result<()> {
 
 /// `activeAssetData`: the coin's mark, the user's leverage, and the sizes the
 /// withdrawable margin supports at that leverage.
-fn active_asset_data(
+pub(crate) fn active_asset_data(
     state: &ApiState,
     user: Address,
     account: &account::Account,

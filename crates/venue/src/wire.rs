@@ -33,9 +33,25 @@ pub(crate) mod decimal_nano {
     use rust_decimal::Decimal;
     use serde::Serializer;
 
+    /// The same text [`serialize`] writes, for payloads built as JSON values.
+    pub(crate) fn text(value: &Decimal) -> String {
+        value.round_dp(9).normalize().to_string()
+    }
+
     pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&value.round_dp(9).normalize().to_string())
     }
+}
+
+/// The `candleSnapshot` request body (`req`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CandleRequest {
+    pub coin: String,
+    pub interval: String,
+    pub start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<u64>,
 }
 
 /// One `POST /info` request. Unknown types parse to [`InfoRequest::Unrouted`]
@@ -98,15 +114,6 @@ pub(crate) enum InfoRequest {
     },
     #[serde(rename = "perpDexs")]
     PerpDexs,
-    /// The metadata of every perp dex, in `perpDexs` order (one here).
-    #[serde(rename = "allPerpMetas")]
-    AllPerpMetas,
-    /// `[[coin, {category, description, displayName, keywords}], …]`.
-    #[serde(rename = "perpConciseAnnotations")]
-    PerpConciseAnnotations,
-    /// `[[coin, category], …]`.
-    #[serde(rename = "perpCategories")]
-    PerpCategories,
     #[serde(rename = "l2Book")]
     L2Book {
         coin: String,
@@ -128,6 +135,37 @@ pub(crate) enum InfoRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dex: Option<String>,
     },
+    /// `{"type":"candleSnapshot","req":{coin,interval,startTime,endTime}}`:
+    /// market data, answered by the real venue.
+    #[serde(rename = "candleSnapshot")]
+    CandleSnapshot { req: CandleRequest },
+    #[serde(rename = "userFills")]
+    UserFills {
+        user: Address,
+        #[serde(rename = "aggregateByTime", default)]
+        _aggregate_by_time: Option<bool>,
+    },
+    #[serde(rename = "userFunding")]
+    UserFunding {
+        user: Address,
+        #[serde(rename = "startTime")]
+        start_time: u64,
+        #[serde(rename = "endTime", default)]
+        end_time: Option<u64>,
+    },
+    #[serde(rename = "maxBuilderFee")]
+    MaxBuilderFee { user: Address, builder: Address },
+    #[serde(rename = "preTransferCheck")]
+    PreTransferCheck { user: Address, source: Address },
+    /// The metadata of every perp dex, in `perpDexs` order (one here).
+    #[serde(rename = "allPerpMetas")]
+    AllPerpMetas,
+    /// `[[coin, {category, description, displayName, keywords}], ...]`.
+    #[serde(rename = "perpConciseAnnotations")]
+    PerpConciseAnnotations,
+    /// `[[coin, category], ...]`.
+    #[serde(rename = "perpCategories")]
+    PerpCategories,
     #[serde(other)]
     Unrouted,
 }
@@ -148,6 +186,11 @@ impl InfoRequest {
             InfoRequest::AllPerpMetas => "allPerpMetas",
             InfoRequest::PerpConciseAnnotations => "perpConciseAnnotations",
             InfoRequest::PerpCategories => "perpCategories",
+            InfoRequest::CandleSnapshot { .. } => "candleSnapshot",
+            InfoRequest::UserFills { .. } => "userFills",
+            InfoRequest::UserFunding { .. } => "userFunding",
+            InfoRequest::MaxBuilderFee { .. } => "maxBuilderFee",
+            InfoRequest::PreTransferCheck { .. } => "preTransferCheck",
             InfoRequest::FrontendOpenOrders { .. } => "frontendOpenOrders",
             InfoRequest::OrderStatus { .. } => "orderStatus",
             InfoRequest::PerpsAtOpenInterestCap { .. } => "perpsAtOpenInterestCap",
@@ -204,7 +247,8 @@ pub(crate) struct Position {
     #[serde(default)]
     pub entry_px: Option<Decimal>,
     pub leverage: Leverage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Served as `null` when the position has no liquidation price (the venue does).
+    #[serde(default)]
     pub liquidation_px: Option<Decimal>,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub margin_used: Decimal,
@@ -231,8 +275,9 @@ pub(crate) struct Leverage {
     #[serde(rename = "type")]
     pub kind: LeverageType,
     pub value: u32,
-    /// `marginUsed − positionValue` (measured exact on the live sample).
-    #[serde(default)]
+    /// `marginUsed − positionValue` (measured exact on the live sample). Only an
+    /// isolated position carries it; the venue omits it on a cross one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_usd: Option<Decimal>,
 }
 
@@ -815,7 +860,7 @@ mod tests {
             }
         ));
         let r: InfoRequest = serde_json::from_str(
-            r#"{"type":"userFills","user":"0x0000000000000000000000000000000000000001"}"#,
+            r#"{"type":"userNonFundingLedgerUpdates","user":"0x0000000000000000000000000000000000000001"}"#,
         )
         .unwrap();
         assert_eq!(r, InfoRequest::Unrouted);
@@ -1037,8 +1082,8 @@ pub(crate) enum ExchangeAction {
         #[serde(default)]
         grouping: Option<Grouping>,
         /// The optional builder fee (docs: `{"b": address, "f": tenths of a
-        /// basis point}`): refused by name — fees are a research lane, and a
-        /// fill that silently skips the fee would lie.
+        /// basis point}`): accepted when the account approved that builder for
+        /// at least `f`, and charged on every fill of the order.
         #[serde(default)]
         builder: Option<Builder>,
     },
