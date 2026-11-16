@@ -148,6 +148,7 @@ fn world() -> (Arc<ApiState>, Address) {
                 address: user,
                 class: DealClass::Perp,
                 coin: None,
+                dex: None,
                 amount: Decimal::from(10_000),
             },
         )

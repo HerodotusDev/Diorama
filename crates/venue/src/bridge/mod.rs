@@ -718,9 +718,8 @@ impl Bridge {
             tracing::warn!(account = %caller, amount = %amount, "bridge: Core→EVM refused (unknown account)");
             return Ok(false);
         };
-        let meta = self.feed.meta();
         if let Some(bound) =
-            crate::sim::account::spot_bridge_bound(&account, &self.feed, meta.as_ref(), info.index)?
+            crate::sim::account::spot_bridge_bound(&account, &self.feed, info.index)?
         {
             if amount > bound {
                 self.metrics.inc_refusals();

@@ -283,7 +283,7 @@ fn leverage_action(
     leverage: u32,
 ) -> Response {
     asset_action(state, asset, |coin| {
-        let meta = state.feed.meta_for_coin(coin);
+        let meta = state.feed.meta_for_lookup(coin);
         state.sim.set_leverage(
             owner,
             coin,
@@ -884,6 +884,7 @@ mod tests {
                     address: who.parse().unwrap(),
                     class: crate::sim::DealClass::Perp,
                     coin: None,
+                    dex: None,
                     amount: amount.parse().unwrap(),
                 },
             )
@@ -925,7 +926,7 @@ mod tests {
             .account(who.parse().unwrap())
             .unwrap()
             .unwrap()
-            .perp_balance
+            .perp_balance("")
     }
 
     /// The frontend flow end to end: an order carrying a builder the account

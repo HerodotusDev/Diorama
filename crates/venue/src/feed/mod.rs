@@ -716,6 +716,91 @@ impl MarketFeed {
         self.read().registry.meta_for_coin(coin).cloned()
     }
 
+    /// The meta a per-coin lookup (margin tiers, leverage bounds, tick/lot,
+    /// delisting) resolves `coin` against: its dex's meta whether or not the
+    /// dex lists the coin (so an unknown coin of a known dex reads as
+    /// not-found, never as a warming plane), the default dex's meta when the
+    /// coin's dex is not in the registry (an unknown prefix is not-found
+    /// there too). `None` only while no meta has landed.
+    pub(crate) fn meta_for_lookup(&self, coin: &str) -> Option<Meta> {
+        let c = self.read();
+        let registry = &c.registry;
+        registry
+            .dex(dex_of_coin(coin))
+            .or_else(|| registry.dex(""))
+            .map(|d| d.meta.clone())
+    }
+
+    /// The collateral token a dex margins against (`0` = USDC). A dex the
+    /// registry does not know (a seeded position on a dex that has not landed
+    /// yet) reads as USDC: the same reading the default dex has.
+    pub(crate) fn collateral_token_of(&self, dex: &str) -> u32 {
+        self.read()
+            .registry
+            .dex(dex)
+            .map_or(0, |d| d.collateral_token)
+    }
+
+    /// Every dex name with its collateral token, `perpDexs` order (cheap: no
+    /// universes are copied).
+    pub(crate) fn dex_collateral_tokens(&self) -> Vec<(String, u32)> {
+        self.read()
+            .registry
+            .dexs()
+            .iter()
+            .map(|d| (d.name.clone(), d.collateral_token))
+            .collect()
+    }
+
+    /// The name of spot token `index` (the venue's spot meta). Token 0 is
+    /// `USDC` even before the registry lands; any other index needs the
+    /// registry (`None` = unknown).
+    pub(crate) fn token_name(&self, index: u32) -> Option<String> {
+        let c = self.read();
+        let named = c
+            .spot_meta
+            .as_ref()
+            .and_then(|s| s.tokens.iter().find(|t| t.index == index))
+            .map(|t| t.name.clone());
+        named.or_else(|| (index == 0).then(|| "USDC".to_string()))
+    }
+
+    /// The token a fill on `coin` pays its fee in: the dex's collateral token
+    /// name (`USDC`, `USDH`, ...). A token the registry cannot name falls back
+    /// to its index, never to a USDC that would be wrong for the dex.
+    pub(crate) fn fee_token_of_coin(&self, coin: &str) -> String {
+        let token = self.collateral_token_of(dex_of_coin(coin));
+        self.token_name(token).unwrap_or_else(|| token.to_string())
+    }
+
+    /// Every delisted coin of every dex (`isDelisted` in its dex's meta): the
+    /// delisting settlement's work list. Scans under the lock, copying only
+    /// the names (the registry holds every universe).
+    pub(crate) fn delisted_coins(&self) -> Vec<String> {
+        let c = self.read();
+        c.registry
+            .dexs()
+            .iter()
+            .flat_map(|d| d.meta.universe.iter())
+            .filter(|a| a.is_delisted.unwrap_or(false))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Every coin the sim may hold a mark for: each dex's universe plus the
+    /// configured markets (a fixture feed has markets and no registry).
+    pub(crate) fn all_coins(&self) -> Vec<String> {
+        let mut coins: Vec<String> = self.markets.clone();
+        let c = self.read();
+        for dex in c.registry.dexs() {
+            coins.extend(dex.meta.universe.iter().map(|a| a.name.clone()));
+        }
+        drop(c);
+        coins.sort_unstable();
+        coins.dedup();
+        coins
+    }
+
     /// Every dex (`perpDexs` order): name, index, collateral token, asset-id
     /// base, the raw `perpDexs` record and the universe.
     pub(crate) fn all_dexs(&self) -> Vec<PerpDexInfo> {

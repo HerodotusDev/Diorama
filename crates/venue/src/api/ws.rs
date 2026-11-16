@@ -830,15 +830,10 @@ fn account_states(
                         what: format!("simulated account `{user}`"),
                     }
                 })?;
-            let meta = state.feed.meta();
             let spot_state = SpotClearinghouseState {
                 balances: crate::sim::account::spot_balances(&account),
                 token_to_available_after_maintenance:
-                    crate::sim::account::available_after_maintenance(
-                        &account,
-                        &state.feed,
-                        meta.as_ref(),
-                    )?,
+                    crate::sim::account::available_after_maintenance(&account, &state.feed)?,
             };
             Ok((clearinghouse_state, spot_state))
         }
@@ -939,6 +934,7 @@ mod tests {
                     address: user,
                     class: DealClass::Perp,
                     coin: None,
+                    dex: None,
                     amount: Decimal::from(1_000),
                 },
             )
@@ -986,6 +982,7 @@ mod tests {
                     address: user,
                     class: DealClass::Spot,
                     coin: Some("USDC".into()),
+                    dex: None,
                     amount: Decimal::from(25),
                 },
             )

@@ -260,13 +260,11 @@ async fn clearinghouse(
 async fn spot_state(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
     // Pure observation; the 1 Hz tick owns accrual and liquidation.
     simulated(state, &body, user, |account| {
-        let meta = state.feed.meta();
         Ok(Json(crate::wire::SpotClearinghouseState {
             balances: account::spot_balances(account),
             token_to_available_after_maintenance: account::available_after_maintenance(
                 account,
                 &state.feed,
-                meta.as_ref(),
             )?,
         })
         .into_response())
@@ -764,7 +762,6 @@ pub(crate) fn clearinghouse_of(
     let Some(account) = state.sim.account(address)? else {
         return Ok(None);
     };
-    let meta = state.feed.meta();
     // The served `time` is the **oldest live mark** the account is priced
     // from, not the read's clock. A stalled feed keeps its old mark; stamping
     // the read's clock made that stale mark look fresh and passed the
@@ -777,7 +774,9 @@ pub(crate) fn clearinghouse_of(
         .filter_map(|coin| state.feed.last_ctx_at(coin))
         .min()
         .map_or(served_time, |oldest| served_time.min(oldest));
-    let served = account::clearinghouse(&account, &state.feed, meta.as_ref(), observation_time)?;
+    // The default dex's clearinghouse (the per-dex serving is the REST/WS
+    // phase's: `account::clearinghouse` takes the dex).
+    let served = account::clearinghouse(&account, &state.feed, "", observation_time)?;
     if !account::identity_holds(&served) {
         state
             .sim
@@ -868,7 +867,6 @@ pub(crate) fn active_asset_data(
     let mark = state.feed.mark(coin).ok_or_else(|| Error::NoMarket {
         coin: coin.to_string(),
     })?;
-    let meta = state.feed.meta();
     let leverage = account
         .positions
         .get(coin)
@@ -890,7 +888,7 @@ pub(crate) fn active_asset_data(
     // `withdrawable`, which the docs' transfer rule bounds.
     let available = state
         .sim
-        .available_for(&state.feed, user, None, meta.as_ref())?
+        .available_for(&state.feed, user, crate::feed::dex::dex_of_coin(coin), None)?
         .ok_or_else(|| Error::NotFound {
             what: format!("{user} is not a simulated account"),
         })?
