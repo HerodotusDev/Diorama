@@ -1663,6 +1663,7 @@ dependencies = [
  "diorama-devnet",
  "flate2",
  "futures-util",
+ "k256",
  "reqwest",
  "rust_decimal",
  "serde",
@@ -2605,6 +2606,7 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
+ "signature",
 ]
 
 [[package]]

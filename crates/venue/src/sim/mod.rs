@@ -226,6 +226,28 @@ impl Sim {
         self.with_state(|state| Ok(state.accounts.get(&address).cloned()))
     }
 
+    /// The account a recovered `/exchange` signer acts for (the venue's
+    /// rule): the account that registered it as an API wallet (CoreWriter
+    /// action 9), else its own account. `None` when it is neither — the
+    /// venue's "User or API Wallet … does not exist". An API wallet two
+    /// accounts registered is refused by name rather than guessed.
+    pub(crate) fn signer_account(&self, signer: Address) -> Result<Option<Address>> {
+        self.with_state(|state| {
+            let mut owners = state
+                .accounts
+                .iter()
+                .filter(|(_, account)| account.agents.iter().any(|a| a.wallet == signer))
+                .map(|(owner, _)| *owner);
+            match (owners.next(), owners.next()) {
+                (Some(owner), None) => Ok(Some(owner)),
+                (Some(_), Some(_)) => Err(crate::error::Error::bad_request(format!(
+                    "venue-sim: API wallet {signer} is registered by more than one account"
+                ))),
+                (None, _) => Ok(state.accounts.contains_key(&signer).then_some(signer)),
+            }
+        })
+    }
+
     /// The sim clock (ms) at wall time `now_ms`.
     pub fn clock(&self, now_ms: u64) -> Result<u64> {
         let offset = self.with_state(|state| Ok(state.clock_offset_ms))?;

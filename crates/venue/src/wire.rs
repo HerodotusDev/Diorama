@@ -1013,17 +1013,16 @@ fn default_true() -> bool {
     true
 }
 
-/// The `/exchange` body: the venue's compact action shape. The devnet reads
-/// the acting account from `user` (the real venue derives it from the
-/// signature) and accepts `signature` without checking it.
+/// The `/exchange` body: the venue's compact action shape. As on the venue,
+/// the acting account is recovered from `signature` (api/signing.rs); a body
+/// that names `user` is the keyless harness shape instead.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExchangeBody {
     pub action: ExchangeAction,
-    /// The acting account. The real venue derives it from the signature; the
-    /// devnet has no keys, so it reads the field (the documented analogue).
-    /// Optional in the body so the SDK's `noop` (which carries no `user`)
-    /// parses; an order without it refuses by name.
+    /// The keyless harness's acting account (the anvil-impersonation
+    /// analogue): when present it is read as named and the signature is not
+    /// checked. A venue client sends none, and its signer is recovered.
     #[serde(default)]
     pub user: Option<Address>,
     #[serde(default)]
@@ -1051,8 +1050,8 @@ pub(crate) struct ActionTagInner {
     pub r#type: String,
 }
 
-/// The EIP-712 signature's fields (accepted, never verified): the devnet
-/// reads only its presence and shape.
+/// The EIP-712 signature's fields: the signer is recovered from them when
+/// the body names no `user` (api/signing.rs).
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct Signature {
     pub r: String,
@@ -1061,8 +1060,8 @@ pub(crate) struct Signature {
 }
 
 impl Signature {
-    /// Whether the signature is shaped like the venue's (nonempty `r`/`s`).
-    /// The devnet never verifies it — the anvil-impersonation analogue.
+    /// Whether the signature is shaped like the venue's (nonempty `r`/`s`):
+    /// the order log's `signed` field.
     pub(crate) fn is_shaped(&self) -> bool {
         !self.r.is_empty() && !self.s.is_empty()
     }

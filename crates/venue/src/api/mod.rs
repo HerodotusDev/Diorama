@@ -13,6 +13,7 @@ pub(crate) mod exchange;
 pub(crate) mod info;
 #[cfg(test)]
 mod parity;
+pub(crate) mod signing;
 pub(crate) mod ws;
 pub(crate) mod ws_codec;
 
