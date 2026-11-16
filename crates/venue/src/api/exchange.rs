@@ -1,7 +1,14 @@
 //! The `/exchange` surface: the venue's action handlers (orders, cancels,
 //! modifies, leverage and isolated-margin updates, scheduleCancel, noop), the
-//! dispatch, and the boundary refusals. The reads live in `info.rs`; the wire
-//! shapes in `wire.rs`.
+//! dispatch, and the boundary refusals. The transfer and account-setup
+//! actions are `user_actions.rs`; the reads live in `info.rs`; the wire shapes
+//! in `wire.rs`.
+//!
+//! The wire errors are the venue's own (measured, `fixtures/real_exchange.json`):
+//! a body that is not JSON is a 400 and one that is not an action (a missing
+//! field, a tag the venue does not define) a 422, both plain text; everything
+//! else is HTTP 200 with `{"status":"err","response":"..."}`.
+use super::user_actions::{self, SendAsset};
 use super::ApiState;
 use crate::error::{Error, Result};
 use crate::sim::order::BuilderFee;
@@ -14,6 +21,7 @@ use crate::wire::{
 use alloy_primitives::Address;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use std::sync::Arc;
@@ -34,10 +42,18 @@ use std::sync::Arc;
 /// registered it as an API wallet, or for its own — unless the body names
 /// `user`, the keyless harness shape (the anvil-impersonation analogue), whose
 /// signature is not checked. `vaultAddress` routes the action to that vault or
-/// subaccount (see `acting_owner`).
+/// subaccount (see `acting_owner`). The transfer actions (`usdClassTransfer`,
+/// `sendAsset`, `spotSend`, `usdSend`) and the account setup (`approveAgent`,
+/// `approveBuilderFee`, `userSetAbstraction`, `agentSetAbstraction`) are
+/// `user_actions.rs`; the user-signed ones must be signed by the account's own
+/// key. Orders on a coin outside the configured markets read its book on
+/// demand (`ensure_books`), and every asset id of a builder dex resolves to
+/// that dex's coins and ledger.
 pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
-    let req: ExchangeBody = serde_json::from_slice(&body)
-        .map_err(|source| Error::bad_request(format!("invalid exchange request: {source}")))?;
+    let req = match parse(&body) {
+        Ok(req) => req,
+        Err(response) => return Ok(*response),
+    };
     // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
     // after which the action is rejected — the venue's own string is "Action
     // already expired" (the FAQ's 15 s protection is the client-side default).
@@ -46,21 +62,83 @@ pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) ->
     if let Err(reason) = expired(&req, state.sim.clock(crate::now_ms())?) {
         return Ok(err_envelope(reason));
     }
-    // The noop action (docs): no side effects, the venue's no-data success —
-    // but it still consumes its nonce, as the venue's does.
-    if matches!(req.action, ExchangeAction::Noop) {
-        if let (Some(user), Some(nonce)) = (req.user, req.nonce) {
-            if let Err(e) = state.sim.use_nonce(user, nonce, crate::now_ms()) {
-                return Ok(err_envelope(e.to_string()));
-            }
-        }
-        return Ok(noop_response(&req));
-    }
+    // Every action, the noop (docs: no side effects) included, goes through
+    // the signature: the venue answers a zero signature on a noop with its
+    // "Unable to recover signer.", and a noop consumes its nonce.
     let owner = match acting_user(&state, &req, &body) {
         Ok((_, owner)) => owner,
         Err(response) => return Ok(*response),
     };
+    ensure_books(&state, &req.action).await;
     Ok(dispatch(&state, owner, &body, &req))
+}
+
+/// The venue's 400 for a body that is not JSON (measured).
+const NOT_JSON: &str = "Failed to parse the request body as JSON";
+
+/// The venue's 422 for JSON that is not an exchange request (measured).
+const NOT_AN_ACTION: &str = "Failed to deserialize the JSON body into the target type";
+
+/// A plain-text error response, as the venue's server sends its own.
+fn plain(status: StatusCode, text: &'static str) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        text,
+    )
+        .into_response()
+}
+
+/// The body as an exchange request, or the venue's own plain-text error: a
+/// body that is not JSON is a 400, one that is JSON but not an action (a
+/// missing field, a type the venue does not define) a 422. The venue's body
+/// carries `nonce` and `signature` always; only the keyless harness shape
+/// (`user` named) may leave them out.
+fn parse(body: &[u8]) -> std::result::Result<ExchangeBody, Box<Response>> {
+    let req: ExchangeBody = serde_json::from_slice(body).map_err(|e| {
+        Box::new(match e.classify() {
+            serde_json::error::Category::Data => {
+                plain(StatusCode::UNPROCESSABLE_ENTITY, NOT_AN_ACTION)
+            }
+            _ => plain(StatusCode::BAD_REQUEST, NOT_JSON),
+        })
+    })?;
+    let unsigned = req.user.is_none() && (req.signature.is_none() || req.nonce.is_none());
+    let unknown_tag = matches!(req.action, ExchangeAction::Unmodeled)
+        && !serde_json::from_slice::<ActionTag>(body)
+            .is_ok_and(|t| crate::wire::KNOWN_ACTION_TAGS.contains(&t.action.r#type.as_str()));
+    if unsigned || unknown_tag {
+        return Err(Box::new(plain(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            NOT_AN_ACTION,
+        )));
+    }
+    Ok(req)
+}
+
+/// The most books one request reads on demand (a batch spans few coins).
+const MAX_ENSURED_BOOKS: usize = 8;
+
+/// Orders walk the coin's book: read it once for a coin outside the
+/// configured markets (a builder dex's, say) before the action runs.
+async fn ensure_books(state: &ApiState, action: &ExchangeAction) {
+    let assets: Vec<u32> = match action {
+        ExchangeAction::Order { orders, .. } => orders.iter().map(|o| o.a).collect(),
+        ExchangeAction::Modify { order, .. } => vec![order.a],
+        ExchangeAction::BatchModify { modifies, .. } => {
+            modifies.iter().map(|m| m.order.a).collect()
+        }
+        _ => return,
+    };
+    let mut coins: Vec<String> = assets
+        .into_iter()
+        .filter_map(|a| state.feed.coin_of_asset(a))
+        .collect();
+    coins.sort();
+    coins.dedup();
+    for coin in coins.iter().take(MAX_ENSURED_BOOKS) {
+        let _ = state.feed.ensure_book(coin).await;
+    }
 }
 
 /// The docs' `expiresAfter`: `Err(reason)` refuses the whole payload when the
@@ -123,7 +201,8 @@ where
 /// dispatcher's and the order path's) carry the same list.
 const MODELED_ACTIONS: &str = "the modeled exchange actions are order, cancel, \
      cancelByCloid, modify, batchModify, updateLeverage, updateIsolatedMargin, \
-     scheduleCancel and noop. See docs/INTEGRATION.md.";
+     scheduleCancel, noop, usdClassTransfer, sendAsset, spotSend, usdSend, approveAgent, \
+     approveBuilderFee, userSetAbstraction and agentSetAbstraction. See docs/INTEGRATION.md.";
 
 /// The wire's optional `fast` flag, converted once for the cancel actions.
 fn cancel_speed(fast: Option<bool>) -> crate::sim::order::CancelSpeed {
@@ -182,10 +261,65 @@ fn dispatch(state: &Arc<ApiState>, owner: Address, body: &Bytes, req: &ExchangeB
         },
         ExchangeAction::Noop => noop_response(req),
         ExchangeAction::Unmodeled => err_envelope(unmodeled_reason(body)),
+        account_action => user_action(state, owner, account_action),
     }
 }
 
-/// The acting account's owner: a request that names a `vaultAddress` acts on
+/// The transfer and account-setup actions (`user_actions.rs`).
+fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -> Response {
+    match action {
+        ExchangeAction::UsdClassTransfer { amount, to_perp } => {
+            user_actions::usd_class_transfer(state, owner, amount, *to_perp)
+        }
+        ExchangeAction::SendAsset {
+            destination,
+            source_dex,
+            destination_dex,
+            token,
+            amount,
+            from_sub_account,
+        } => user_actions::send_asset(
+            state,
+            owner,
+            &SendAsset {
+                destination: *destination,
+                source_dex,
+                destination_dex,
+                token,
+                amount,
+                from_sub_account,
+            },
+        ),
+        ExchangeAction::SpotSend {
+            destination,
+            token,
+            amount,
+        } => user_actions::spot_send(state, owner, *destination, (token, amount)),
+        ExchangeAction::UsdSend {
+            destination,
+            amount,
+        } => user_actions::usd_send(state, owner, *destination, amount),
+        ExchangeAction::Withdraw3 => user_actions::withdraw3(),
+        ExchangeAction::ApproveAgent {
+            agent_address,
+            agent_name,
+        } => user_actions::approve_agent(state, owner, *agent_address, agent_name.as_deref()),
+        ExchangeAction::ApproveBuilderFee {
+            max_fee_rate,
+            builder,
+        } => user_actions::approve_builder_fee(state, owner, *builder, max_fee_rate),
+        ExchangeAction::UserSetAbstraction { user, abstraction } => {
+            user_actions::user_set_abstraction(state, owner, *user, abstraction)
+        }
+        ExchangeAction::AgentSetAbstraction { abstraction } => {
+            user_actions::agent_set_abstraction(state, owner, abstraction)
+        }
+        _ => err_envelope("venue-sim: not an account action".to_string()),
+    }
+}
+
+/// The acting account's owner (L1 actions): a request that names a
+/// `vaultAddress` acts on
 /// that vault or subaccount instead of the signer's account (docs:
 /// "Subaccounts and vaults do not have private keys. To perform actions on
 /// behalf of a subaccount or vault signing should be done by the master
@@ -207,33 +341,49 @@ fn acting_user(
     let refuse = |reason: String| Box::new(err_envelope(reason));
     let (signer, account) = match req.user {
         Some(user) => (user, user),
-        None => signed_account(state, req, body).map_err(refuse)?,
+        None => signed_account(state, body).map_err(refuse)?,
     };
     if let Some(nonce) = req.nonce {
         if let Err(e) = state.sim.use_nonce(signer, nonce, crate::now_ms()) {
             return Err(refuse(e.to_string()));
         }
     }
-    Ok((signer, acting_owner(req, account)))
+    // A user-signed action is the account's own (it has no vault routing:
+    // `sendAsset` names its source in `fromSubAccount`).
+    let owner = if req.action.is_user_signed() {
+        account
+    } else {
+        acting_owner(req, account)
+    };
+    Ok((signer, owner))
 }
 
 /// The venue's own reading of a body without `user`: the signer recovered
 /// from the signature, and the account it acts for (the one that registered
 /// it as an API wallet, or its own). A signer that is neither gets the
-/// venue's string — a tampered body recovers to such an address.
+/// venue's string: a tampered body recovers to such an address. A
+/// user-signed action must be signed by the account itself: an API wallet
+/// signing one is refused.
 fn signed_account(
     state: &ApiState,
-    req: &ExchangeBody,
     body: &[u8],
 ) -> std::result::Result<(Address, Address), String> {
-    if req.signature.is_none() {
-        return Err(
-            "venue-sim: an action must carry the venue's signature, or name the \
-                    acting account in `user` (the keyless harness shape)."
-                .to_string(),
-        );
+    let recovered = crate::api::signing::recover_signer(body)?;
+    let signer = recovered.address;
+    if recovered.user_signed {
+        return match state.sim.account(signer) {
+            Ok(Some(_)) => Ok((signer, signer)),
+            Ok(None) => match state.sim.signer_account(signer) {
+                Ok(Some(owner)) => Err(format!(
+                    "venue-sim: this action is signed by the account's own key; {signer:#x} is \
+                     an API wallet of {owner:#x}"
+                )),
+                Ok(None) => Err(format!("User or API Wallet {signer:#x} does not exist.")),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
     }
-    let signer = crate::api::signing::recover_signer(body)?;
     match state.sim.signer_account(signer) {
         Ok(Some(account)) => Ok((signer, account)),
         Ok(None) => Err(format!("User or API Wallet {signer:#x} does not exist.")),
@@ -290,7 +440,7 @@ fn ok_envelope<T: serde::Serialize>(response: T) -> Response {
 }
 
 /// The venue's no-data success, built once.
-fn default_ok() -> Response {
+pub(super) fn default_ok() -> Response {
     ok_envelope(DefaultBody { r#type: "default" })
 }
 
@@ -339,7 +489,7 @@ fn order_action(
         group = ?grouping,
         orders = orders.len(),
         builder = ?builder,
-        "exchange order action accepted (the signature is accepted, never verified)"
+        "exchange order action accepted"
     );
     // The docs' pre-validation class: one error for the whole payload
     // (empty batches, non-reduce-only TP/SL, an order too far from the
@@ -516,7 +666,7 @@ fn noop_response(req: &ExchangeBody) -> Response {
         user = ?req.user,
         nonce = ?req.nonce,
         signed = req.signature.as_ref().is_some_and(Signature::is_shaped),
-        "exchange noop accepted (the signature is accepted, never verified)"
+        "exchange noop accepted"
     );
     ok_envelope(DefaultBody { r#type: "default" })
 }
@@ -586,7 +736,7 @@ fn order_parts<'a>(
 }
 
 /// The venue's `err` envelope (HTTP 200 — the shape their client parses).
-fn err_envelope(response: String) -> Response {
+pub(super) fn err_envelope(response: String) -> Response {
     Json(ExchangeResponse {
         status: "err",
         response,
@@ -1030,13 +1180,11 @@ mod tests {
         let reason = out["response"].as_str().unwrap();
         assert!(reason.starts_with("User or API Wallet 0x"), "{reason}");
 
+        // Neither `user` nor a signature: the venue's 422, not an envelope.
         let unsigned = r#"{"action":{"type":"order","orders":[],"grouping":"na"}}"#;
-        let out = post(&state, unsigned.to_string()).await;
-        assert_eq!(out["status"], "err");
-        assert!(
-            out["response"].as_str().unwrap().contains("signature"),
-            "{out}"
-        );
+        let (status, _, text) = post_raw(&state, unsigned).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(text, NOT_AN_ACTION);
         assert!(state.sim.user_fills(owner).unwrap().is_empty());
     }
 
@@ -1145,5 +1293,822 @@ mod tests {
         );
         let fills = state.sim.user_fills(owner).unwrap();
         assert_eq!(fills[1].builder_fee, None);
+    }
+
+    // ---- the wire errors, the transfers and the builder dexes ---------------
+
+    /// POST `body` and return the status, content type and text as the venue's
+    /// client sees them.
+    async fn post_raw(state: &Arc<ApiState>, body: &str) -> (StatusCode, String, String) {
+        let response = exchange(State(state.clone()), Bytes::from(body.to_string()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    /// The venue's wire errors, as measured (`fixtures/real_exchange.json`): a
+    /// body that is not JSON is a 400 and a body that is JSON but not an
+    /// action (an unknown tag, a missing signature) a 422, both plain text; a
+    /// zero signature is `err` "Unable to recover signer." on every action,
+    /// the noop included; a real action the sim does not model is refused by
+    /// name once its signature holds.
+    #[tokio::test]
+    async fn the_wire_errors_are_the_venues() {
+        let state = builder_state();
+        let real: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/real_exchange.json")).unwrap();
+        for probe in real["probes"].as_array().unwrap() {
+            let name = probe["name"].as_str().unwrap();
+            let (status, content_type, text) =
+                post_raw(&state, probe["request"].as_str().unwrap()).await;
+            assert_eq!(status.as_u16(), probe["status"], "{name}");
+            assert_eq!(content_type, probe["contentType"], "{name}");
+            assert_eq!(text, probe["body"], "{name}");
+        }
+    }
+
+    /// An action the venue defines but the sim does not model names itself
+    /// (after the signature holds); one the venue does not define is a 422.
+    #[tokio::test]
+    async fn an_unmodeled_action_is_named_and_an_unknown_one_is_a_422() {
+        let state = builder_state();
+        let named = post(
+            &state,
+            format!(r#"{{"action":{{"type":"twapOrder","twap":{{}}}},"user":"{OWNER}"}}"#),
+        )
+        .await;
+        assert_eq!(named["status"], "err");
+        assert!(
+            named["response"].as_str().unwrap().contains("`twapOrder`"),
+            "{named}"
+        );
+        let (status, _, text) = post_raw(
+            &state,
+            &format!(r#"{{"action":{{"type":"nopeNotAnAction"}},"user":"{OWNER}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(text, NOT_AN_ACTION);
+        let (status, _, text) = post_raw(&state, "{").await;
+        assert_eq!((status, text.as_str()), (StatusCode::BAD_REQUEST, NOT_JSON));
+        let (status, _, _) = post_raw(
+            &state,
+            &format!(r#"{{"action":{{"type":"cancel","cancels":"x"}},"user":"{OWNER}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "a mistyped field");
+    }
+
+    /// A signature that holds is the only way through: a signed noop from a
+    /// registered key answers the no-data success and spends its nonce; the
+    /// keyless harness shape does the same on its named user.
+    #[tokio::test]
+    async fn the_noop_goes_through_the_signature_and_spends_its_nonce() {
+        let state = builder_state();
+        let owner: Address = OWNER.parse().unwrap();
+        let (agent, agent_address) = key(0x11);
+        let nonce = crate::now_ms();
+        let noop = || r#"{"type":"noop"}"#.to_string();
+
+        let out = post(&state, signed(&agent, &noop(), nonce)).await;
+        assert_eq!(out["status"], "err");
+        assert!(out["response"].as_str().unwrap().contains("does not exist"));
+
+        state.sim.note_agent(owner, agent_address, "agent").unwrap();
+        let out = post(&state, signed(&agent, &noop(), nonce)).await;
+        assert_eq!(
+            out,
+            serde_json::json!({"status":"ok","response":{"type":"default"}})
+        );
+        let replay = post(&state, signed(&agent, &noop(), nonce)).await;
+        assert_eq!(replay["response"], "Nonce already used.");
+
+        let harness = format!(
+            r#"{{"action":{{"type":"noop"}},"user":"{OWNER}","nonce":{}}}"#,
+            nonce + 5
+        );
+        assert_eq!(post(&state, harness.clone()).await["status"], "ok");
+        assert_eq!(
+            post(&state, harness).await["response"],
+            "Nonce already used."
+        );
+    }
+
+    /// `isCross` and the camelCase fields of the L1 actions parse as the wire
+    /// spells them (`isCross: false` once read as the default `true`).
+    #[test]
+    fn the_leverage_action_reads_its_camel_case_fields() {
+        let body: ExchangeBody = serde_json::from_str(
+            r#"{"action":{"type":"updateLeverage","asset":3,"isCross":false,"leverage":5},"user":"0x00000000000000000000000000000000000000e1"}"#,
+        )
+        .unwrap();
+        let ExchangeAction::UpdateLeverage {
+            asset,
+            is_cross,
+            leverage,
+        } = body.action
+        else {
+            panic!("not an updateLeverage");
+        };
+        assert_eq!((asset, is_cross, leverage), (3, false, 5));
+        let body: ExchangeBody = serde_json::from_str(
+            r#"{"action":{"type":"updateLeverage","asset":3,"leverage":5},"user":"0x00000000000000000000000000000000000000e1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            body.action,
+            ExchangeAction::UpdateLeverage { is_cross: true, .. }
+        ));
+    }
+
+    /// Sign `action` (its raw JSON, L1 or user-signed) with `key`, as the
+    /// venue's clients do.
+    fn signed(key: &k256::ecdsa::SigningKey, action: &str, nonce: u64) -> String {
+        let digest = crate::api::signing::signing_digest(action, nonce, None, None).unwrap();
+        let (signature, recovery) = key.sign_prehash_recoverable(digest.as_slice()).unwrap();
+        let bytes = signature.to_bytes();
+        let (r, s) = (
+            alloy_primitives::hex::encode(&bytes[..32]),
+            alloy_primitives::hex::encode(&bytes[32..]),
+        );
+        let v = 27 + recovery.to_byte();
+        format!(
+            r#"{{"action":{action},"nonce":{nonce},"signature":{{"r":"0x{r}","s":"0x{s}","v":{v}}},"vaultAddress":null,"expiresAfter":null}}"#
+        )
+    }
+
+    /// A user-signed action: its fields after the chain, in the order the
+    /// client writes them.
+    fn user_signed(tag: &str, fields: &str) -> String {
+        format!(
+            r#"{{"type":"{tag}","hyperliquidChain":"Mainnet","signatureChainId":"0x66eee",{fields}}}"#
+        )
+    }
+
+    const TOKEN: &str = "USDC:0x6d1e7cde53ba9467b783cb7c530ce054";
+
+    /// The spot registry with USDC alone (token 0).
+    fn usdc_registry() -> crate::wire::SpotMeta {
+        use crate::wire::{SpotMeta, SpotToken};
+        SpotMeta {
+            tokens: vec![SpotToken {
+                name: "USDC".into(),
+                sz_decimals: 8,
+                wei_decimals: 8,
+                index: 0,
+                is_canonical: true,
+                evm_contract: None,
+                token_id: None,
+                full_name: None,
+                deployer_trading_fee_share: rust_decimal::Decimal::ZERO,
+            }],
+            universe: vec![],
+        }
+    }
+
+    /// The default dex (`ETH`, a market) and the builder dex `xyz` (`xyz:TSLA`,
+    /// asset id 110000, a coin the on-demand path owns), the spot registry
+    /// (`USDC`), and a mark and a one-level book on both.
+    fn dex_state() -> Arc<ApiState> {
+        use crate::wire::{L2Book, Level};
+        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string(), "xyz:TSLA".to_string()]);
+        let now = crate::now_ms();
+        feed.put_meta(crate::sim::meta_with("ETH", 10), now);
+        feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);
+        let level = |px: &str| Level {
+            px: px.parse().unwrap(),
+            sz: "50".parse().unwrap(),
+            n: 1,
+        };
+        for (coin, bid, ask) in [("ETH", "100", "101"), ("xyz:TSLA", "200", "201")] {
+            feed.put_ctx(coin.into(), crate::wire::test_ctx(ask, ask), now);
+            feed.put_book(
+                L2Book {
+                    coin: coin.into(),
+                    time: 0,
+                    levels: [vec![level(bid)], vec![level(ask)]],
+                    spread: None,
+                },
+                now,
+            );
+        }
+        feed.put_oi_caps(Vec::new());
+        feed.put_oi_caps_of("xyz", Vec::new());
+        feed.put_spot_meta(usdc_registry());
+        let sim = Arc::new(crate::sim::Sim::memory());
+        let api = crate::feed::rest::RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+        Arc::new(
+            ApiState::new(
+                Arc::new(feed),
+                sim,
+                api,
+                None,
+                None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Fund `who` with `amount` in a wallet: spot USDC, or a perp dex's ledger.
+    fn fund(
+        state: &ApiState,
+        who: Address,
+        class: crate::sim::DealClass,
+        dex: Option<&str>,
+        amount: &str,
+    ) {
+        state
+            .sim
+            .deal(
+                &state.feed,
+                &crate::sim::Deal {
+                    address: who,
+                    class,
+                    coin: None,
+                    dex: dex.map(str::to_string),
+                    amount: amount.parse().unwrap(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn ledger(state: &ApiState, who: Address, dex: &str) -> rust_decimal::Decimal {
+        state
+            .sim
+            .account(who)
+            .unwrap()
+            .map_or(rust_decimal::Decimal::ZERO, |a| a.perp_balance(dex))
+    }
+
+    fn spot_usdc(state: &ApiState, who: Address) -> rust_decimal::Decimal {
+        state
+            .sim
+            .account(who)
+            .unwrap()
+            .and_then(|a| a.spot.get(&0).map(|e| e.total))
+            .unwrap_or_default()
+    }
+
+    fn dec(text: &str) -> rust_decimal::Decimal {
+        text.parse().unwrap()
+    }
+
+    /// The signer's own transfers, signed as a TypeScript client signs them:
+    /// the spot wallet to the default dex and back, to a builder dex and
+    /// between dexes (`sendAsset`), to another account (`spotSend` on spot,
+    /// `usdSend` on the default dex). Each answers the no-data success and
+    /// moves exactly its two ledgers.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the moves
+    async fn user_signed_transfers_move_the_signers_ledgers() {
+        use crate::sim::DealClass::Spot;
+        let state = dex_state();
+        let (me_key, me) = key(0x11);
+        let (_, other) = key(0x22);
+        fund(&state, me, Spot, None, "1000");
+        let nonce = crate::now_ms();
+        let ok = |out: &serde_json::Value| assert_eq!(out["status"], "ok", "{out}");
+
+        // usdClassTransfer: spot to the default dex, and part of it back.
+        let action = user_signed(
+            "usdClassTransfer",
+            &format!(r#""amount":"100","toPerp":true,"nonce":{nonce}"#),
+        );
+        ok(&post(&state, signed(&me_key, &action, nonce)).await);
+        assert_eq!(
+            (ledger(&state, me, ""), spot_usdc(&state, me)),
+            (dec("100"), dec("900"))
+        );
+        let n = nonce + 1;
+        let action = user_signed(
+            "usdClassTransfer",
+            &format!(r#""amount":"30","toPerp":false,"nonce":{n}"#),
+        );
+        ok(&post(&state, signed(&me_key, &action, n)).await);
+        assert_eq!(
+            (ledger(&state, me, ""), spot_usdc(&state, me)),
+            (dec("70"), dec("930"))
+        );
+        // More than the dex holds is refused, and nothing moves.
+        let n = nonce + 2;
+        let action = user_signed(
+            "usdClassTransfer",
+            &format!(r#""amount":"500","toPerp":false,"nonce":{n}"#),
+        );
+        let out = post(&state, signed(&me_key, &action, n)).await;
+        assert_eq!(out["status"], "err", "{out}");
+        assert_eq!(ledger(&state, me, ""), dec("70"));
+
+        // sendAsset: spot to the builder dex xyz, then xyz to the default dex.
+        let n = nonce + 3;
+        let action = user_signed(
+            "sendAsset",
+            &format!(
+                r#""destination":"{me:#x}","sourceDex":"spot","destinationDex":"xyz","token":"USDC","amount":"200","fromSubAccount":"","nonce":{n}"#
+            ),
+        );
+        ok(&post(&state, signed(&me_key, &action, n)).await);
+        assert_eq!(
+            (ledger(&state, me, "xyz"), spot_usdc(&state, me)),
+            (dec("200"), dec("730"))
+        );
+        let n = nonce + 4;
+        let action = user_signed(
+            "sendAsset",
+            &format!(
+                r#""destination":"{me:#x}","sourceDex":"xyz","destinationDex":"","token":"USDC","amount":"50","fromSubAccount":"","nonce":{n}"#
+            ),
+        );
+        ok(&post(&state, signed(&me_key, &action, n)).await);
+        assert_eq!(
+            (ledger(&state, me, "xyz"), ledger(&state, me, "")),
+            (dec("150"), dec("120"))
+        );
+        // A sub-account source and an unknown dex are refused by name.
+        let n = nonce + 5;
+        let action = user_signed(
+            "sendAsset",
+            &format!(
+                r#""destination":"{me:#x}","sourceDex":"","destinationDex":"nope","token":"USDC","amount":"1","fromSubAccount":"","nonce":{n}"#
+            ),
+        );
+        let out = post(&state, signed(&me_key, &action, n)).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("`nope`"),
+            "{out}"
+        );
+
+        // spotSend: spot to another account; usdSend: default dex to another.
+        let n = nonce + 6;
+        let action = user_signed(
+            "spotSend",
+            &format!(r#""destination":"{other:#x}","token":"{TOKEN}","amount":"25","time":{n}"#),
+        );
+        ok(&post(&state, signed(&me_key, &action, n)).await);
+        assert_eq!(
+            (spot_usdc(&state, me), spot_usdc(&state, other)),
+            (dec("705"), dec("25"))
+        );
+        let n = nonce + 7;
+        let action = user_signed(
+            "usdSend",
+            &format!(r#""destination":"{other:#x}","amount":"20","time":{n}"#),
+        );
+        ok(&post(&state, signed(&me_key, &action, n)).await);
+        assert_eq!(
+            (ledger(&state, me, ""), ledger(&state, other, "")),
+            (dec("100"), dec("20"))
+        );
+        // An unknown token is refused by name.
+        let n = nonce + 8;
+        let action = user_signed(
+            "spotSend",
+            &format!(r#""destination":"{other:#x}","token":"NOPE","amount":"1","time":{n}"#),
+        );
+        let out = post(&state, signed(&me_key, &action, n)).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("unknown token"),
+            "{out}"
+        );
+    }
+
+    /// The user-signed actions are the account's own: an API wallet signing
+    /// one is refused (and moves nothing), a key with no account is the venue's
+    /// "does not exist", and `withdraw3` is refused in the venue's envelope.
+    #[tokio::test]
+    async fn a_user_signed_action_needs_the_accounts_own_key() {
+        use crate::sim::DealClass::Spot;
+        let state = dex_state();
+        let (_, me) = key(0x11);
+        let (agent_key, agent) = key(0x33);
+        let (stranger_key, stranger) = key(0x44);
+        fund(&state, me, Spot, None, "100");
+        state.sim.note_agent(me, agent, "bot").unwrap();
+        let nonce = crate::now_ms();
+        let action = user_signed(
+            "usdClassTransfer",
+            &format!(r#""amount":"10","toPerp":true,"nonce":{nonce}"#),
+        );
+
+        let out = post(&state, signed(&agent_key, &action, nonce)).await;
+        assert_eq!(out["status"], "err");
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("account's own key"),
+            "{out}"
+        );
+        assert_eq!(spot_usdc(&state, me), dec("100"));
+
+        let out = post(&state, signed(&stranger_key, &action, nonce)).await;
+        assert_eq!(
+            out["response"],
+            format!("User or API Wallet {stranger:#x} does not exist.")
+        );
+
+        let withdraw = user_signed(
+            "withdraw3",
+            &format!(r#""destination":"{me:#x}","amount":"1","time":{nonce}"#),
+        );
+        let (own_key, _) = key(0x11);
+        let out = post(&state, signed(&own_key, &withdraw, nonce + 1)).await;
+        assert_eq!(out["status"], "err");
+        assert!(
+            out["response"].as_str().unwrap().contains("withdraw3"),
+            "{out}"
+        );
+    }
+
+    /// The account setup: `approveAgent` registers the wallet (which then
+    /// signs L1 actions for the account), `approveBuilderFee` sets the
+    /// builder's maximum in tenths of a basis point (and 0% revokes it),
+    /// `userSetAbstraction` and `agentSetAbstraction` set the mode and refuse
+    /// portfolio margin.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the setup
+    async fn the_account_setup_actions_register_what_they_name() {
+        use crate::sim::DealClass::Spot;
+        use crate::wire::UserAbstraction;
+        let state = dex_state();
+        let (me_key, me) = key(0x11);
+        let (agent_key, agent) = key(0x33);
+        let builder: Address = BUILDER.parse().unwrap();
+        fund(&state, me, Spot, None, "100");
+        let next = std::cell::Cell::new(crate::now_ms());
+        // The next body: its nonce is the action's and the envelope's.
+        let send = |key: &k256::ecdsa::SigningKey, build: &dyn Fn(u64) -> String| {
+            let n = next.get() + 1;
+            next.set(n);
+            signed(key, &build(n), n)
+        };
+
+        // approveAgent: the wallet then signs for the account.
+        let body = send(&me_key, &|n| {
+            user_signed(
+                "approveAgent",
+                &format!(r#""agentAddress":"{agent:#x}","agentName":"bot","nonce":{n}"#),
+            )
+        });
+        let out = post(&state, body).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(state.sim.signer_account(agent).unwrap(), Some(me));
+        let out = post(
+            &state,
+            send(&agent_key, &|_| r#"{"type":"noop"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+
+        // approveBuilderFee.
+        let fee = |rate: &'static str| {
+            move |n: u64| {
+                user_signed(
+                    "approveBuilderFee",
+                    &format!(r#""maxFeeRate":"{rate}","builder":"{builder:#x}","nonce":{n}"#),
+                )
+            }
+        };
+        let out = post(&state, send(&me_key, &fee("0.01%"))).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(state.sim.max_builder_fee(me, builder).unwrap(), Some(10));
+        let out = post(&state, send(&me_key, &fee("0.0005%"))).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("0.001%"),
+            "{out}"
+        );
+        let out = post(&state, send(&me_key, &fee("2%"))).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("1% cap"),
+            "{out}"
+        );
+        let out = post(&state, send(&me_key, &fee("0%"))).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(state.sim.max_builder_fee(me, builder).unwrap(), Some(0));
+
+        // userSetAbstraction.
+        let set = |user: Address, mode: &'static str| {
+            move |n: u64| {
+                user_signed(
+                    "userSetAbstraction",
+                    &format!(r#""user":"{user:#x}","abstraction":"{mode}","nonce":{n}"#),
+                )
+            }
+        };
+        let out = post(&state, send(&me_key, &set(me, "unifiedAccount"))).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            state.sim.account(me).unwrap().unwrap().mode,
+            UserAbstraction::UnifiedAccount
+        );
+        let out = post(&state, send(&me_key, &set(me, "portfolioMargin"))).await;
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("portfolio margin is not modeled"),
+            "{out}"
+        );
+        let out = post(&state, send(&me_key, &set(builder, "disabled"))).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("signed it"),
+            "{out}"
+        );
+        let out = post(&state, send(&me_key, &set(me, "bogus"))).await;
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("unknown abstraction"),
+            "{out}"
+        );
+
+        // agentSetAbstraction (an L1 action: the agent signs it).
+        let agent_sets = |code: &'static str| {
+            move |_: u64| format!(r#"{{"type":"agentSetAbstraction","abstraction":"{code}"}}"#)
+        };
+        let out = post(&state, send(&agent_key, &agent_sets("i"))).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            state.sim.account(me).unwrap().unwrap().mode,
+            UserAbstraction::Disabled
+        );
+        let out = post(&state, send(&agent_key, &agent_sets("p"))).await;
+        assert!(
+            out["response"]
+                .as_str()
+                .unwrap()
+                .contains("portfolio margin is not modeled"),
+            "{out}"
+        );
+        let out = post(&state, send(&agent_key, &agent_sets("u"))).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            state.sim.account(me).unwrap().unwrap().mode,
+            UserAbstraction::UnifiedAccount
+        );
+    }
+
+    /// The keyless harness shape stays what PR #2 left: `user` named, no
+    /// signature, and the new actions act as that user (the transfer
+    /// included).
+    #[tokio::test]
+    async fn the_keyless_harness_shape_acts_as_the_named_user() {
+        use crate::sim::DealClass::Spot;
+        let state = dex_state();
+        let who: Address = OWNER.parse().unwrap();
+        fund(&state, who, Spot, None, "100");
+        let body = format!(
+            r#"{{"action":{{"type":"usdClassTransfer","amount":"40","toPerp":true}},"user":"{OWNER}"}}"#
+        );
+        let out = post(&state, body).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(ledger(&state, who, ""), dec("40"));
+    }
+
+    const TSLA: u32 = 110_000;
+
+    fn order_json(asset: u32, buy: bool, px: &str, tif: &str, cloid: Option<&str>) -> String {
+        let c = cloid.map_or(String::new(), |c| format!(r#","c":"{c}""#));
+        format!(
+            r#"{{"a":{asset},"b":{buy},"p":"{px}","s":"1","r":false,"t":{{"limit":{{"tif":"{tif}"}}}}{c}}}"#
+        )
+    }
+
+    /// A harness-shape action by `OWNER`.
+    async fn act(state: &Arc<ApiState>, action: &str) -> serde_json::Value {
+        post(state, format!(r#"{{"action":{action},"user":"{OWNER}"}}"#)).await
+    }
+
+    /// Asset ids of a builder dex work on every action that takes one, against
+    /// that dex's own ledger: an order fills there (the default dex is
+    /// untouched), a resting one is modified, batch-modified and cancelled by
+    /// oid and by cloid, leverage and isolated margin apply to the coin, and
+    /// the dead-man's switch is accepted.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the actions
+    async fn builder_dex_asset_ids_work_on_every_asset_action() {
+        use crate::sim::DealClass::Perp;
+        let state = dex_state();
+        let who: Address = OWNER.parse().unwrap();
+        fund(&state, who, Perp, Some("xyz"), "1000");
+        let orders =
+            |envelope: &serde_json::Value| envelope["response"]["data"]["statuses"][0].clone();
+
+        // A market-style IOC fills against xyz:TSLA's book, on xyz's ledger.
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"order","orders":[{}],"grouping":"na"}}"#,
+                order_json(TSLA, true, "205", "Ioc", None)
+            ),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(orders(&out)["filled"]["totalSz"], "1", "{out}");
+        assert!(
+            ledger(&state, who, "xyz") < dec("1000"),
+            "the fee left xyz's ledger"
+        );
+        assert_eq!(
+            ledger(&state, who, ""),
+            dec("0"),
+            "the default dex is untouched"
+        );
+        assert!(state
+            .sim
+            .account(who)
+            .unwrap()
+            .unwrap()
+            .positions
+            .contains_key("xyz:TSLA"));
+
+        // Leverage and isolated margin on the coin.
+        let out = act(
+            &state,
+            &format!(r#"{{"type":"updateLeverage","asset":{TSLA},"isCross":false,"leverage":5}}"#),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let setting = state.sim.account(who).unwrap().unwrap().leverage_settings["xyz:TSLA"];
+        assert_eq!(
+            (setting.mode, setting.leverage),
+            (crate::wire::LeverageType::Isolated, 5)
+        );
+        let margin = |state: &ApiState| {
+            state.sim.account(who).unwrap().unwrap().positions["xyz:TSLA"].isolated_margin
+        };
+        let (before, ledger_before) = (margin(&state), ledger(&state, who, "xyz"));
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"updateIsolatedMargin","asset":{TSLA},"isBuy":true,"ntli":5000000}}"#
+            ),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            margin(&state),
+            before + dec("5"),
+            "the position holds 5 more"
+        );
+        assert_eq!(
+            ledger(&state, who, "xyz"),
+            ledger_before - dec("5"),
+            "taken from xyz's ledger"
+        );
+
+        // Rest, modify, batch-modify, cancel by oid and by cloid.
+        let cloid = "0x00000000000000000000000000000abc";
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"order","orders":[{},{}],"grouping":"na"}}"#,
+                order_json(TSLA, true, "150", "Gtc", None),
+                order_json(TSLA, true, "149", "Gtc", Some(cloid))
+            ),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let resting = state.sim.resting_orders(Some(who)).unwrap();
+        assert_eq!(resting.len(), 2);
+        assert!(resting.iter().all(|r| r.coin == "xyz:TSLA"));
+        let oid = out["response"]["data"]["statuses"][0]["resting"]["oid"]
+            .as_u64()
+            .unwrap();
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"modify","oid":{oid},"order":{}}}"#,
+                order_json(TSLA, true, "151", "Gtc", None)
+            ),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let resting = state.sim.resting_orders(Some(who)).unwrap();
+        assert!(
+            resting.iter().any(|r| r.px == dec("151")) && resting.len() == 2,
+            "{resting:?}"
+        );
+        let moved = resting.iter().find(|r| r.px == dec("151")).unwrap().oid;
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"batchModify","modifies":[{{"oid":{moved},"order":{}}}]}}"#,
+                order_json(TSLA, true, "152", "Gtc", None)
+            ),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let resting = state.sim.resting_orders(Some(who)).unwrap();
+        let moved = resting
+            .iter()
+            .find(|r| r.px == dec("152"))
+            .expect("batchModify moved it")
+            .oid;
+        let out = act(
+            &state,
+            &format!(r#"{{"type":"cancel","cancels":[{{"a":{TSLA},"o":{moved}}}]}}"#),
+        )
+        .await;
+        assert_eq!(out["response"]["data"]["statuses"][0], "success", "{out}");
+        let out = act(
+            &state,
+            &format!(
+                r#"{{"type":"cancelByCloid","cancels":[{{"asset":{TSLA},"cloid":"{cloid}"}}]}}"#
+            ),
+        )
+        .await;
+        assert_eq!(out["response"]["data"]["statuses"][0], "success", "{out}");
+        assert!(state.sim.resting_orders(Some(who)).unwrap().is_empty());
+
+        // The dead-man's switch is accepted against the account's resting
+        // orders on the dex too: it closes them when its time comes.
+        let out = act(
+            &state,
+            &order_action_json(&order_json(TSLA, true, "150", "Gtc", None)),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let when = crate::now_ms() + 30_000;
+        let out = act(
+            &state,
+            &format!(r#"{{"type":"scheduleCancel","time":{when}}}"#),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(state.sim.resting_orders(Some(who)).unwrap().len(), 1);
+    }
+
+    fn order_action_json(order: &str) -> String {
+        format!(r#"{{"type":"order","orders":[{order}],"grouping":"na"}}"#)
+    }
+
+    /// An order on a coin outside the configured markets reads its book on
+    /// demand before it fills: `xyz:TSLA` is not a market here, the mock
+    /// venue serves its `l2Book`, and the order fills against that book.
+    #[tokio::test]
+    async fn an_order_on_an_unconfigured_coin_reads_its_book_first() {
+        use crate::sim::DealClass::Perp;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = crate::feed::tests::l2_server(hits.clone()).await;
+        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let now = crate::now_ms();
+        feed.put_meta(crate::sim::meta_with("ETH", 10), now);
+        feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);
+        feed.put_ctx("xyz:TSLA".into(), crate::wire::test_ctx("200", "200"), now);
+        feed.put_oi_caps(Vec::new());
+        feed.put_oi_caps_of("xyz", Vec::new());
+        let api = crate::feed::rest::RestClient::new(&[url]).unwrap();
+        feed.attach_rest(api.clone());
+        let state = Arc::new(
+            ApiState::new(
+                Arc::new(feed),
+                Arc::new(crate::sim::Sim::memory()),
+                api,
+                None,
+                None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let who: Address = OWNER.parse().unwrap();
+        fund(&state, who, Perp, Some("xyz"), "1000");
+        assert!(
+            state.feed.book("xyz:TSLA", crate::now_ms()).is_none(),
+            "no book yet"
+        );
+        let out = act(
+            &state,
+            &order_action_json(&order_json(TSLA, true, "305", "Ioc", None)),
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            out["response"]["data"]["statuses"][0]["filled"]["avgPx"], "200",
+            "{out}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one l2Book read"
+        );
     }
 }

@@ -1125,10 +1125,19 @@ impl Signature {
     }
 }
 
-/// The action, tagged by `type`. `order` and `noop` are modeled; every other
-/// tag the venue defines lands in `Unmodeled` and is refused by name.
+/// The action, tagged by `type`: the L1 actions (hashed as msgpack) and the
+/// user-signed ones (`usdClassTransfer`, `sendAsset`, ...; their own EIP-712
+/// type, see api/signing.rs). Their fields are camelCase on the wire; only
+/// what the handlers read is named here (the signature covers the raw body).
+/// A tag the venue defines and the sim does not model lands in `Unmodeled`
+/// and is refused by name; a tag the venue does not define is a 422 (see
+/// [`KNOWN_ACTION_TAGS`]).
 #[derive(Debug, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ExchangeAction {
     /// The no-operation action (docs): signature-authentication testing with
     /// no side effects. Answers the venue's no-data success envelope.
@@ -1192,9 +1201,129 @@ pub(crate) enum ExchangeAction {
         is_cross: bool,
         leverage: u32,
     },
+    /// `{"type":"usdClassTransfer","amount":"1.5","toPerp":true,...}`: USDC
+    /// between the account's spot wallet and its default perp dex.
+    UsdClassTransfer { amount: String, to_perp: bool },
+    /// `{"type":"sendAsset","destination":..,"sourceDex":..,"destinationDex":..,
+    /// "token":..,"amount":..,"fromSubAccount":..}`: a token between two
+    /// wallets (the spot wallet is dex `"spot"`, the default dex `""`).
+    SendAsset {
+        destination: Address,
+        source_dex: String,
+        destination_dex: String,
+        token: String,
+        amount: String,
+        #[serde(default)]
+        from_sub_account: String,
+    },
+    /// `{"type":"spotSend","destination":..,"token":"NAME:id","amount":..}`.
+    SpotSend {
+        destination: Address,
+        token: String,
+        amount: String,
+    },
+    /// `{"type":"usdSend","destination":..,"amount":..}`: USDC between two
+    /// accounts' default perp dexes.
+    UsdSend {
+        destination: Address,
+        amount: String,
+    },
+    /// `withdraw3`: bridges USDC out through Arbitrum (refused by name).
+    Withdraw3,
+    /// `{"type":"approveAgent","agentAddress":..,"agentName":..}`: the same
+    /// registration CoreWriter action 9 makes.
+    ApproveAgent {
+        agent_address: Address,
+        #[serde(default)]
+        agent_name: Option<String>,
+    },
+    /// `{"type":"approveBuilderFee","maxFeeRate":"0.01%","builder":..}`.
+    ApproveBuilderFee {
+        max_fee_rate: String,
+        builder: Address,
+    },
+    /// `{"type":"userSetAbstraction","user":..,"abstraction":"unifiedAccount"}`.
+    UserSetAbstraction { user: Address, abstraction: String },
+    /// `{"type":"agentSetAbstraction","abstraction":"i"|"u"|"p"}` (an L1
+    /// action: the account's agent may sign it).
+    AgentSetAbstraction { abstraction: String },
     #[serde(other)]
     Unmodeled,
 }
+
+impl ExchangeAction {
+    /// Whether the action is user-signed (the account's own key, the
+    /// `HyperliquidSignTransaction` domain) rather than an L1 action an API
+    /// wallet may sign.
+    pub(crate) fn is_user_signed(&self) -> bool {
+        matches!(
+            self,
+            Self::UsdClassTransfer { .. }
+                | Self::SendAsset { .. }
+                | Self::SpotSend { .. }
+                | Self::UsdSend { .. }
+                | Self::Withdraw3
+                | Self::ApproveAgent { .. }
+                | Self::ApproveBuilderFee { .. }
+                | Self::UserSetAbstraction { .. }
+        )
+    }
+}
+
+/// Every action tag the real venue defines. A body whose tag is not in this
+/// list is a 422 (measured: the venue answers an unknown tag with its
+/// deserialization failure, not an `err` envelope); a listed tag the sim does
+/// not model is refused by name.
+pub(crate) const KNOWN_ACTION_TAGS: &[&str] = &[
+    "order",
+    "cancel",
+    "cancelByCloid",
+    "modify",
+    "batchModify",
+    "scheduleCancel",
+    "updateLeverage",
+    "updateIsolatedMargin",
+    "topUpIsolatedOnlyMargin",
+    "twapOrder",
+    "twapCancel",
+    "reserveRequestWeight",
+    "noop",
+    "setReferrer",
+    "registerReferrer",
+    "claimRewards",
+    "vaultTransfer",
+    "createVault",
+    "vaultModify",
+    "vaultDistribute",
+    "createSubAccount",
+    "subAccountModify",
+    "subAccountTransfer",
+    "subAccountSpotTransfer",
+    "spotUser",
+    "usdSend",
+    "spotSend",
+    "withdraw3",
+    "usdClassTransfer",
+    "sendAsset",
+    "tokenDelegate",
+    "cDeposit",
+    "cWithdraw",
+    "approveAgent",
+    "approveBuilderFee",
+    "convertToMultiSigUser",
+    "multiSig",
+    "evmUserModify",
+    "userDexAbstraction",
+    "userSetAbstraction",
+    "agentSetAbstraction",
+    "setDisplayName",
+    "perpDeploy",
+    "spotDeploy",
+    "linkStakingUser",
+    "borrowLend",
+    "validatorL1Stream",
+    "finalizeEvmContract",
+];
 
 /// One `cancel` entry (docs: `a` asset, `o` oid).
 #[derive(Debug, serde::Deserialize)]

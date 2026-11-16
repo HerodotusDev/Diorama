@@ -211,6 +211,9 @@ pub(crate) async fn order(
 ) -> Result<Json<OrderResponse>> {
     let address = req.address;
     let order: crate::sim::order::Order = req.into();
+    // The fill walks the coin's book: one outside the configured markets gets
+    // it on demand.
+    let _ = state.feed.ensure_book(&order.coin).await;
     let fill = state.sim.order(&state.feed, address, &order)?;
     // The fill's provenance, so every fill is self-explaining: the levels it
     // walked (the consumed sizes — the COW analogue) and the served book's

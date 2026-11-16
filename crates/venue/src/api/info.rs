@@ -108,7 +108,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             coin,
             n_sig_figs,
             mantissa,
-        } => l2_book(&coin, n_sig_figs, mantissa, &state),
+        } => l2_book(&coin, n_sig_figs, mantissa, &state).await,
         InfoRequest::MarginTable { id } => margin_table(id, &state),
         InfoRequest::ExchangeStatus => Ok(exchange_status()),
         InfoRequest::SpotMeta => {
@@ -602,7 +602,7 @@ fn meta_and_ctxs(dex: &Option<String>, state: &ApiState) -> Result<Response> {
 /// request's parameters (docs: `nSigFigs ∈ {2,3,4,5}`, `mantissa ∈ {1,2,5}`
 /// only with `nSigFigs = 5`). A parameter outside the documented set is a
 /// named 400 — never silently ignored.
-fn l2_book(
+async fn l2_book(
     coin: &str,
     n_sig_figs: Option<u8>,
     mantissa: Option<u8>,
@@ -610,11 +610,20 @@ fn l2_book(
 ) -> Result<Response> {
     book_params_ok(n_sig_figs, mantissa)?;
     let now = crate::now_ms();
-    let Some(book) = state.feed.book(coin, now) else {
+    // A configured market's book is the poller's; any other coin a dex lists
+    // (a builder dex's `xyz:TSLA`, a default-dex coin outside `markets`) gets
+    // its book on demand and stays wanted while it is asked for.
+    let configured = state.feed.markets.iter().any(|m| m == coin);
+    let book = if configured {
+        state.feed.book(coin, now)
+    } else {
+        state.feed.ensure_book(coin).await
+    };
+    let Some(book) = book else {
         // The venue's own absence shape (measured live: `l2Book` for an
-        // unknown coin answers HTTP 200 `null`). A *configured* market with
-        // no book yet is a different fault — the plane is warming (503).
-        return if state.feed.markets.iter().any(|m| m == coin) {
+        // unknown coin answers HTTP 200 `null`). A coin the venue lists with
+        // no book yet is a different fault: the plane is warming (503).
+        return if configured || state.feed.meta_for_coin(coin).is_some() {
             Err(Error::Warming)
         } else {
             Ok(Json(None::<crate::wire::L2Book>).into_response())

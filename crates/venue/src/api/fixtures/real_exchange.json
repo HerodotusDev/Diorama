@@ -1,0 +1,110 @@
+{
+ "_about": "Real /exchange answers captured from the live venue (2026-11-16) with deliberately invalid bodies: a zero signature on every action, so nothing could execute. The sim must answer each request textually the same (api/exchange.rs tests).",
+ "probes": [
+  {
+   "name": "order_bogus_asset",
+   "request": "{\"action\":{\"type\":\"order\",\"orders\":[{\"a\":99999999,\"b\":true,\"p\":\"1\",\"s\":\"0.0001\",\"r\":false,\"t\":{\"limit\":{\"tif\":\"Gtc\"}}}],\"grouping\":\"na\"},\"nonce\":1794856594159,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "cancel",
+   "request": "{\"action\":{\"type\":\"cancel\",\"cancels\":[{\"a\":99999999,\"o\":1}]},\"nonce\":1794856594160,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "updateLeverage",
+   "request": "{\"action\":{\"type\":\"updateLeverage\",\"asset\":99999999,\"isCross\":true,\"leverage\":1},\"nonce\":1794856594161,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "usdClassTransfer",
+   "request": "{\"action\":{\"type\":\"usdClassTransfer\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"amount\":\"0.000001\",\"toPerp\":true,\"nonce\":1794856594162},\"nonce\":1794856594162,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "sendAsset",
+   "request": "{\"action\":{\"type\":\"sendAsset\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"destination\":\"0x0000000000000000000000000000000000000001\",\"sourceDex\":\"\",\"destinationDex\":\"spot\",\"token\":\"USDC\",\"amount\":\"0.000001\",\"fromSubAccount\":\"\",\"nonce\":1794856594163},\"nonce\":1794856594163,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "unknown_action",
+   "request": "{\"action\":{\"type\":\"nopeNotAnAction\"},\"nonce\":1794856594164,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 422,
+   "contentType": "text/plain; charset=utf-8",
+   "body": "Failed to deserialize the JSON body into the target type"
+  },
+  {
+   "name": "missing_signature",
+   "request": "{\"action\":{\"type\":\"noop\"},\"nonce\":1794856594165}",
+   "status": 422,
+   "contentType": "text/plain; charset=utf-8",
+   "body": "Failed to deserialize the JSON body into the target type"
+  },
+  {
+   "name": "non_json",
+   "request": "this is not json",
+   "status": 400,
+   "contentType": "text/plain; charset=utf-8",
+   "body": "Failed to parse the request body as JSON"
+  },
+  {
+   "name": "noop",
+   "request": "{\"action\":{\"type\":\"noop\"},\"nonce\":1794856594166,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "approveBuilderFee",
+   "request": "{\"action\":{\"type\":\"approveBuilderFee\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"maxFeeRate\":\"0.001%\",\"builder\":\"0x0000000000000000000000000000000000000001\",\"nonce\":1794856594167},\"nonce\":1794856594167,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "spotSend",
+   "request": "{\"action\":{\"type\":\"spotSend\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"destination\":\"0x0000000000000000000000000000000000000001\",\"token\":\"USDC:0x6d1e7cde53ba9467b783cb7c530ce054\",\"amount\":\"0.000001\",\"time\":1794856594168},\"nonce\":1794856594168,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "approveAgent",
+   "request": "{\"action\":{\"type\":\"approveAgent\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"agentAddress\":\"0x0000000000000000000000000000000000000001\",\"agentName\":\"probe\",\"nonce\":1794856594169},\"nonce\":1794856594169,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "userSetAbstraction",
+   "request": "{\"action\":{\"type\":\"userSetAbstraction\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"user\":\"0x0000000000000000000000000000000000000001\",\"abstraction\":\"disabled\",\"nonce\":1794856594170},\"nonce\":1794856594170,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "withdraw3",
+   "request": "{\"action\":{\"type\":\"withdraw3\",\"hyperliquidChain\":\"Mainnet\",\"signatureChainId\":\"0x66eee\",\"destination\":\"0x0000000000000000000000000000000000000001\",\"amount\":\"0.000001\",\"time\":1794856594171},\"nonce\":1794856594171,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  },
+  {
+   "name": "agentSetAbstraction",
+   "request": "{\"action\":{\"type\":\"agentSetAbstraction\",\"abstraction\":\"u\"},\"nonce\":1794856594172,\"signature\":{\"r\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"s\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"v\":27},\"vaultAddress\":null,\"expiresAfter\":null}",
+   "status": 200,
+   "contentType": "application/json",
+   "body": "{\"status\":\"err\",\"response\":\"Unable to recover signer.\"}"
+  }
+ ]
+}

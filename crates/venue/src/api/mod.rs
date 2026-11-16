@@ -14,6 +14,7 @@ pub(crate) mod info;
 #[cfg(test)]
 mod parity;
 pub(crate) mod signing;
+mod user_actions;
 pub(crate) mod ws;
 pub(crate) mod ws_codec;
 

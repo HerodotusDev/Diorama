@@ -13,6 +13,13 @@
 //! The action is re-encoded from the body's raw JSON (read in order, never
 //! through a typed struct or a sorted map), so a client that sends what it
 //! sends to the venue recovers to its own key.
+//!
+//! The **user-signed** actions (`usdClassTransfer`, `sendAsset`, `spotSend`,
+//! `approveAgent`, ...) are not hashed that way: the client signs the action's
+//! own EIP-712 struct, `HyperliquidTransaction:<Name>`, under the
+//! `HyperliquidSignTransaction` domain whose chain id is the action's
+//! `signatureChainId`. Their field lists are [`USER_SIGNED`]; the account's own
+//! key signs them (an API wallet may not).
 use crate::wire::Signature;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
@@ -42,6 +49,227 @@ fn exchange_domain() -> Eip712Domain {
     }
 }
 
+/// What the venue answers for a signature that recovers no key (measured: a
+/// zero `r`/`s` on any action, `noop` included).
+pub(crate) const UNRECOVERABLE: &str = "Unable to recover signer.";
+
+/// The domain name every user-signed action is signed under.
+const USER_DOMAIN_NAME: &str = "HyperliquidSignTransaction";
+
+/// The EIP-712 type of one user-signed field.
+#[derive(Clone, Copy)]
+enum Ty {
+    Str,
+    Bool,
+    U64,
+    Addr,
+}
+
+impl Ty {
+    fn name(self) -> &'static str {
+        match self {
+            Ty::Str => "string",
+            Ty::Bool => "bool",
+            Ty::U64 => "uint64",
+            Ty::Addr => "address",
+        }
+    }
+}
+
+/// One user-signed action's struct: the wire tag, the struct name after
+/// `HyperliquidTransaction:` and its fields in signing order. Every field is
+/// read from the action by name (a missing string is signed as empty: the
+/// SDKs drop an empty `agentName` from the body and sign it).
+struct UserSigned {
+    tag: &'static str,
+    primary: &'static str,
+    fields: &'static [(&'static str, Ty)],
+}
+
+const CHAIN: (&str, Ty) = ("hyperliquidChain", Ty::Str);
+const NONCE: (&str, Ty) = ("nonce", Ty::U64);
+const TIME: (&str, Ty) = ("time", Ty::U64);
+
+/// The user-signed actions the venue defines (the official SDK's
+/// `USER_SIGNED_*_TYPES`, checked against signatures a TypeScript client
+/// produces: see the vectors in the tests).
+const USER_SIGNED: &[UserSigned] = &[
+    UserSigned {
+        tag: "usdSend",
+        primary: "UsdSend",
+        fields: &[CHAIN, ("destination", Ty::Str), ("amount", Ty::Str), TIME],
+    },
+    UserSigned {
+        tag: "spotSend",
+        primary: "SpotSend",
+        fields: &[
+            CHAIN,
+            ("destination", Ty::Str),
+            ("token", Ty::Str),
+            ("amount", Ty::Str),
+            TIME,
+        ],
+    },
+    UserSigned {
+        tag: "withdraw3",
+        primary: "Withdraw",
+        fields: &[CHAIN, ("destination", Ty::Str), ("amount", Ty::Str), TIME],
+    },
+    UserSigned {
+        tag: "usdClassTransfer",
+        primary: "UsdClassTransfer",
+        fields: &[CHAIN, ("amount", Ty::Str), ("toPerp", Ty::Bool), NONCE],
+    },
+    UserSigned {
+        tag: "sendAsset",
+        primary: "SendAsset",
+        fields: &[
+            CHAIN,
+            ("destination", Ty::Str),
+            ("sourceDex", Ty::Str),
+            ("destinationDex", Ty::Str),
+            ("token", Ty::Str),
+            ("amount", Ty::Str),
+            ("fromSubAccount", Ty::Str),
+            NONCE,
+        ],
+    },
+    UserSigned {
+        tag: "userDexAbstraction",
+        primary: "UserDexAbstraction",
+        fields: &[CHAIN, ("user", Ty::Addr), ("enabled", Ty::Bool), NONCE],
+    },
+    UserSigned {
+        tag: "userSetAbstraction",
+        primary: "UserSetAbstraction",
+        fields: &[CHAIN, ("user", Ty::Addr), ("abstraction", Ty::Str), NONCE],
+    },
+    UserSigned {
+        tag: "approveAgent",
+        primary: "ApproveAgent",
+        fields: &[
+            CHAIN,
+            ("agentAddress", Ty::Addr),
+            ("agentName", Ty::Str),
+            NONCE,
+        ],
+    },
+    UserSigned {
+        tag: "approveBuilderFee",
+        primary: "ApproveBuilderFee",
+        fields: &[CHAIN, ("maxFeeRate", Ty::Str), ("builder", Ty::Addr), NONCE],
+    },
+    UserSigned {
+        tag: "cDeposit",
+        primary: "CDeposit",
+        fields: &[CHAIN, ("wei", Ty::U64), NONCE],
+    },
+    UserSigned {
+        tag: "cWithdraw",
+        primary: "CWithdraw",
+        fields: &[CHAIN, ("wei", Ty::U64), NONCE],
+    },
+    UserSigned {
+        tag: "tokenDelegate",
+        primary: "TokenDelegate",
+        fields: &[
+            CHAIN,
+            ("validator", Ty::Addr),
+            ("wei", Ty::U64),
+            ("isUndelegate", Ty::Bool),
+            NONCE,
+        ],
+    },
+];
+
+/// The action's `type` tag, read alone from its raw JSON.
+fn tag_of(action: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Tag {
+        r#type: String,
+    }
+    serde_json::from_str::<Tag>(action).ok().map(|t| t.r#type)
+}
+
+/// The user-signed struct of `action`, when its tag is one.
+fn user_signed_of(action: &str) -> Option<&'static UserSigned> {
+    let tag = tag_of(action)?;
+    USER_SIGNED.iter().find(|u| u.tag == tag)
+}
+
+/// The EIP-712 digest of a user-signed action: the struct hash over the
+/// action's fields, under the domain of its `signatureChainId`.
+fn user_signed_digest(spec: &UserSigned, action: &str) -> Result<B256, String> {
+    let value: serde_json::Value = serde_json::from_str(action)
+        .map_err(|e| format!("venue-sim: the action does not parse: {e}"))?;
+    let chain = value
+        .get("signatureChainId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("venue-sim: a user-signed action carries its `signatureChainId`")?;
+    let chain_id = u64::from_str_radix(chain.strip_prefix("0x").unwrap_or(chain), 16)
+        .map_err(|e| format!("venue-sim: `signatureChainId` {chain} is not hex: {e}"))?;
+    let signature = spec
+        .fields
+        .iter()
+        .map(|(name, ty)| format!("{} {name}", ty.name()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let type_hash = keccak256(format!(
+        "HyperliquidTransaction:{}({signature})",
+        spec.primary
+    ));
+    let mut encoded = type_hash.to_vec();
+    for (name, ty) in spec.fields {
+        encoded.extend_from_slice(encode_field(&value, name, *ty)?.as_slice());
+    }
+    let domain = Eip712Domain::new(
+        Some(USER_DOMAIN_NAME.into()),
+        Some("1".into()),
+        Some(U256::from(chain_id)),
+        Some(Address::ZERO),
+        None,
+    );
+    let mut data = vec![0x19, 0x01];
+    data.extend_from_slice(domain.separator().as_slice());
+    data.extend_from_slice(keccak256(&encoded).as_slice());
+    Ok(keccak256(&data))
+}
+
+/// One field's 32-byte EIP-712 encoding.
+fn encode_field(action: &serde_json::Value, name: &str, ty: Ty) -> Result<B256, String> {
+    let field = action.get(name);
+    let bad = |what: &str| format!("venue-sim: the action's `{name}` is not {what}");
+    Ok(match ty {
+        Ty::Str => keccak256(
+            field
+                .map_or(Some(""), serde_json::Value::as_str)
+                .ok_or_else(|| bad("a string"))?,
+        ),
+        Ty::Bool => {
+            let flag = field
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| bad("a boolean"))?;
+            B256::from(U256::from(u8::from(flag)))
+        }
+        Ty::U64 => {
+            let n = match field {
+                Some(serde_json::Value::Number(n)) => n.as_u64(),
+                Some(serde_json::Value::String(s)) => s.parse().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| bad("an unsigned integer"))?;
+            B256::from(U256::from(n))
+        }
+        Ty::Addr => {
+            let address: Address = field
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| bad("an address"))?;
+            address.into_word()
+        }
+    })
+}
+
 /// The fields of an `/exchange` body the signature covers. The action stays
 /// raw: its bytes are what the client encoded.
 #[derive(serde::Deserialize)]
@@ -57,11 +285,20 @@ struct SignedBody<'a> {
     expires_after: Option<u64>,
 }
 
+/// The key that signed a body, and how the action is signed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Recovered {
+    pub address: Address,
+    /// The action is user-signed: the account's own key signs it.
+    pub user_signed: bool,
+}
+
 /// The address whose key signed `body` (an `/exchange` body). `Err` names
-/// why nothing could be recovered: a missing or malformed field, or a
-/// signature that is not a valid secp256k1 signature. A tampered body still
-/// recovers, to an address that is nobody's.
-pub(crate) fn recover_signer(body: &[u8]) -> Result<Address, String> {
+/// why nothing could be recovered: the venue's own text for a signature that
+/// is no valid secp256k1 signature of the body, or the sim's for a field the
+/// signed hash needs and the body lacks. A tampered body still recovers, to
+/// an address that is nobody's.
+pub(crate) fn recover_signer(body: &[u8]) -> Result<Recovered, String> {
     let signed: SignedBody<'_> = serde_json::from_slice(body)
         .map_err(|e| format!("venue-sim: the signed fields do not parse: {e}"))?;
     let digest = signing_digest(
@@ -70,16 +307,24 @@ pub(crate) fn recover_signer(body: &[u8]) -> Result<Address, String> {
         signed.vault_address,
         signed.expires_after,
     )?;
-    recover(&signed.signature, digest)
+    Ok(Recovered {
+        address: recover(&signed.signature, digest)?,
+        user_signed: user_signed_of(signed.action.get()).is_some(),
+    })
 }
 
-/// The EIP-712 digest a client signs for `action` (its raw JSON).
+/// The EIP-712 digest a client signs for `action` (its raw JSON): the
+/// action's own struct for a user-signed action, the phantom agent over the
+/// msgpack hash for an L1 action.
 pub(crate) fn signing_digest(
     action: &str,
     nonce: u64,
     vault: Option<Address>,
     expires_after: Option<u64>,
 ) -> Result<B256, String> {
+    if let Some(spec) = user_signed_of(action) {
+        return user_signed_digest(spec, action);
+    }
     let agent = Agent {
         source: MAINNET_SOURCE.to_string(),
         connectionId: action_hash(action, nonce, vault, expires_after)?,
@@ -116,24 +361,25 @@ fn action_hash(
 
 /// The signer of `digest`. `v` is the venue's 27/28 (0/1 is read as the bare
 /// parity); `r` and `s` are hex, zero-padding optional (the Python SDK drops
-/// it).
+/// it). Anything that recovers no key (a `v` outside those, a scalar that is
+/// not hex, a zero or out-of-range `r`/`s`) is the venue's one answer,
+/// [`UNRECOVERABLE`].
 fn recover(signature: &Signature, digest: B256) -> Result<Address, String> {
     let y_parity = match signature.v {
         0 | 27 => false,
         1 | 28 => true,
-        v => return Err(format!("venue-sim: signature `v` is {v}, not 27 or 28")),
+        _ => return Err(UNRECOVERABLE.to_string()),
     };
-    let r = scalar("r", &signature.r)?;
-    let s = scalar("s", &signature.s)?;
+    let r = scalar(&signature.r)?;
+    let s = scalar(&signature.s)?;
     alloy_primitives::Signature::new(r, s, y_parity)
         .recover_address_from_prehash(&digest)
-        .map_err(|e| format!("venue-sim: the signature does not recover a key: {e}"))
+        .map_err(|_| UNRECOVERABLE.to_string())
 }
 
-fn scalar(name: &str, hex: &str) -> Result<U256, String> {
+fn scalar(hex: &str) -> Result<U256, String> {
     let digits = hex.strip_prefix("0x").unwrap_or(hex);
-    U256::from_str_radix(digits, 16)
-        .map_err(|e| format!("venue-sim: signature `{name}` is not a hex scalar: {e}"))
+    U256::from_str_radix(digits, 16).map_err(|_| UNRECOVERABLE.to_string())
 }
 
 /// A JSON value as the client's encoder sees it: object keys in their
@@ -339,17 +585,21 @@ mod tests {
         SIGNER.parse().unwrap()
     }
 
+    fn signer_of(body: &str) -> Result<Address, String> {
+        recover_signer(body.as_bytes()).map(|r| r.address)
+    }
+
     #[test]
     fn a_typescript_signers_signatures_recover_its_key() {
         for body in TYPESCRIPT_BODIES {
-            assert_eq!(recover_signer(body.as_bytes()), Ok(signer()), "{body}");
+            assert_eq!(signer_of(body), Ok(signer()), "{body}");
         }
     }
 
     #[test]
     fn the_python_sdks_signatures_recover_its_key() {
         for body in PYTHON_SDK_BODIES {
-            assert_eq!(recover_signer(body.as_bytes()), Ok(signer()), "{body}");
+            assert_eq!(signer_of(body), Ok(signer()), "{body}");
         }
     }
 
@@ -370,7 +620,7 @@ mod tests {
         for (body, from, to) in edits {
             let edited = body.replacen(from, to, 1);
             assert_ne!(edited, body, "the edit applies");
-            let recovered = recover_signer(edited.as_bytes()).unwrap();
+            let recovered = signer_of(&edited).unwrap();
             assert_ne!(recovered, signer(), "{from} -> {to}");
         }
     }
@@ -408,8 +658,100 @@ mod tests {
     fn a_body_without_the_signed_fields_is_refused_by_name() {
         let refusal = recover_signer(br#"{"action":{"type":"cancel","cancels":[]}}"#).unwrap_err();
         assert!(refusal.contains("missing field `nonce`"), "{refusal}");
-        let bad_v = TYPESCRIPT_BODIES[2].replacen(r#""v":27"#, r#""v":29"#, 1);
-        let refusal = recover_signer(bad_v.as_bytes()).unwrap_err();
-        assert!(refusal.contains("not 27 or 28"), "{refusal}");
+    }
+
+    /// A signature that recovers no key (a zero `r`/`s`, a `v` outside 27/28,
+    /// a scalar that is not hex) is the venue's one answer, measured on the
+    /// live API with a zero signature.
+    #[test]
+    fn a_signature_that_recovers_no_key_gets_the_venues_string() {
+        let zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let body = TYPESCRIPT_BODIES[2];
+        let signed = body.split(r#""signature":"#).nth(1).unwrap();
+        let signature = &signed[..signed.find('}').unwrap() + 1];
+        let zeroed = format!(r#"{{"r":"{zero}","s":"{zero}","v":27}}"#);
+        let bad_v = signature.replacen(r#""v":27"#, r#""v":29"#, 1);
+        let not_hex = signature.replacen(r#""r":"0x"#, r#""r":"0xzz"#, 1);
+        for replacement in [zeroed, bad_v, not_hex] {
+            let edited = body.replacen(signature, &replacement, 1);
+            assert_ne!(edited, body);
+            assert_eq!(signer_of(&edited), Err(UNRECOVERABLE.to_string()));
+        }
+    }
+
+    /// The viem fixture: every user-signed action type, signed by a
+    /// TypeScript client with `signTypedData` under the
+    /// `HyperliquidSignTransaction` domain (chain 0x66eee), recovers to its
+    /// key and is flagged user-signed; the L1 vectors are not.
+    #[test]
+    fn a_typescript_clients_user_signed_actions_recover_its_key() {
+        let vectors = include_str!("fixtures/viem_user_signed.jsonl");
+        let mut seen = Vec::new();
+        for line in vectors.lines().filter(|l| !l.trim().is_empty()) {
+            let recovered = recover_signer(line.as_bytes()).unwrap();
+            assert_eq!(recovered.address, signer(), "{line}");
+            assert!(recovered.user_signed, "{line}");
+            let body: serde_json::Value = serde_json::from_str(line).unwrap();
+            seen.push(body["action"]["type"].as_str().unwrap().to_string());
+        }
+        seen.dedup();
+        for tag in [
+            "usdClassTransfer",
+            "sendAsset",
+            "spotSend",
+            "usdSend",
+            "withdraw3",
+            "approveAgent",
+            "approveBuilderFee",
+            "userSetAbstraction",
+            "userDexAbstraction",
+        ] {
+            assert!(seen.iter().any(|t| t == tag), "no vector for {tag}");
+        }
+        assert!(
+            !recover_signer(TYPESCRIPT_BODIES[0].as_bytes())
+                .unwrap()
+                .user_signed
+        );
+    }
+
+    /// Every signed field is bound, and so is the chain: changing the
+    /// amount, the direction or the `signatureChainId` recovers another
+    /// address.
+    #[test]
+    fn a_changed_user_signed_field_recovers_another_address() {
+        let vectors = include_str!("fixtures/viem_user_signed.jsonl");
+        let first = vectors.lines().next().unwrap();
+        for (from, to) in [
+            (r#""amount":"1.5""#, r#""amount":"1.6""#),
+            (r#""toPerp":true"#, r#""toPerp":false"#),
+            (
+                r#""signatureChainId":"0x66eee""#,
+                r#""signatureChainId":"0x1""#,
+            ),
+            (
+                r#""hyperliquidChain":"Mainnet""#,
+                r#""hyperliquidChain":"Testnet""#,
+            ),
+        ] {
+            let edited = first.replacen(from, to, 1);
+            assert_ne!(edited, first, "{from}");
+            assert_ne!(signer_of(&edited), Ok(signer()), "{from} -> {to}");
+        }
+    }
+
+    /// The SDKs sign an empty `agentName` and drop the key from the body: a
+    /// body without the name recovers (the vector above), a body that names
+    /// one the signature does not cover does not.
+    #[test]
+    fn an_unsigned_agent_name_recovers_another_address() {
+        let vectors = include_str!("fixtures/viem_user_signed.jsonl");
+        let nameless = vectors
+            .lines()
+            .find(|l| l.contains("approveAgent") && !l.contains("agentName"))
+            .unwrap();
+        let named = nameless.replacen(r#""agentAddress""#, r#""agentName":"x","agentAddress""#, 1);
+        assert_eq!(signer_of(nameless), Ok(signer()));
+        assert_ne!(signer_of(&named), Ok(signer()));
     }
 }

@@ -959,17 +959,25 @@ pub(crate) fn spot_bridge_bound(
         .map(|(_, available)| available))
 }
 
-/// The unified account's USD-class-transfer bound for one dex: the docs'
-/// transfer rule at the live marks: the served `withdrawable` (the margin
-/// floor; "transferring includes ... transfer to spot wallet"). `None` when a
-/// mark behind the dex's positions is not served: the caller refuses rather
-/// than guesses. The sibling unified figure is [`available_after_maintenance`].
-pub(crate) fn unified_transfer_bound(
+/// What one dex's perp wallet may send out now: the docs' transfer rule at the
+/// live marks, the served `withdrawable` (the margin floor; "transferring
+/// includes ... transfer to spot wallet"), so the margin in use never leaves.
+/// A unified account's perp view is one slice of a pool and may go negative,
+/// so the floor alone bounds it; a standard account's wallet also never sends
+/// more than its cash. `None` when a mark behind the dex's positions is not
+/// served: the caller refuses rather than guesses. The sibling unified figure
+/// is [`available_after_maintenance`].
+pub(crate) fn perp_transfer_bound(
     account: &Account,
     feed: &MarketFeed,
     dex: &str,
 ) -> Option<Decimal> {
-    view(account, feed, dex).ok().map(|v| v.withdrawable)
+    let withdrawable = view(account, feed, dex).ok()?.withdrawable;
+    Some(if account.mode == UserAbstraction::UnifiedAccount {
+        withdrawable
+    } else {
+        withdrawable.min(account.perp_balance(dex).max(Decimal::ZERO))
+    })
 }
 
 /// The maintenance-margin rate for a notional: the margin tier's

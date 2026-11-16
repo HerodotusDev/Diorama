@@ -406,7 +406,9 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
             })
         };
     let has_book = |coin: &str| {
-        if feed.book(coin, crate::now_ms()).is_some() {
+        // A coin outside the configured markets that a dex lists gets its book
+        // on demand (and stays wanted while it is subscribed).
+        if feed.book(coin, crate::now_ms()).is_some() || feed.warm_book(coin) {
             Ok(())
         } else {
             Err(Refusal::Named(format!(

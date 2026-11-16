@@ -4,8 +4,12 @@
 //! The poller refreshes the cache (`metaAndAssetCtxs`, one `l2Book` per
 //! configured market, `allMids`) every `poll_interval_ms`; a book or mids the WS
 //! client updated within one interval is skipped, so the REST lane is the gap
-//! reconciliation rather than a duplicate read. The same client serves the
-//! passthrough reads (untouched accounts are the real venue's answers).
+//! reconciliation rather than a duplicate read. Coins outside the configured
+//! markets are read the same way once something wants them (an order, a held
+//! position or resting order, an `l2Book` read or subscription): a few of the
+//! wanted set per pass, round-robin, inside the shared request budget (see
+//! `MarketFeed::want_book`). The same client serves the passthrough reads
+//! (untouched accounts are the real venue's answers).
 //!
 //! Failover is the shared [`EndpointPool::execute`]: admission, cooldown,
 //! bounded retry and the attempt budget live in the common spine. This module
@@ -242,6 +246,11 @@ const SLOW_REFRESH_MS: u64 = 60_000;
 /// while the default plane's own cadence is untouched.
 const BUILDER_DEXES_PER_PASS: usize = 2;
 
+/// Wanted books (an order, a position, an `l2Book` read) one pass refreshes,
+/// round-robin across passes: each is one `l2Book`, and the wanted set can
+/// hold more coins than a pass's share of the request budget.
+const WANTED_BOOKS_PER_PASS: usize = 16;
+
 /// The budget the optional builder-dex reads leave free: the default plane
 /// (its `metaAndAssetCtxs`, books, mids) and the passthrough reads always
 /// fit, so the builder sweep slows down before anything else does.
@@ -254,6 +263,8 @@ pub struct Poller {
     interval: Duration,
     /// The round-robin cursor over the builder dexes.
     cursor: AtomicUsize,
+    /// The round-robin cursor over the wanted books.
+    book_cursor: AtomicUsize,
     /// When the slow reads last ran (ms since the epoch; 0 = never).
     spot_at_ms: AtomicU64,
     registry_at_ms: AtomicU64,
@@ -266,6 +277,7 @@ impl Poller {
             api,
             interval,
             cursor: AtomicUsize::new(0),
+            book_cursor: AtomicUsize::new(0),
             spot_at_ms: AtomicU64::new(0),
             registry_at_ms: AtomicU64::new(0),
         }
@@ -453,32 +465,59 @@ impl Poller {
         }
     }
 
+    /// The books: every configured market, then a round-robin slice of the
+    /// wanted set (coins an order, a position, a resting order or an `l2Book`
+    /// read named; the optional reads keep the reserve free like the builder
+    /// dexes' do).
     async fn books(&self) {
         let now = crate::now_ms();
         let window = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
         for coin in &self.feed.markets {
-            // WSS primary, REST gap reconciliation: a book the socket updated
-            // within one poll interval is not re-read. A scripted book owns the
-            // coin and is never polled; a warming or stale one is.
-            if matches!(
-                self.feed.book_age(coin, now, window),
-                crate::feed::BookAge::Fresh | crate::feed::BookAge::Scripted
-            ) {
-                continue;
-            }
-            if !self.gated(crate::feed::budget::weight::LIGHT) {
+            if !self.refresh_book(coin, now, window, false).await {
                 return;
             }
-            let req = InfoRequest::L2Book {
-                coin: coin.clone(),
-                n_sig_figs: None,
-                mantissa: None,
-            };
-            match self.api.info::<L2Book>(&req).await {
-                Ok(book) => self.feed.put_book(book, crate::now_ms()),
-                Err(e) => self.rest_fault("l2Book", &e),
+        }
+        let wanted = self.feed.wanted_coins(now);
+        if wanted.is_empty() {
+            return;
+        }
+        for _ in 0..WANTED_BOOKS_PER_PASS.min(wanted.len()) {
+            let coin = &wanted[self.book_cursor.fetch_add(1, Ordering::Relaxed) % wanted.len()];
+            if !self.refresh_book(coin, now, window, true).await {
+                return;
             }
         }
+    }
+
+    /// One book's refresh. WSS primary, REST gap reconciliation: a book the
+    /// socket updated within one poll interval is not re-read. A scripted book
+    /// owns the coin and is never polled; a warming or stale one is. `false`
+    /// when the budget is spent (the rest of the pass is skipped).
+    async fn refresh_book(&self, coin: &str, now: u64, window: u64, optional: bool) -> bool {
+        if matches!(
+            self.feed.book_age(coin, now, window),
+            crate::feed::BookAge::Fresh | crate::feed::BookAge::Scripted
+        ) {
+            return true;
+        }
+        let weight = crate::feed::budget::weight::LIGHT;
+        if !(if optional {
+            self.gated_keeping(weight)
+        } else {
+            self.gated(weight)
+        }) {
+            return false;
+        }
+        let req = InfoRequest::L2Book {
+            coin: coin.to_string(),
+            n_sig_figs: None,
+            mantissa: None,
+        };
+        match self.api.info::<L2Book>(&req).await {
+            Ok(book) => self.feed.put_book(book, crate::now_ms()),
+            Err(e) => self.rest_fault("l2Book", &e),
+        }
+        true
     }
 
     /// `allMids`. With builder dexes known, ONE `ALL_DEXS` read covers every

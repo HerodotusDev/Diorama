@@ -5,7 +5,8 @@
 //! (the served-shape patch), `funding` (the hourly interval), `ledger` (the
 //! per-account fill and funding history), `order` (the matching lane),
 //! `validate` (the lane's rules), `waterfall` (the liquidation ladder), `tick`
-//! (the self-advance automaton), `metrics` (the registry).
+//! (the self-advance automaton), `transfer` (collateral moves between the spot
+//! wallet and the perp dexes), `metrics` (the registry).
 //!
 //! Untouched accounts are not the sim's business — the API layer passes those
 //! reads through to the real venue. A *touched* account (dealt funds, seeded,
@@ -34,12 +35,12 @@ pub(crate) mod metrics;
 pub(crate) mod order;
 pub(crate) mod seed;
 pub(crate) mod tick;
+pub(crate) mod transfer;
 pub(crate) mod validate;
 pub(crate) mod waterfall;
 
 use crate::error::{Error, Result};
 use crate::feed::MarketFeed;
-use crate::wire::UserAbstraction;
 use account::{Account, Accounts, Liquidation};
 use alloy_primitives::Address;
 use diorama_devnet::store;
@@ -315,6 +316,29 @@ impl Sim {
                 ))),
                 (None, _) => Ok(state.accounts.contains_key(&signer).then_some(signer)),
             }
+        })
+    }
+
+    /// Every coin some account holds a position in or has a resting order on
+    /// (sorted, deduplicated): the books the venue feed keeps wanted so a held
+    /// coin's depth never idles out of the poll set.
+    pub(crate) fn held_coins(&self) -> Result<Vec<String>> {
+        self.with_state(|state| {
+            let mut coins: std::collections::BTreeSet<String> = state
+                .resting
+                .values()
+                .map(|order| order.coin.clone())
+                .collect();
+            for account in state.accounts.values() {
+                coins.extend(
+                    account
+                        .positions
+                        .iter()
+                        .filter(|(_, p)| !p.szi.is_zero())
+                        .map(|(coin, _)| coin.clone()),
+                );
+            }
+            Ok(coins.into_iter().collect())
         })
     }
 
@@ -663,22 +687,19 @@ impl Sim {
                     stamp_funding_baseline(account, clock);
                 }
                 Direction::ToSpot => {
-                    if account.mode == UserAbstraction::UnifiedAccount {
-                        // A mark not yet served (`view` faults) is a refusal,
-                        // never a guess — the caller re-sends.
-                        let Some(bound) =
-                            account::unified_transfer_bound(account, feed, DEFAULT_DEX)
-                        else {
-                            tracing::warn!(account = %address, amount = %transfer.amount,
-                                "usd class transfer refused: the unified account's marks are not served yet");
-                            return Ok(Applied::Refused);
-                        };
-                        if transfer.amount > bound {
-                            tracing::warn!(account = %address, amount = %transfer.amount, withdrawable = %bound,
-                                "usd class transfer refused: the amount exceeds the unified account's withdrawable (the docs' transfer floor)");
-                            return Ok(Applied::Refused);
-                        }
-                    } else if account.perp_balance(DEFAULT_DEX) < transfer.amount {
+                    // A mark not yet served (`view` faults) is a refusal,
+                    // never a guess; the caller re-sends. The margin in use
+                    // stays on the dex (the docs' transfer floor); a standard
+                    // account's wallet also never sends more than its cash.
+                    let Some(bound) = account::perp_transfer_bound(account, feed, DEFAULT_DEX)
+                    else {
+                        tracing::warn!(account = %address, amount = %transfer.amount,
+                            "usd class transfer refused: the account's marks are not served yet");
+                        return Ok(Applied::Refused);
+                    };
+                    if transfer.amount > bound {
+                        tracing::warn!(account = %address, amount = %transfer.amount, withdrawable = %bound,
+                            "usd class transfer refused: the amount exceeds what the default dex may send (the docs' transfer floor)");
                         return Ok(Applied::Refused);
                     }
                     // The unified pool re-splits: the perp view may go negative.
