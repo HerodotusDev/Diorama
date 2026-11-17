@@ -1,10 +1,13 @@
-//! The WS lane of the market plane: `allMids`, `activeAssetCtx` and `l2Book`
+//! The WS lane of the market plane: `allMids`, `activeAssetCtx` and `l2`
 //! pushes (the primary freshness source; the REST poller backfills a coin the
 //! socket has not updated within one poll interval).
 //!
 //! One upstream socket carries every stream (see [`crate::feed::relay`]):
 //! `allMids`, an `activeAssetCtx` for every live coin of every perp dex, and
-//! an `l2Book` for each coin someone needs. The set changes while the socket
+//! an `l2` book feed for each coin someone needs. The venue throttles the plain
+//! `l2Book` channel to one 20-level frame every 5 to 12 s, while `l2` is a
+//! snapshot plus a diff about every half second (the channel its own app
+//! uses), rebuilt into full books by [`crate::feed::l2`]. The set changes while the socket
 //! is up: a once-a-second sync diffs the desired streams against what the
 //! socket carries and sends the `subscribe`/`unsubscribe` frames (a fresh
 //! socket carries nothing, so a reconnect resubscribes the live set).
@@ -22,6 +25,7 @@
 //! deadline (2× the documented 30 s push cadence) fails the endpoint, cools it
 //! and rotates to the next one. A long-lived session that delivered data and
 //! then dropped reconnects immediately; only a failed session sleeps.
+use crate::feed::l2;
 use crate::feed::relay::{self, Op, SendBudget, Stream};
 use crate::feed::MarketFeed;
 use crate::wire::{AssetCtx, L2Book};
@@ -68,8 +72,13 @@ pub(crate) enum WsMessage {
     AllMids { data: WsAllMids },
     #[serde(rename = "activeAssetCtx")]
     ActiveAssetCtx { data: WsAssetCtx },
+    /// A full book (the plain `l2Book` channel; the lane subscribes `l2`, but
+    /// a book frame is folded whichever channel carries it).
     #[serde(rename = "l2Book")]
     L2Book { data: L2Book },
+    /// The `l2` feed: a snapshot, then diffs (see [`crate::feed::l2`]).
+    #[serde(rename = "l2")]
+    L2 { data: serde_json::Value },
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "error")]
@@ -96,6 +105,9 @@ enum Frame {
     /// An `l2Book` push for this coin (data, and the coin's book stream is
     /// now known to be delivering).
     Book(String),
+    /// An `l2` diff that could not apply to this coin's book: the stream is
+    /// resubscribed for a fresh snapshot.
+    Resync(String),
     /// A pong or an unknown channel: alive, but not data.
     Control,
     /// The venue's subscription error. A per-coin refusal is isolated (the
@@ -131,8 +143,10 @@ enum Subscription<'a> {
     AllMids,
     #[serde(rename = "activeAssetCtx")]
     ActiveAssetCtx { coin: &'a str },
-    #[serde(rename = "l2Book")]
-    L2Book { coin: &'a str },
+    /// The venue's `l2` feed (`c` is the coin): the book as a snapshot and
+    /// diffs, not the throttled `l2Book`.
+    #[serde(rename = "l2")]
+    L2 { c: &'a str },
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +173,11 @@ pub struct WsClient {
 struct SessionState {
     live: BTreeSet<Stream>,
     book_seen: BTreeSet<String>,
+    /// The `l2` snapshots each book diff applies to.
+    books: l2::Rebuilder,
+    /// Books whose diffs stopped applying: the next sync unsubscribes them so
+    /// the plan subscribes again and the venue sends a fresh snapshot.
+    resync: BTreeSet<String>,
     /// Whether the socket has delivered a data frame (it is then a healthy
     /// endpoint whatever happens next).
     delivered: bool,
@@ -371,7 +390,7 @@ impl WsClient {
                 msg = source.next() => match msg {
                     Some(Ok(Message::Text(text))) => {
                         deadline = tokio::time::Instant::now() + DATA_IDLE_TIMEOUT;
-                        let frame = self.handle_text(&text, &state);
+                        let frame = self.handle_text(&text, &mut state);
                         if matches!(frame, Frame::Data | Frame::Book(_)) {
                             last_data = tokio::time::Instant::now();
                         }
@@ -401,19 +420,32 @@ impl WsClient {
     /// next sync). Updates the live set as if the frames were sent.
     fn sync_frames(&self, state: &mut SessionState, now_ms: u64) -> Result<Vec<String>, WsError> {
         let desired = self.feed.desired_streams(now_ms);
+        let mut frames = Vec::new();
+        // A book whose diffs stopped applying is dropped from the live set
+        // (with an unsubscribe, so the venue forgets it) and the plan below
+        // subscribes it again.
+        for coin in std::mem::take(&mut state.resync) {
+            let stream = Stream::Book(coin.clone());
+            if state.live.contains(&stream) && self.budget_take(1) == 1 {
+                frames.push(Self::encode("unsubscribe", Subscription::L2 { c: &coin })?);
+                state.live.remove(&stream);
+                state.book_seen.remove(&coin);
+                state.books.forget(&coin);
+            }
+        }
         let ops = relay::plan(&desired, &state.live);
         if ops.is_empty() {
-            return Ok(Vec::new());
+            return Ok(frames);
         }
         let allowed = self.budget_take(ops.len());
-        let mut frames = Vec::with_capacity(allowed);
+        frames.reserve(allowed);
         for op in ops.into_iter().take(allowed) {
             let (method, stream) = match &op {
                 Op::Subscribe(stream) => ("subscribe", stream),
                 Op::Unsubscribe(stream) => ("unsubscribe", stream),
             };
             let subscription = match stream {
-                Stream::Book(coin) => Subscription::L2Book { coin },
+                Stream::Book(coin) => Subscription::L2 { c: coin },
                 Stream::Ctx(coin) => Subscription::ActiveAssetCtx { coin },
             };
             frames.push(Self::encode(method, subscription)?);
@@ -424,6 +456,7 @@ impl WsClient {
                 Op::Unsubscribe(stream) => {
                     if let Stream::Book(coin) = &stream {
                         state.book_seen.remove(coin);
+                        state.books.forget(coin);
                     }
                     state.live.remove(&stream);
                 }
@@ -474,6 +507,10 @@ impl WsClient {
                 }
             }
             Frame::Control => {}
+            Frame::Resync(coin) => {
+                tracing::debug!(coin = %coin, "l2 diff did not apply; resubscribing the book");
+                state.resync.insert(coin);
+            }
             Frame::Error(SubscriptionFailure::Coin(coin)) => {
                 // One refused coin is not the lane's failure: the allMids and
                 // every other stream stay live. The REST poller backfills the
@@ -508,7 +545,7 @@ impl WsClient {
         .map_err(WsError::Encode)
     }
 
-    fn handle_text(&self, text: &str, state: &SessionState) -> Frame {
+    fn handle_text(&self, text: &str, state: &mut SessionState) -> Frame {
         let msg: WsMessage = match serde_json::from_str(text) {
             Ok(msg) => msg,
             Err(e) => {
@@ -531,6 +568,21 @@ impl WsClient {
                 self.feed.put_book(data, now);
                 Frame::Book(coin)
             }
+            WsMessage::L2 { data } => match state.books.apply(&data) {
+                Some(book) => {
+                    let coin = book.coin.clone();
+                    self.feed.put_book(book, now);
+                    Frame::Book(coin)
+                }
+                None => match l2::frame_coin(&data) {
+                    // A diff that cannot apply (no snapshot, a gap) leaves
+                    // the coin's book silently stale: ask for a fresh one.
+                    Some(coin) if state.live.contains(&Stream::Book(coin.clone())) => {
+                        Frame::Resync(coin)
+                    }
+                    _ => Frame::Control,
+                },
+            },
             WsMessage::Error { data } => Frame::Error(classify_subscription_error(
                 state.live.iter().map(Stream::coin),
                 &data,
@@ -669,8 +721,8 @@ mod tests {
             r#"{"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}"#
         );
         assert_eq!(
-            encode("unsubscribe", Subscription::L2Book { coin: "xyz:TSLA" }),
-            r#"{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"xyz:TSLA"}}"#,
+            encode("unsubscribe", Subscription::L2 { c: "xyz:TSLA" }),
+            r#"{"method":"unsubscribe","subscription":{"type":"l2","c":"xyz:TSLA"}}"#,
             "a builder coin keeps its colon"
         );
     }
@@ -680,7 +732,7 @@ mod tests {
     }
 
     fn sub(coin: &str) -> String {
-        format!(r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"{coin}"}}}}"#)
+        format!(r#"{{"method":"subscribe","subscription":{{"type":"l2","c":"{coin}"}}}}"#)
     }
 
     fn ctx_sub(coin: &str) -> String {
@@ -729,7 +781,7 @@ mod tests {
         );
         assert_eq!(
             frames(&client, &mut state, released + relay::GRACE_MS + 2_000),
-            [r#"{"method":"unsubscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#],
+            [r#"{"method":"unsubscribe","subscription":{"type":"l2","c":"BTC"}}"#],
             "the stream goes after the grace"
         );
     }
@@ -864,10 +916,10 @@ mod tests {
     fn an_l2_book_push_is_folded_as_a_live_book() {
         let client = client();
         let feed = Arc::clone(&client.feed);
-        let state = SessionState::default();
+        let mut state = SessionState::default();
         let frame = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1700000000000,"levels":[[{"px":"100.5","sz":"1.0","n":2}],[{"px":"101.0","sz":"2.0","n":1}]],"spread":"0.5"}}"#;
         assert!(matches!(
-            client.handle_text(frame, &state),
+            client.handle_text(frame, &mut state),
             Frame::Book(coin) if coin == "BTC"
         ));
         let book = feed
@@ -876,6 +928,53 @@ mod tests {
         assert_eq!(book.levels[0][0].px, Decimal::new(1005, 1));
         assert_eq!(book.levels[0][0].n, 2);
         assert_eq!(book.levels[1][0].px, Decimal::new(1010, 1));
+    }
+
+    /// The `l2` feed: a snapshot starts the book, each diff lands in the same
+    /// cache `/info` serves (so the book moves at the venue's own cadence), and
+    /// a diff that cannot apply resubscribes the stream for a fresh snapshot.
+    #[test]
+    fn the_l2_feed_rebuilds_the_book_and_a_broken_diff_resubscribes() {
+        let client = client();
+        let now = crate::now_ms();
+        assert!(client.feed.want_book("BTC"));
+        let mut state = SessionState::default();
+        let _ = frames(&client, &mut state, now);
+        let feed = Arc::clone(&client.feed);
+        let feed_frame = |state: &mut SessionState, text: &str| {
+            let frame = client.handle_text(text, state);
+            client.handle_frame(0, "ws://x", frame, state);
+        };
+        feed_frame(
+            &mut state,
+            r#"{"channel":"l2","data":{"s":{"coin":"BTC","time":5,"levels":[[{"px":"100","sz":"1","n":2},{"px":"99","sz":"1","n":1}],[{"px":"101","sz":"1","n":1}]]}}}"#,
+        );
+        assert!(state.book_seen.contains("BTC"));
+        feed_frame(
+            &mut state,
+            r#"{"channel":"l2","data":{"u":{"c":"BTC","t":6,"l":[[{"p":"100","s":"7"}],[{"p":"100.5","s":"3"}]],"r":[[1],[]]}}}"#,
+        );
+        let book = feed.book("BTC", crate::now_ms()).expect("served");
+        assert_eq!(book.levels[0].len(), 1);
+        assert_eq!(book.levels[0][0].sz, Decimal::from(7));
+        assert_eq!(book.levels[1][0].px, Decimal::new(1005, 1));
+        assert_eq!(book.levels[1].len(), 2);
+
+        // A diff for a coin the lane has no snapshot of: resubscribe it.
+        state.books.forget("BTC");
+        feed_frame(
+            &mut state,
+            r#"{"channel":"l2","data":{"u":{"c":"BTC","t":7,"l":[[],[]],"r":[[],[]]}}}"#,
+        );
+        assert!(state.resync.contains("BTC"));
+        assert_eq!(
+            frames(&client, &mut state, now),
+            [
+                r#"{"method":"unsubscribe","subscription":{"type":"l2","c":"BTC"}}"#.to_string(),
+                sub("BTC")
+            ]
+        );
+        assert!(state.resync.is_empty());
     }
 
     /// A book whose first frame arrived is confirmed current while the socket
@@ -888,7 +987,7 @@ mod tests {
         let mut state = SessionState::default();
         let _ = frames(&client, &mut state, now);
         let frame = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[{"px":"100","sz":"1","n":1}],[{"px":"101","sz":"1","n":1}]]}}"#;
-        let seen = client.handle_text(frame, &state);
+        let seen = client.handle_text(frame, &mut state);
         client.handle_frame(0, "ws://x", seen, &mut state);
         assert!(state.book_seen.contains("BTC"));
         // 40 s on, with no new push, the confirmation keeps the quiet book fresh.
@@ -938,9 +1037,9 @@ mod tests {
                                 100 + id,
                                 100 + id,
                             )),
-                            (Some("subscribe"), Some("l2Book")) => Some(format!(
-                                r#"{{"channel":"l2Book","data":{{"coin":"{}","time":1,"levels":[[{{"px":"99","sz":"1","n":1}}],[{{"px":"101","sz":"1","n":1}}]]}}}}"#,
-                                sub["coin"].as_str().unwrap()
+                            (Some("subscribe"), Some("l2")) => Some(format!(
+                                r#"{{"channel":"l2","data":{{"s":{{"coin":"{}","time":1,"levels":[[{{"px":"99","sz":"1","n":1}}],[{{"px":"101","sz":"1","n":1}}]]}}}}}}"#,
+                                sub["c"].as_str().unwrap()
                             )),
                             _ => None,
                         };
@@ -951,7 +1050,7 @@ mod tests {
                         }
                         // The first connection is dropped once it has served
                         // a book: the lane must come back and resubscribe.
-                        if id == 0 && text.contains("l2Book") {
+                        if id == 0 && text.contains(r#""type":"l2""#) {
                             tokio::time::sleep(Duration::from_millis(300)).await;
                             return;
                         }
@@ -1011,7 +1110,7 @@ mod tests {
         }
         assert!(
             log.iter()
-                .any(|(conn, text)| *conn == 1 && text.contains("l2Book")),
+                .any(|(conn, text)| *conn == 1 && text.contains(r#""type":"l2""#)),
             "the book stream was resubscribed after the reconnect"
         );
         task.abort();
@@ -1090,6 +1189,17 @@ mod tests {
             feed.all_mids_of("xyz").0.get("xyz:TSLA")
         );
         assert!(missing.len() * 20 < live.len(), "nearly every coin is live");
+        // The `l2` feed moves a busy book about twice a second (the plain
+        // `l2Book` channel would show one change per 5 to 12 s).
+        let mut stamps = std::collections::BTreeSet::new();
+        for _ in 0..100 {
+            if let Some(book) = feed.book("BTC", crate::now_ms()) {
+                stamps.insert(book.time);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        println!("BTC book updates in 10 s: {}", stamps.len());
+        assert!(stamps.len() >= 6, "the book follows the l2 feed's cadence");
         task.abort();
     }
 }
