@@ -360,6 +360,13 @@ impl Bridge {
         for (caller, action) in calls {
             self.apply_action(caller, action, &tokens).await?;
         }
+        // The block's credits and actions moved Core state: bring the L1 read
+        // precompiles to it now, so a read in the very next EVM block sees
+        // the deposit or recall this block applied (the end-of-pass mirror
+        // would only catch up at the next poll).
+        if let Err(e) = self.mirror_precompiles().await {
+            tracing::warn!(block = n, error = %e, "venue bridge: precompile mirror failed; will retry");
+        }
         Ok(())
     }
 
