@@ -233,11 +233,12 @@ pub struct VenueSimSection {
     pub poll_interval_ms: u64,
     /// The account plane's self-advance tick (funding, liquidations, persist).
     pub tick_interval_ms: u64,
-    /// The websocket's market-data push cadence (`l2Book`, `l2`,
-    /// `activeAssetCtx`, `allMids`, `fastAssetCtxs`, `pac`); the account
-    /// channels keep `tick_interval_ms`. The real venue pushes books about
-    /// twice a second.
-    #[serde(default = "default_market_push_interval_ms")]
+    /// Deprecated and ignored: the websocket pushes the market channels
+    /// (`l2Book`, `l2`, `bbo`, `activeAssetCtx`, `allMids`, `fastAssetCtxs`,
+    /// `pac`) when the feed changes, not on a clock. Kept so existing
+    /// instance files still parse; the account channels keep
+    /// `tick_interval_ms`.
+    #[serde(default)]
     pub market_push_interval_ms: u64,
     /// The market-plane heartbeat log cadence.
     pub heartbeat_interval_secs: u64,
@@ -375,10 +376,6 @@ pub struct LoopsSection {
     pub mine_empty_blocks: bool,
 }
 
-/// The venue sim's market-data push cadence: about the real venue's.
-fn default_market_push_interval_ms() -> u64 {
-    500
-}
 
 /// The mirror stays alive when idle: the default. A pinned demo opts out.
 fn default_mine_empty_blocks() -> bool {

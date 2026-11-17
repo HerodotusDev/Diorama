@@ -28,8 +28,10 @@ use crate::sim::Sim;
 use axum::Router;
 use std::sync::Arc;
 
-/// The market channels' default push cadence (about the real venue's).
-const DEFAULT_MARKET_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a change to the market feed waits before the websocket composes
+/// and pushes it: a burst of writes (a book and its ctx landing together)
+/// becomes one frame. Nothing is pushed when nothing changed.
+const DEFAULT_MARKET_COALESCE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Everything both routers read. Built once by the bin.
 pub struct ApiState {
@@ -51,11 +53,12 @@ pub struct ApiState {
     /// The venue websocket's push cadence (the account automaton's configured
     /// tick, not a second hardcoded second).
     pub push_interval: std::time::Duration,
-    /// The market-data channels' push cadence (`l2Book`, `l2`,
-    /// `activeAssetCtx`, `allMids`, `fastAssetCtxs`, `pac`): the real venue
-    /// pushes these about twice a second, faster than the account automaton's
-    /// tick, so they have their own interval.
-    pub market_push_interval: std::time::Duration,
+    /// The market-data channels (`l2Book`, `l2`, `bbo`, `activeAssetCtx`,
+    /// `allMids`, `fastAssetCtxs`, `pac`) are event driven: a feed change wakes
+    /// the session, which waits this long to batch a burst and then pushes only
+    /// the content that changed (the real venue pushes on change, not on a
+    /// clock).
+    pub market_coalesce: std::time::Duration,
     /// The relayed candle streams (the venue serves candles; the sim has no
     /// trade tape to build them from).
     pub candles: Arc<candles::CandleHub>,
@@ -87,15 +90,16 @@ impl ApiState {
             bridge,
             ws_pool: None,
             push_interval,
-            market_push_interval: push_interval.min(DEFAULT_MARKET_PUSH_INTERVAL),
+            market_coalesce: DEFAULT_MARKET_COALESCE,
             candles: Arc::new(candles::CandleHub::default()),
         })
     }
 
-    /// Set the market-data channels' push cadence.
+    /// Set the market-data channels' coalescing window.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_market_push_interval(mut self, interval: std::time::Duration) -> Self {
-        self.market_push_interval = interval;
+    pub fn with_market_coalesce(mut self, window: std::time::Duration) -> Self {
+        self.market_coalesce = window;
         self
     }
 
@@ -280,11 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn the_market_push_interval_defaults_to_the_venues_cadence() {
+    fn the_market_channels_coalesce_briefly_and_the_account_tick_is_kept() {
         let api = state(Arc::new(MarketFeed::memory()));
         assert_eq!(api.push_interval, Duration::from_secs(1));
-        assert_eq!(api.market_push_interval, Duration::from_millis(500));
-        let api = api.with_market_push_interval(Duration::from_millis(250));
-        assert_eq!(api.market_push_interval, Duration::from_millis(250));
+        assert_eq!(api.market_coalesce, Duration::from_millis(25));
+        let api = api.with_market_coalesce(Duration::from_millis(50));
+        assert_eq!(api.market_coalesce, Duration::from_millis(50));
     }
 }

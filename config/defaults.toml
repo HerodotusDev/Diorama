@@ -119,9 +119,6 @@ addr = "0.0.0.0"
 poll_interval_ms = 5000
 # The account plane's self-advance tick (funding, liquidations, persist).
 tick_interval_ms = 1000
-# The websocket's market-data push cadence (books, contexts, mids); the real
-# venue pushes books about twice a second. Account channels keep the tick.
-market_push_interval_ms = 500
 # The `orderStatus` terminal-history bound (a deployment memory policy).
 terminal_orders = 1024
 # The Core↔EVM bridge's scan cadence (one pass per interval).

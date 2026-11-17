@@ -1371,9 +1371,6 @@ fn check_venue_sim(sim: &VenueSimSection, issues: &mut Vec<String>) {
     if sim.poll_interval_ms == 0 {
         issues.push("services.venue_sim.poll_interval_ms must be > 0".into());
     }
-    if sim.market_push_interval_ms == 0 {
-        issues.push("services.venue_sim.market_push_interval_ms must be > 0".into());
-    }
     if sim.tick_interval_ms == 0 {
         issues.push("services.venue_sim.tick_interval_ms must be > 0".into());
     }

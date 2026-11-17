@@ -290,6 +290,30 @@ mod tests {
     use super::*;
     use alloy_primitives::U256;
 
+    /// The websocket's market channels are event driven now: the old
+    /// `market_push_interval_ms` key is ignored but an instance file that still
+    /// sets it keeps parsing, and the shipped defaults no longer carry it.
+    #[test]
+    fn a_legacy_market_push_interval_still_parses() {
+        let defaults: toml::Value = toml::from_str(DEFAULTS).unwrap();
+        let mut sim = defaults["services"]["venue_sim"].clone();
+        assert!(sim.get("market_push_interval_ms").is_none());
+        let table = sim.as_table_mut().unwrap();
+        table.insert("state_dir".into(), "/state".into());
+        for (key, port) in [("control", 8091), ("info", 8090)] {
+            if let Some(section) = table.get_mut(key).and_then(|v| v.as_table_mut()) {
+                section.insert("port".into(), port.into());
+            }
+        }
+        let without: VenueSimSection = sim.clone().try_into().unwrap();
+        assert_eq!(without.market_push_interval_ms, 0);
+        sim.as_table_mut()
+            .unwrap()
+            .insert("market_push_interval_ms".into(), 250.into());
+        let legacy: VenueSimSection = sim.try_into().unwrap();
+        assert_eq!(legacy.market_push_interval_ms, 250);
+    }
+
     fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()

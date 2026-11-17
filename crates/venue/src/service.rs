@@ -116,7 +116,6 @@ fn build_planes(
             Duration::from_secs(sim_section.admin_timeout_secs),
             Duration::from_millis(sim_section.tick_interval_ms),
         )?
-        .with_market_push_interval(Duration::from_millis(sim_section.market_push_interval_ms))
         .with_ws_pool(ws_pool.clone()),
     );
     Ok(Planes {

@@ -169,6 +169,12 @@ pub struct MarketFeed {
     /// service; absent in fixtures, where [`Self::ensure_book`] only serves
     /// what is cached).
     rest: std::sync::OnceLock<rest::RestClient>,
+    /// A monotonic version bumped by every write that can change what a market
+    /// channel serves (a live ctx, book or mids write, a scripted override, a
+    /// consumed level). A downstream websocket wakes on it, composes its
+    /// channels and pushes only what changed. A relay confirmation (the book
+    /// is unchanged) does not bump it.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 /// A live context with the scenario's overrides applied: the one composition
@@ -221,7 +227,18 @@ impl MarketFeed {
             persist_lock: std::sync::Mutex::new(()),
             stalled_until_ms: AtomicU64::new(0),
             rest: std::sync::OnceLock::new(),
+            changes: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// Signal that the market content may have changed (see `changes`).
+    fn notify(&self) {
+        self.changes.send_modify(|version| *version += 1);
+    }
+
+    /// The change signal a websocket session waits on.
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// An in-memory feed (tests only: no production path builds one).
@@ -237,6 +254,7 @@ impl MarketFeed {
             persist_lock: std::sync::Mutex::new(()),
             stalled_until_ms: AtomicU64::new(0),
             rest: std::sync::OnceLock::new(),
+            changes: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -255,6 +273,7 @@ impl MarketFeed {
             crate::now_ms().saturating_add(seconds.saturating_mul(1_000))
         };
         self.stalled_until_ms.store(until, Ordering::Relaxed);
+        self.notify();
         until
     }
 
@@ -453,6 +472,8 @@ impl MarketFeed {
         c.books.remove(coin);
         c.book_at.remove(coin);
         c.book_live_at.remove(coin);
+        drop(c);
+        self.notify();
     }
 
     /// The coin's book, fetching it from the venue once when it is not cached
@@ -543,6 +564,8 @@ impl MarketFeed {
         let mut c = self.write();
         c.registry.put_meta("", meta);
         c.meta_at = Some(now_ms);
+        drop(c);
+        self.notify();
     }
 
     /// One dex's meta (the default dex is `""`); a dex the registry does not
@@ -556,6 +579,7 @@ impl MarketFeed {
             return;
         }
         self.write().registry.put_meta(dex, meta);
+        self.notify();
     }
 
     /// The venue's dex list with every dex's meta (`perpDexs` +
@@ -578,6 +602,8 @@ impl MarketFeed {
         c.registry = registry;
         c.registry_loaded = true;
         c.meta_at = Some(now_ms);
+        drop(c);
+        self.notify();
         true
     }
 
@@ -606,6 +632,8 @@ impl MarketFeed {
             c.ctxs.insert(asset.name.clone(), ctx);
         }
         c.registry.refresh_meta(dex, meta);
+        drop(c);
+        self.notify();
     }
 
     pub(crate) fn put_spot_meta(&self, spot: crate::wire::SpotMeta) {
@@ -661,7 +689,12 @@ impl MarketFeed {
             return;
         }
         c.ctx_at.insert(coin.clone(), now_ms);
+        let changed = c.ctxs.get(&coin) != Some(&ctx);
         c.ctxs.insert(coin, ctx);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     pub(crate) fn put_ctx(&self, coin: String, ctx: AssetCtx, now_ms: u64) {
@@ -671,7 +704,12 @@ impl MarketFeed {
         }
         let mut c = self.write();
         c.ctx_at.insert(coin.clone(), now_ms);
+        let changed = c.ctxs.get(&coin) != Some(&ctx);
         c.ctxs.insert(coin, ctx);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     pub(crate) fn put_book(&self, book: L2Book, now_ms: u64) {
@@ -698,7 +736,15 @@ impl MarketFeed {
         let mut c = self.write();
         c.book_at.insert(book.coin.clone(), now_ms);
         c.book_live_at.insert(book.coin.clone(), now_ms);
+        let changed = c
+            .books
+            .get(&book.coin)
+            .is_none_or(|old| old.levels != book.levels);
         c.books.insert(book.coin.clone(), book);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     /// Prune the coin's consumptions against the base it will serve (a live
@@ -737,8 +783,13 @@ impl MarketFeed {
             return;
         }
         let mut c = self.write();
+        let changed = c.mids.get("") != Some(&mids);
         c.mids.insert(String::new(), mids);
         c.mids_at.insert(String::new(), now_ms);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     /// `allMids {dex:"ALL_DEXS"}`: every dex's coins in one answer, split by
@@ -765,9 +816,15 @@ impl MarketFeed {
                 .or_default()
                 .insert(coin, mid);
         }
+        let mut changed = false;
         for (dex, mids) in by_dex {
             c.mids_at.insert(dex.clone(), now_ms);
+            changed |= c.mids.get(&dex) != Some(&mids);
             c.mids.insert(dex, mids);
+        }
+        drop(c);
+        if changed {
+            self.notify();
         }
     }
 
@@ -777,11 +834,13 @@ impl MarketFeed {
         self.write_overrides()
             .prices
             .insert(coin.to_string(), price);
+        self.notify();
         self.persist()
     }
 
     pub fn clear_price(&self, coin: &str) -> Result<()> {
         self.write_overrides().prices.remove(coin);
+        self.notify();
         self.persist()
     }
 
@@ -798,6 +857,7 @@ impl MarketFeed {
                 }
             }
         }
+        self.notify();
         self.persist()
     }
 
@@ -807,6 +867,7 @@ impl MarketFeed {
             o.funding.remove(coin);
             o.funding_expires_ms.remove(coin);
         }
+        self.notify();
         self.persist()
     }
 
@@ -833,6 +894,7 @@ impl MarketFeed {
             }
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -854,6 +916,7 @@ impl MarketFeed {
             self.metrics.add_owned_pruned(pruned as u64);
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -866,6 +929,7 @@ impl MarketFeed {
             o.consumptions.retain(|c| c.coin != coin);
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -874,6 +938,7 @@ impl MarketFeed {
     pub fn clear_overrides(&self) -> Result<()> {
         *self.write_overrides() = Overrides::default();
         self.metrics.set_owned_levels(0);
+        self.notify();
         self.persist()
     }
 
