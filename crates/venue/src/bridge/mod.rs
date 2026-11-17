@@ -15,6 +15,9 @@
 //!   the ones it models (limit orders, cancels by oid and cloid, USD class
 //!   transfer, spot send, sendAsset, add API wallet, approve builder fee, set
 //!   abstraction), counts the rest;
+//! - **L1 reads**: the fork has no HyperEVM read precompiles, so the bridge
+//!   installs a mock at `0x0801`/`0x0803`/`0x080f`/`0x0810` and keeps its
+//!   answers equal to the sim's Core state (see [`precompiles`]);
 //! - **Core→EVM**: a `sendAsset` naming a token's system address is completed
 //!   the way the chain does it — a `transfer(recipient, amount)` call on the
 //!   linked ERC20 **from** the system address (V runs auto-impersonate).
@@ -24,6 +27,7 @@
 //! not the devnet's); a re-pin re-anchors the cursor to the new pin.
 pub(crate) mod corewriter;
 pub(crate) mod metrics;
+pub(crate) mod precompiles;
 pub(crate) mod system;
 
 use crate::error::{Error, Result};
@@ -130,6 +134,9 @@ pub struct Bridge {
     /// sim's state so a restart does not lose the boundary activity mined
     /// meanwhile.
     cursor: std::sync::atomic::AtomicU64,
+    /// The precompile answers last written into V's mocks (the diff base of
+    /// [`Self::mirror_precompiles`]); empty = write everything.
+    mirrored: std::sync::Mutex<std::collections::HashMap<(Address, U256), precompiles::Answer>>,
     pub metrics: Arc<BridgeMetrics>,
 }
 
@@ -153,6 +160,7 @@ impl Bridge {
             system_gas_stipend: policy.system_gas_stipend,
             observed_head: std::sync::atomic::AtomicU64::new(0),
             cursor: std::sync::atomic::AtomicU64::new(cursor),
+            mirrored: std::sync::Mutex::default(),
             metrics,
         })
     }
@@ -198,6 +206,93 @@ impl Bridge {
         }
         self.metrics
             .set_lag_blocks(head.saturating_sub(self.cursor.load(Ordering::Relaxed)));
+        // The L1 read precompiles follow the sim (trades move them too, not
+        // only the chain's blocks); a failure here never stalls the scan.
+        if let Err(e) = self.mirror_precompiles().await {
+            tracing::warn!(error = %e, "venue bridge: precompile mirror failed; will retry");
+        }
+        Ok(())
+    }
+
+    /// Keep V's L1 read precompiles (`precompiles` module docs) equal to the
+    /// sim's Core state: install the mock where it is missing (first pass, a
+    /// chain reset, a re-install by someone else), then write only the answers
+    /// that changed and clear the ones that are gone.
+    async fn mirror_precompiles(&self) -> Result<()> {
+        let Some(spot) = self.feed.spot_meta() else {
+            return Ok(());
+        };
+        let tokens = system::token_registry(&spot);
+        let code = precompiles::mock_code();
+        let mut mirrored = {
+            let mut guard = self
+                .mirrored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        if self
+            .anvil_v
+            .code_at_latest(precompiles::SPOT_BALANCE)
+            .await?
+            != code
+        {
+            for address in precompiles::MIRRORED {
+                self.anvil_v.anvil_set_code(address, code.clone()).await?;
+            }
+            mirrored.clear();
+            tracing::info!("venue bridge: L1 read precompile mocks installed");
+        }
+        let mut wanted = std::collections::HashMap::new();
+        for user in self.sim.account_addresses()? {
+            let Some(account) = self.sim.account(user)? else {
+                continue;
+            };
+            for answer in precompiles::answers_of(user, &account, &self.feed, &tokens) {
+                wanted.insert((answer.target, answer.slot()), answer);
+            }
+        }
+        let result = self.write_answers(&mut mirrored, wanted).await;
+        *self
+            .mirrored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = mirrored;
+        result
+    }
+
+    /// Write the answers that differ from `mirrored` and clear those no
+    /// longer wanted, recording each in `mirrored` as it lands (a failure
+    /// leaves the rest for the next pass).
+    async fn write_answers(
+        &self,
+        mirrored: &mut std::collections::HashMap<(Address, U256), precompiles::Answer>,
+        wanted: std::collections::HashMap<(Address, U256), precompiles::Answer>,
+    ) -> Result<()> {
+        let gone: Vec<(Address, U256)> = mirrored
+            .keys()
+            .filter(|key| !wanted.contains_key(key))
+            .copied()
+            .collect();
+        for key in gone {
+            if let Some(answer) = mirrored.get(&key) {
+                let (slot, value) = answer.cleared();
+                self.anvil_v
+                    .anvil_set_storage_at(answer.target, slot, value)
+                    .await?;
+            }
+            mirrored.remove(&key);
+        }
+        for (key, answer) in wanted {
+            if mirrored.get(&key) == Some(&answer) {
+                continue;
+            }
+            for (slot, value) in answer.storage() {
+                self.anvil_v
+                    .anvil_set_storage_at(answer.target, slot, value)
+                    .await?;
+            }
+            mirrored.insert(key, answer);
+        }
         Ok(())
     }
 
@@ -264,6 +359,13 @@ impl Bridge {
         }
         for (caller, action) in calls {
             self.apply_action(caller, action, &tokens).await?;
+        }
+        // The block's credits and actions moved Core state: bring the L1 read
+        // precompiles to it now, so a read in the very next EVM block sees
+        // the deposit or recall this block applied (the end-of-pass mirror
+        // would only catch up at the next poll).
+        if let Err(e) = self.mirror_precompiles().await {
+            tracing::warn!(block = n, error = %e, "venue bridge: precompile mirror failed; will retry");
         }
         Ok(())
     }
