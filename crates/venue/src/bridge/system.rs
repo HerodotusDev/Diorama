@@ -34,6 +34,39 @@ sol! {
     /// emits `Received(user, amount)` with `user = msg.sender`, so a tx value
     /// sent to `0x2222…2` is the EVM→Core HYPE transfer.
     event Received(address indexed user, uint256 amount);
+    /// The CoreDepositWallet's entry points (the linked USDC's bridge on
+    /// HyperEVM): the deposit names the Core wallet it lands in,
+    /// `destinationDex` (`u32::MAX` the spot wallet, otherwise the
+    /// `perpDexs` position: `0` the default perp dex).
+    function deposit(uint256 amount, uint32 destinationDex);
+    function depositFor(address recipient, uint256 amount, uint32 destinationDex);
+}
+
+/// Where a CoreDepositWallet deposit lands on Core: the account and the dex
+/// index (`u32::MAX` = spot) the call named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepositRoute {
+    pub(crate) recipient: Address,
+    pub(crate) dex: u32,
+}
+
+/// The deposit a call to the CoreDepositWallet makes: `deposit(amount, dex)`
+/// credits the caller, `depositFor(recipient, amount, dex)` the recipient.
+/// `None` for any other calldata (a plain token transfer has no route: spot).
+pub(crate) fn deposit_call_of(caller: Address, input: &[u8]) -> Option<(DepositRoute, U256)> {
+    if let Ok(call) = depositCall::abi_decode(input) {
+        let route = DepositRoute {
+            recipient: caller,
+            dex: call.destinationDex,
+        };
+        return Some((route, call.amount));
+    }
+    let call = depositForCall::abi_decode(input).ok()?;
+    let route = DepositRoute {
+        recipient: call.recipient,
+        dex: call.destinationDex,
+    };
+    Some((route, call.amount))
 }
 
 /// The native HYPE system address (transfers as tx value; `Received` event).
@@ -583,6 +616,51 @@ mod tests {
         // A third party's transfer is not the helper-hop shape.
         let third = transfer_of(&transfer_log(agent, system_address(0), value)).unwrap();
         assert!(hop_credit_of(&third, &[(linked, &funding)], &tokens, helper).is_none());
+    }
+
+    /// The CoreDepositWallet's own entry points name the Core wallet: `deposit`
+    /// credits the caller, `depositFor` the recipient; dex `0` is the default
+    /// perp dex and `u32::MAX` the spot wallet. Anything else has no route.
+    #[test]
+    fn deposit_calls_decode_to_their_route() {
+        let caller = Address::repeat_byte(0xaa);
+        let recipient = Address::repeat_byte(0xbb);
+        let amount = U256::from(25_000_000u64);
+
+        let input = depositCall {
+            amount,
+            destinationDex: 0,
+        }
+        .abi_encode();
+        let (route, decoded) = deposit_call_of(caller, &input).expect("deposit decodes");
+        assert_eq!(
+            route,
+            DepositRoute {
+                recipient: caller,
+                dex: 0
+            }
+        );
+        assert_eq!(decoded, amount);
+
+        let input = depositForCall {
+            recipient,
+            amount,
+            destinationDex: u32::MAX,
+        }
+        .abi_encode();
+        let (route, decoded) = deposit_call_of(caller, &input).expect("depositFor decodes");
+        assert_eq!(
+            route,
+            DepositRoute {
+                recipient,
+                dex: u32::MAX
+            }
+        );
+        assert_eq!(decoded, amount);
+
+        // An ERC-20 transfer (or garbage) is no deposit call.
+        assert!(deposit_call_of(caller, &transfer_calldata(recipient, amount)).is_none());
+        assert!(deposit_call_of(caller, &[]).is_none());
     }
 
     #[test]

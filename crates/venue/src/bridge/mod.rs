@@ -6,7 +6,9 @@
 //!
 //! - **EVM→Core**: an ERC20 transfer to a token's system address credits the
 //!   sender's Core spot balance (from the `Transfer` log — the docs' exact
-//!   rule);
+//!   rule); a CoreDepositWallet `deposit` / `depositFor` (read from the call
+//!   trace) credits the wallet its `destinationDex` names instead (`u32::MAX`
+//!   spot, `0` the default perp dex, any other index that `perpDexs` dex);
 //! - **CoreWriter actions**: every call to `0x3333…3333` (top-level *and*
 //!   contract-internal, via the callTracer — a contract's action is
 //!   attributed to the contract) decodes to a typed action; the sim applies
@@ -72,6 +74,43 @@ impl DexRoute {
     fn spot_to_spot(self) -> bool {
         self.source == corewriter::SPOT_DEX && self.destination == corewriter::SPOT_DEX
     }
+}
+
+/// Where an EVM→Core credit's log sits: its emitter, the same transaction's
+/// earlier logs, and the transaction (block and index) for its call tree.
+#[derive(Clone, Copy)]
+struct CreditSite<'a> {
+    emitter: Address,
+    prior: &'a [(Address, &'a alloy_primitives::LogData)],
+    block: u64,
+    tx_index: usize,
+}
+
+/// A block's call traces, one tree per transaction: unread (`None`), read
+/// but unavailable (`Some(None)`), or read.
+type BlockTraces = Option<Option<Vec<TraceResult>>>;
+
+/// The CoreDepositWallet call (`deposit` / `depositFor`) inside a call tree
+/// that deposited `value` for `depositor`: its route on Core. Only a
+/// successful call to the token's linked contract, made by the account whose
+/// funds moved and carrying exactly the amount that moved, counts.
+fn deposit_route_in(
+    frame: &CallFrame,
+    wallet: Address,
+    depositor: Address,
+    value: U256,
+) -> Option<system::DepositRoute> {
+    if frame.to == Some(wallet) && frame.from == depositor && frame.error.is_none() {
+        if let Some((route, amount)) = system::deposit_call_of(frame.from, &frame.input) {
+            if amount == value {
+                return Some(route);
+            }
+        }
+    }
+    frame
+        .calls
+        .iter()
+        .find_map(|child| deposit_route_in(child, wallet, depositor, value))
 }
 
 /// The bridge's own cursor and the persisted state it needs. The cursor lives
@@ -235,7 +274,10 @@ impl Bridge {
     /// from the receipts' logs.
     async fn apply_credits(&self, n: u64, tokens: &[TokenInfo]) -> Result<()> {
         let receipts = self.anvil_v.receipts(n).await?;
-        for receipt in &receipts {
+        // The block's call traces, read once and only when a deposit needs
+        // the CoreDepositWallet call it made (its `destinationDex`).
+        let mut traces: BlockTraces = None;
+        for (tx_index, receipt) in receipts.iter().enumerate() {
             // The logs decoded once, with their emitters, so a helper-hop
             // credit can look back at the same transaction's funding leg.
             let logs: Vec<(Address, &alloy_primitives::LogData)> = receipt
@@ -253,7 +295,13 @@ impl Bridge {
                 let Some(transfer) = system::transfer_of(log.data()) else {
                     continue;
                 };
-                self.apply_credit(&transfer, log.address(), &logs[..index], tokens)
+                let site = CreditSite {
+                    emitter: log.address(),
+                    prior: &logs[..index],
+                    block: n,
+                    tx_index,
+                };
+                self.apply_credit(&transfer, site, tokens, &mut traces)
                     .await?;
             }
         }
@@ -301,10 +349,11 @@ impl Bridge {
     async fn apply_credit(
         &self,
         transfer: &Transfer,
-        emitter: Address,
-        prior: &[(Address, &alloy_primitives::LogData)],
+        site: CreditSite<'_>,
         tokens: &[TokenInfo],
+        traces: &mut BlockTraces,
     ) -> Result<()> {
+        let CreditSite { emitter, prior, .. } = site;
         // The linked token's own log is the ordinary deposit. When a bridge
         // helper moves the tokens on, the helper's self-transfer is resolved
         // back to the depositor that funded it earlier in the same
@@ -325,8 +374,11 @@ impl Bridge {
             }
             return Ok(());
         };
-        self.sim.credit_evm_deposit(
-            credit.sender,
+        let (account, wallet) = self
+            .deposit_destination(&credit, transfer.value, site, traces)
+            .await;
+        self.sim.credit_evm_deposit_to(
+            (account, &wallet),
             TokenRef {
                 index: credit.token.index,
                 coin: &credit.token.name,
@@ -337,11 +389,82 @@ impl Bridge {
         self.metrics.inc_credits();
         tracing::info!(
             from = %credit.sender,
+            to = %account,
             token = %credit.token.name,
             amount = %credit.amount,
+            wallet = ?wallet,
             "bridge: EVM→Core credit"
         );
         Ok(())
+    }
+
+    /// The Core account and wallet a deposit lands in. A plain transfer to
+    /// the system address, and any deposit whose wallet call cannot be read,
+    /// credits the sender's spot wallet. A CoreDepositWallet `deposit` /
+    /// `depositFor` names its own: `destinationDex` `u32::MAX` is the spot
+    /// wallet, any other index the `perpDexs` position (`0` the default perp
+    /// dex), and `depositFor` credits its recipient. A dex the registry does
+    /// not list, or one that does not collateralise in the token, falls back
+    /// to spot (the funds stay visible rather than vanishing).
+    async fn deposit_destination(
+        &self,
+        credit: &system::EvmCredit<'_>,
+        value: U256,
+        site: CreditSite<'_>,
+        traces: &mut BlockTraces,
+    ) -> (Address, Wallet) {
+        let spot = (credit.sender, Wallet::Spot);
+        let Some(evm) = credit.token.evm else {
+            return spot;
+        };
+        let Some(frame) = self.tx_frame(traces, site.block, site.tx_index).await else {
+            return spot;
+        };
+        let Some(route) = deposit_route_in(frame, evm.address, credit.sender, value) else {
+            return spot;
+        };
+        if route.dex == corewriter::SPOT_DEX {
+            return (route.recipient, Wallet::Spot);
+        }
+        match self.wallet_of(route.dex) {
+            Some(Wallet::Perp(dex))
+                if self.feed.collateral_token_of(&dex) == credit.token.index =>
+            {
+                (route.recipient, Wallet::Perp(dex))
+            }
+            _ => {
+                tracing::warn!(
+                    dex = route.dex,
+                    token = %credit.token.name,
+                    "bridge: deposit names a dex the registry does not list or that does not take the token; credited to spot"
+                );
+                (route.recipient, Wallet::Spot)
+            }
+        }
+    }
+
+    /// The call tree of one transaction of the block (the traces are read once
+    /// per block; a trace fault is counted and reads as "no tree").
+    async fn tx_frame<'a>(
+        &self,
+        traces: &'a mut BlockTraces,
+        block: u64,
+        tx_index: usize,
+    ) -> Option<&'a CallFrame> {
+        if traces.is_none() {
+            *traces = Some(match self.anvil_v.trace_block_calls(block).await {
+                Ok(all) => Some(all),
+                Err(e) => {
+                    self.metrics.inc_trace_faults();
+                    tracing::warn!(block, error = %e, "callTracer unavailable; deposits are credited to spot this block");
+                    None
+                }
+            });
+        }
+        match traces.as_ref()?.as_ref()?.get(tx_index)?.success()? {
+            GethTrace::CallTracer(frame) => Some(frame),
+            _ => None,
+        }
     }
 
     /// The EVM→Core HYPE credit (the system contract's `Received` event).
@@ -993,6 +1116,68 @@ mod tests {
         input.extend_from_slice(&U256::from(ntl).to_be_bytes::<32>());
         input.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
         input
+    }
+
+    fn frame(from: Address, to: Address, input: Vec<u8>, calls: Vec<CallFrame>) -> CallFrame {
+        CallFrame {
+            from,
+            to: Some(to),
+            input: input.into(),
+            calls,
+            ..Default::default()
+        }
+    }
+
+    /// A CoreDepositWallet call inside the call tree names where the deposit
+    /// lands, but only when the depositor made it, it carries the amount that
+    /// moved and it did not revert.
+    #[test]
+    fn a_deposit_route_is_read_from_the_matching_wallet_call() {
+        use alloy_sol_types::SolCall;
+        let wallet = Address::repeat_byte(0x6b);
+        let agent = Address::repeat_byte(0xa1);
+        let value = U256::from(10_000_000u64);
+        let call = |dex| {
+            system::depositForCall {
+                recipient: agent,
+                amount: value,
+                destinationDex: dex,
+            }
+            .abi_encode()
+        };
+        // The agent calls a helper, which is not the wallet; the wallet call
+        // is nested one level down.
+        let tree = |dex| {
+            frame(
+                Address::repeat_byte(0x01),
+                agent,
+                vec![],
+                vec![frame(
+                    Address::repeat_byte(0x01),
+                    agent,
+                    vec![],
+                    vec![frame(agent, wallet, call(dex), vec![])],
+                )],
+            )
+        };
+        let route = deposit_route_in(&tree(0), wallet, agent, value).expect("a route");
+        assert_eq!((route.recipient, route.dex), (agent, 0));
+        let route = deposit_route_in(&tree(u32::MAX), wallet, agent, value).expect("a route");
+        assert_eq!(route.dex, u32::MAX);
+
+        // A different amount, a different depositor or a different contract
+        // is not this deposit's call.
+        assert!(deposit_route_in(&tree(0), wallet, agent, value + U256::from(1u64)).is_none());
+        assert!(deposit_route_in(&tree(0), wallet, Address::repeat_byte(0xcc), value).is_none());
+        assert!(deposit_route_in(&tree(0), Address::repeat_byte(0x99), agent, value).is_none());
+        // A reverted call made no deposit.
+        let mut reverted = tree(0);
+        reverted.calls[0].calls[0].error = Some("execution reverted".into());
+        assert!(deposit_route_in(&reverted, wallet, agent, value).is_none());
+        // A plain token transfer has no wallet call at all.
+        assert!(
+            deposit_route_in(&frame(agent, wallet, vec![], vec![]), wallet, agent, value).is_none()
+        );
     }
 
     /// The CoreWriter order's units are the docs' own: 10^8 × human for both

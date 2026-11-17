@@ -482,13 +482,26 @@ impl Sim {
         Ok(applied)
     }
 
-    /// EVM to Core: credit a deposit to `address` and write the system
-    /// address's ledger row. A deposit that creates the account is credited in
-    /// full; its activation is owed on its first outbound transfer (Circle's
-    /// rule), and the address exists from now on.
+    /// EVM to Core: credit a deposit to `address`'s spot wallet and write the
+    /// system address's ledger row. A deposit that creates the account is
+    /// credited in full; its activation is owed on its first outbound
+    /// transfer (Circle's rule), and the address exists from now on.
     pub(crate) fn credit_evm_deposit(
         &self,
         address: Address,
+        token: TokenRef<'_>,
+        amount: Decimal,
+        feed: &MarketFeed,
+    ) -> Result<()> {
+        self.credit_evm_deposit_to((address, &Wallet::Spot), token, amount, feed)
+    }
+
+    /// [`Self::credit_evm_deposit`] into `wallet`: the spot wallet for a plain
+    /// transfer to the system address, a perp dex's clearinghouse when the
+    /// CoreDepositWallet call named one (`destinationDex`).
+    pub(crate) fn credit_evm_deposit_to(
+        &self,
+        (address, wallet): (Address, &Wallet),
         token: TokenRef<'_>,
         amount: Decimal,
         feed: &MarketFeed,
@@ -500,7 +513,14 @@ impl Sim {
             }
             let account = state.accounts.entry(address).or_default();
             stamp_funding_baseline(account, clock);
-            account::credit_entry(account, token, amount, "spot credit")?;
+            match wallet {
+                Wallet::Spot => {
+                    account::credit_entry(account, token, amount, "spot credit")?;
+                }
+                Wallet::Perp(dex) => {
+                    account.credit_perp(dex, amount, "perp credit")?;
+                }
+            }
             state.activated.insert(address);
             let system = if token.coin == fees::GAS_TOKEN {
                 crate::bridge::system::HYPE_SYSTEM
@@ -508,10 +528,15 @@ impl Sim {
                 crate::bridge::system::system_address(u64::from(token.index))
             };
             let row = TransferRow {
-                kind: RowKind::SpotTransfer,
+                // A spot credit is the spot transfer from the system address;
+                // a perp credit is a send into that dex's wallet.
+                kind: match wallet {
+                    Wallet::Spot => RowKind::SpotTransfer,
+                    Wallet::Perp(_) => RowKind::Send,
+                },
                 user: system,
                 destination: address,
-                dexes: (SPOT_DEX_NAME, SPOT_DEX_NAME),
+                dexes: (SPOT_DEX_NAME, wallet.dex_name()),
                 token: token.coin,
                 amount,
                 usdc_value: amount * fees::token_usd(feed, token.index).unwrap_or(Decimal::ZERO),
