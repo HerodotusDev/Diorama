@@ -370,7 +370,7 @@ fn acting_user(
         None => signed_account(state, body).map_err(refuse)?,
     };
     // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
-    // after which the action is rejected — the venue's own string is "Action
+    // after which the action is rejected: the venue's own string is "Action
     // already expired" (the FAQ's 15 s protection is the client-side default).
     // It comes after the signature, as on the venue (a zero signature on an
     // expired action still reads "Unable to recover signer."). The sim's
