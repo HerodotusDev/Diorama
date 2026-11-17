@@ -1649,6 +1649,15 @@ impl Rpc {
         Ok(())
     }
 
+    /// Set the next block's base fee (`anvil_setNextBlockBaseFeePerGas`).
+    pub async fn anvil_set_next_block_base_fee(&self, base_fee: u64) -> Result<()> {
+        self.ensure_write()?;
+
+        self.call_raw("anvil_setNextBlockBaseFeePerGas", (U256::from(base_fee),))
+            .await?;
+        Ok(())
+    }
+
     /// Align the next block's context fields T owns (timestamp/coinbase/
     /// prevRandao/baseFee); the gas limit stays the devnet's own.
     pub async fn set_next_block_context(&self, timestamp: u64, header: &Header) -> Result<()> {
