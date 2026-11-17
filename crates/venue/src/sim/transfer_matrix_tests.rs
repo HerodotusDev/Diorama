@@ -947,6 +947,39 @@ fn a_deposited_account_pays_its_activation_on_its_first_outbound_transfer() {
         .unwrap());
 }
 
+/// A CoreDepositWallet deposit names the wallet it lands in: the default perp
+/// dex (`destinationDex` 0) credits the perp balance and no spot, a builder
+/// dex its own, and the ledger row records the send from the system address.
+#[test]
+fn a_deposit_can_land_in_a_perp_dex_instead_of_spot() {
+    let feed = feed();
+    let sim = Sim::memory();
+    sim.credit_evm_deposit_to((ME, &Wallet::Perp(String::new())), USDC, dec("10"), &feed)
+        .unwrap();
+    assert_eq!(perp_of(&sim, ME, ""), dec("10"));
+    assert_eq!(spot_of(&sim, ME, USDC), Decimal::ZERO);
+    let row = &deltas(&sim, ME)[0];
+    assert_eq!(row["type"], "send");
+    assert_eq!(row["user"], "0x2000000000000000000000000000000000000000");
+    assert_eq!(row["destination"], format!("{ME:#x}"));
+    assert_eq!(row["sourceDex"], "spot");
+    assert_eq!(row["destinationDex"], "");
+    // The account exists from now on and owes its activation, as for a spot deposit.
+    assert!(owes(&sim, ME));
+
+    sim.credit_evm_deposit_to((ME, &Wallet::Perp("xyz".into())), USDC, dec("4"), &feed)
+        .unwrap();
+    assert_eq!(perp_of(&sim, ME, "xyz"), dec("4"));
+    assert_eq!(perp_of(&sim, ME, ""), dec("10"));
+    assert_eq!(deltas(&sim, ME)[1]["destinationDex"], "xyz");
+
+    // The spot wallet stays the default of the plain deposit.
+    sim.credit_evm_deposit_to((ME, &Wallet::Spot), USDC, dec("1"), &feed)
+        .unwrap();
+    assert_eq!(spot_of(&sim, ME, USDC), dec("1"));
+    assert_eq!(deltas(&sim, ME)[2]["type"], "spotTransfer");
+}
+
 /// The debt follows the account, not the destination: a deposited account's
 /// first send to a brand new address pays the 1 USDC once, the new address
 /// owes its own, and the second send from the first account is free.
