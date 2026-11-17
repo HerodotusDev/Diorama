@@ -1478,6 +1478,13 @@ impl Rpc {
         self.call("eth_getCode", (addr, U64::from(block))).await
     }
 
+    /// The code at the node's latest state (the block parameter `0` names a
+    /// real block on a fork, as for [`Self::storage_at_latest`]).
+    pub async fn code_at_latest(&self, addr: Address) -> Result<Bytes> {
+        self.call("eth_getCode", (addr, BlockNumberOrTag::Latest))
+            .await
+    }
+
     pub async fn nonce_at(&self, addr: Address, block: u64) -> Result<u64> {
         let quantity: U64 = self
             .call("eth_getTransactionCount", (addr, U64::from(block)))
@@ -1766,6 +1773,14 @@ impl Rpc {
         self.ensure_write()?;
 
         self.call("eth_sendTransaction", (tx,)).await
+    }
+
+    /// Replace an account's code (`anvil_setCode`), silently.
+    pub async fn anvil_set_code(&self, addr: Address, code: Bytes) -> Result<()> {
+        self.ensure_write()?;
+
+        self.call_raw("anvil_setCode", (addr, code)).await?;
+        Ok(())
     }
 
     /// One storage word, silently (the venue driver's chain-instance canary;
