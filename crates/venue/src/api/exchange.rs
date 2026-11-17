@@ -54,18 +54,11 @@ pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) ->
         Ok(req) => req,
         Err(response) => return Ok(*response),
     };
-    // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
-    // after which the action is rejected — the venue's own string is "Action
-    // already expired" (the FAQ's 15 s protection is the client-side default).
-    // The sim's clock is the scenario's, so a scripted time jump expires
-    // actions exactly as the venue's would.
-    if let Err(reason) = expired(&req, state.sim.clock(crate::now_ms())?) {
-        return Ok(err_envelope(reason));
-    }
     // Every action, the noop (docs: no side effects) included, goes through
     // the signature: the venue answers a zero signature on a noop with its
     // "Unable to recover signer.", and a noop consumes its nonce.
-    let owner = match acting_user(&state, &req, &body) {
+    let now = state.sim.clock(crate::now_ms())?;
+    let owner = match acting_user(&state, &req, &body, now) {
         Ok((_, owner)) => owner,
         Err(response) => return Ok(*response),
     };
@@ -103,11 +96,18 @@ fn parse(body: &[u8]) -> std::result::Result<ExchangeBody, Box<Response>> {
             _ => plain(StatusCode::BAD_REQUEST, NOT_JSON),
         })
     })?;
+    let shaped = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("action")
+                .map(|a| super::shape::conforms(a, req.user.is_none()))
+        })
+        .unwrap_or(true);
     let unsigned = req.user.is_none() && (req.signature.is_none() || req.nonce.is_none());
     let unknown_tag = matches!(req.action, ExchangeAction::Unmodeled)
         && !serde_json::from_slice::<ActionTag>(body)
             .is_ok_and(|t| crate::wire::KNOWN_ACTION_TAGS.contains(&t.action.r#type.as_str()));
-    if unsigned || unknown_tag {
+    if unsigned || unknown_tag || !shaped {
         return Err(Box::new(plain(
             StatusCode::UNPROCESSABLE_ENTITY,
             NOT_AN_ACTION,
@@ -265,6 +265,16 @@ fn dispatch(state: &Arc<ApiState>, owner: Address, body: &Bytes, req: &ExchangeB
     }
 }
 
+/// A transfer's `destination` string as an address: the venue reads it as a
+/// free string and refuses a malformed one only after the signature held.
+fn destination_of(text: &str) -> std::result::Result<Address, Response> {
+    text.parse::<Address>().map_err(|_| {
+        err_envelope(format!(
+            "venue-sim: the destination `{text}` is not an address (0x and 40 hex digits)"
+        ))
+    })
+}
+
 /// The transfer and account-setup actions (`user_actions.rs`).
 fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -> Response {
     match action {
@@ -278,27 +288,36 @@ fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -
             token,
             amount,
             from_sub_account,
-        } => user_actions::send_asset(
-            state,
-            owner,
-            &SendAsset {
-                destination: *destination,
-                source_dex,
-                destination_dex,
-                token,
-                amount,
-                from_sub_account,
-            },
-        ),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::send_asset(
+                state,
+                owner,
+                &SendAsset {
+                    destination,
+                    source_dex,
+                    destination_dex,
+                    token,
+                    amount,
+                    from_sub_account,
+                },
+            ),
+            Err(response) => response,
+        },
         ExchangeAction::SpotSend {
             destination,
             token,
             amount,
-        } => user_actions::spot_send(state, owner, *destination, (token, amount)),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::spot_send(state, owner, destination, (token, amount)),
+            Err(response) => response,
+        },
         ExchangeAction::UsdSend {
             destination,
             amount,
-        } => user_actions::usd_send(state, owner, *destination, amount),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::usd_send(state, owner, destination, amount),
+            Err(response) => response,
+        },
         ExchangeAction::Withdraw3 => user_actions::withdraw3(),
         ExchangeAction::ApproveAgent {
             agent_address,
@@ -337,12 +356,28 @@ fn acting_user(
     state: &Arc<ApiState>,
     req: &ExchangeBody,
     body: &[u8],
+    now_ms: u64,
 ) -> std::result::Result<(Address, Address), Box<Response>> {
     let refuse = |reason: String| Box::new(err_envelope(reason));
+    // The venue checks, before it recovers the signer, that a user-signed
+    // action's own `nonce`/`time` is the request's nonce, and its network.
+    if req.user.is_none() {
+        if let Some(reason) = crate::api::shape::pre_signature_refusal(body) {
+            return Err(refuse(reason.to_string()));
+        }
+    }
     let (signer, account) = match req.user {
         Some(user) => (user, user),
         None => signed_account(state, body).map_err(refuse)?,
     };
+    // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
+    // after which the action is rejected — the venue's own string is "Action
+    // already expired" (the FAQ's 15 s protection is the client-side default).
+    // It comes after the signature, as on the venue (a zero signature on an
+    // expired action still reads "Unable to recover signer."). The sim's
+    // clock is the scenario's, so a scripted time jump expires actions
+    // exactly as the venue's would.
+    expired(req, now_ms).map_err(refuse)?;
     if let Some(nonce) = req.nonce {
         if let Err(e) = state.sim.use_nonce(signer, nonce, crate::now_ms()) {
             return Err(refuse(e.to_string()));
@@ -1820,7 +1855,7 @@ mod tests {
             &format!(r#""destination":"{me:#x}","amount":"1","time":{nonce}"#),
         );
         let (own_key, _) = key(0x11);
-        let out = post(&state, signed(&own_key, &withdraw, nonce + 1)).await;
+        let out = post(&state, signed(&own_key, &withdraw, nonce)).await;
         assert_eq!(out["status"], "err");
         assert!(
             out["response"].as_str().unwrap().contains("withdraw3"),
@@ -1922,14 +1957,9 @@ mod tests {
             out["response"].as_str().unwrap().contains("signed it"),
             "{out}"
         );
-        let out = post(&state, send(&me_key, &set(me, "bogus"))).await;
-        assert!(
-            out["response"]
-                .as_str()
-                .unwrap()
-                .contains("unknown abstraction"),
-            "{out}"
-        );
+        // an abstraction the venue does not define is a 422, before the signature
+        let (status, _, _) = post_raw(&state, &send(&me_key, &set(me, "bogus"))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         // agentSetAbstraction (an L1 action: the agent signs it).
         let agent_sets = |code: &'static str| {

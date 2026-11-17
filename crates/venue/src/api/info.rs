@@ -1088,10 +1088,17 @@ pub(crate) fn active_asset_data(
     let meta = state.feed.meta_for_lookup(coin);
     let setting = state.sim.leverage_setting_for(user, coin, meta.as_ref())?;
     let raw_usd = (setting.mode == LeverageType::Isolated).then(|| {
-        account
-            .positions
-            .get(coin)
-            .map_or(Decimal::ZERO, |p| p.margin_used - mark * p.szi.abs())
+        // The row's figure: the isolated equity less the signed position value.
+        account.positions.get(coin).map_or(Decimal::ZERO, |p| {
+            let value = mark * p.szi.abs();
+            let signed = if p.szi.is_sign_negative() {
+                -value
+            } else {
+                value
+            };
+            let pnl = p.unrealized_pnl(mark).unwrap_or(Decimal::ZERO);
+            p.margin_used + pnl - signed
+        })
     });
     let leverage = Leverage {
         kind: setting.mode,

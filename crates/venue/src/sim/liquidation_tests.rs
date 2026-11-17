@@ -400,6 +400,47 @@ fn isolated_positions_liquidate_at_their_served_prices() {
     }
 }
 
+/// An isolated position's loss is its own: with almost no free cash beside it,
+/// the cross figure stays the cash (not cash minus the isolated loss), the
+/// waterfall leaves the solvent isolated leg alone, and the position row
+/// serves the venue's figures (`marginUsed` = margin + pnl, `rawUsd` =
+/// `marginUsed` less the signed value, positive for a short).
+#[test]
+fn an_isolated_loss_beyond_the_free_cash_is_not_a_cross_liquidation() {
+    for long in [true, false] {
+        let rig = Rig::new();
+        let a = Address::repeat_byte(0xa6);
+        rig.fund(a, "", "110");
+        rig.open(a, "ETH", (long, "10", 10));
+        rig.isolate(a, "ETH", 10);
+        let cash = rig.sim.account(a).unwrap().unwrap().perp_balance("");
+        // 4 % against the position: a loss of 40 on a margin of 100, far more
+        // than the free cash, still above the leg's 5 % maintenance (48).
+        let mark = if long { dec("96") } else { dec("104") };
+        rig.mark("ETH", mark);
+        let held = rig.sim.account(a).unwrap().unwrap().positions["ETH"].clone();
+        let equity = held.isolated_margin + held.unrealized_pnl(mark).unwrap();
+        assert!(
+            rig.tick().is_empty(),
+            "a solvent isolated leg is not liquidated"
+        );
+        assert_ne!(rig.szi(a, "ETH"), Decimal::ZERO);
+        let served = rig.served(a, "");
+        assert_eq!(
+            served.cross_margin_summary.account_value, cash,
+            "the cross figure is the free cash alone"
+        );
+        let position = &served.asset_positions[0].position;
+        let value = position.position_value;
+        assert_eq!(position.margin_used, equity, "the margin plus the pnl");
+        assert_eq!(
+            position.leverage.raw_usd,
+            Some(if long { equity - value } else { equity + value }),
+        );
+        assert_eq!(served.margin_summary.total_margin_used, equity);
+    }
+}
+
 /// A builder dex's margin table is applied at the liquidation price: the short
 /// below sits in the 20x tier at the mark and in the 10x tier at its
 /// liquidation price (notional above 1000), so the flat 20x rate would put the

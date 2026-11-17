@@ -15,6 +15,7 @@ pub(crate) mod info;
 mod liquidation_parity;
 #[cfg(test)]
 mod parity;
+mod shape;
 pub(crate) mod signing;
 mod user_actions;
 pub(crate) mod ws;

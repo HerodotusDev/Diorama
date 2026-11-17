@@ -1439,7 +1439,7 @@ pub(crate) enum ExchangeAction {
     /// "token":..,"amount":..,"fromSubAccount":..}`: a token between two
     /// wallets (the spot wallet is dex `"spot"`, the default dex `""`).
     SendAsset {
-        destination: Address,
+        destination: String,
         source_dex: String,
         destination_dex: String,
         token: String,
@@ -1449,16 +1449,13 @@ pub(crate) enum ExchangeAction {
     },
     /// `{"type":"spotSend","destination":..,"token":"NAME:id","amount":..}`.
     SpotSend {
-        destination: Address,
+        destination: String,
         token: String,
         amount: String,
     },
     /// `{"type":"usdSend","destination":..,"amount":..}`: USDC between two
     /// accounts' default perp dexes.
-    UsdSend {
-        destination: Address,
-        amount: String,
-    },
+    UsdSend { destination: String, amount: String },
     /// `withdraw3`: bridges USDC out through Arbitrum (refused by name).
     Withdraw3,
     /// `{"type":"approveAgent","agentAddress":..,"agentName":..}`: the same

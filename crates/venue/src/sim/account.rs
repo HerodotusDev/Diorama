@@ -460,6 +460,11 @@ struct PositionTotals {
     cross_margin: Decimal,
     cross_maintenance: Decimal,
     isolated_margin: Decimal,
+    /// The isolated positions' own equity, `margin + unrealized pnl`: what the
+    /// venue serves as an isolated position's `marginUsed` and carves out of
+    /// the cross summary (the cross figure is the free cash alone: an isolated
+    /// position's pnl is its own).
+    isolated_equity: Decimal,
     /// The isolated positions' signed value (`Σ sign(szi)·positionValue`):
     /// the cross summary's raw balance subtracts the margins and adds this
     /// back (measured live).
@@ -473,7 +478,17 @@ impl PositionTotals {
             Direction::Short => -facts.value,
         };
         self.notional = add(self.notional, facts.value, "total notional")?;
-        self.margin = add(self.margin, p.margin_used, "total margin")?;
+        // An isolated position's `marginUsed` is its equity (margin plus
+        // unrealized pnl), measured live: `rawUsd + positionValue` of the row.
+        let served_margin = match p.leverage {
+            LeverageType::Cross => p.margin_used,
+            LeverageType::Isolated => add(
+                p.margin_used,
+                p.unrealized_pnl(facts.mark)?,
+                "isolated equity",
+            )?,
+        };
+        self.margin = add(self.margin, served_margin, "total margin")?;
         self.signed_value = add(self.signed_value, signed, "signed value")?;
         self.cost_basis = add(self.cost_basis, p.cost_basis()?, COST_BASIS)?;
         if p.leverage == LeverageType::Cross {
@@ -486,6 +501,7 @@ impl PositionTotals {
             )?;
         } else {
             self.isolated_margin = add(self.isolated_margin, p.margin_used, ISOLATED_MARGIN)?;
+            self.isolated_equity = add(self.isolated_equity, served_margin, ISOLATED_MARGIN)?;
             self.isolated_signed = add(self.isolated_signed, signed, "isolated signed value")?;
         }
         Ok(())
@@ -520,11 +536,21 @@ fn position_row(
                 value: p.leverage_value,
                 // The isolated carve-out only: the venue omits it on a cross
                 // position.
-                raw_usd: (p.leverage == LeverageType::Isolated)
-                    .then(|| p.margin_used - facts.value),
+                // `marginUsed` less the position's signed value: a short's raw
+                // balance is positive (it holds the proceeds), measured live.
+                raw_usd: (p.leverage == LeverageType::Isolated).then(|| {
+                    let signed = match p.direction() {
+                        Direction::Long => facts.value,
+                        Direction::Short => -facts.value,
+                    };
+                    p.margin_used + u_pnl - signed
+                }),
             },
             liquidation_px,
-            margin_used: p.margin_used,
+            margin_used: match p.leverage {
+                LeverageType::Cross => p.margin_used,
+                LeverageType::Isolated => p.margin_used + u_pnl,
+            },
             // The live bound for a tracked coin; for a coin the meta does not
             // carry (a seeded position outside the markets) the position's own
             // leverage — a value we know, never a fabricated bound.
@@ -586,8 +612,8 @@ fn assemble(
         total_raw_usd: total_raw,
         total_margin_used: totals.margin,
     };
-    let cross_account_value = account_value - totals.isolated_margin;
-    let cross_raw = total_raw - totals.isolated_margin + totals.isolated_signed;
+    let cross_account_value = account_value - totals.isolated_equity;
+    let cross_raw = total_raw - totals.isolated_equity + totals.isolated_signed;
     let cross_margin_summary = MarginSummary {
         account_value: cross_account_value,
         total_ntl_pos: totals.cross_notional,
