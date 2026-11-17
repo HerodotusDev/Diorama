@@ -1,4 +1,4 @@
-//! The upstream subscription relay: which `l2Book` and `activeAssetCtx`
+//! The upstream subscription relay: which `l2` book and `activeAssetCtx`
 //! streams the single upstream socket carries.
 //!
 //! The venue sim mirrors the real venue, so every coin of every perp dex is a
@@ -10,7 +10,7 @@
 //!   each, so the whole set is a few hundred messages per second and ~130
 //!   KiB/s: modest, and it makes every coin's mark, funding and OI live
 //!   without the REST sweep.
-//! - **Books are demand-driven**: `l2Book` is subscribed for a coin only while
+//! - **Books are demand-driven**: the `l2` feed is subscribed for a coin only while
 //!   someone needs it. A *lease* (a downstream websocket subscription holds
 //!   one until it unsubscribes or disconnects) keeps a coin wanted; a *touch*
 //!   (an order placed, a held position or resting order, an `/info` `l2Book`

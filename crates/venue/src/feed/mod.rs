@@ -19,6 +19,7 @@
 //! read a different mark than the sim used for margin.
 pub(crate) mod budget;
 pub(crate) mod dex;
+pub(crate) mod l2;
 pub(crate) mod metrics;
 pub(crate) mod relay;
 pub(crate) mod rest;

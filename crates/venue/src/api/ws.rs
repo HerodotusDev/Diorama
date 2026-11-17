@@ -818,10 +818,27 @@ fn encode(push: &WsPush) -> Vec<String> {
     }
 }
 
+/// The levels per side a `fast: true` `l2Book` carries (measured on the venue).
+const FAST_BOOK_DEPTH: usize = 5;
+
+/// The venue's `fast: true` `l2Book` frame: the top [`FAST_BOOK_DEPTH`] levels
+/// of each side and a `fast: true` key beside `coin`, `time` and `levels`.
+fn fast_book_frame(mut book: L2Book) -> Option<String> {
+    for side in &mut book.levels {
+        side.truncate(FAST_BOOK_DEPTH);
+    }
+    let mut data = serde_json::to_value(&book).ok()?;
+    data.as_object_mut()?
+        .insert("fast".to_string(), serde_json::Value::Bool(true));
+    let frame = serde_json::json!({"channel": "l2Book", "data": data});
+    Some(frame.to_string())
+}
+
 /// The frame a whole-state subscription pushes, from the composed cache.
 /// `None` = the coin has no ctx yet (the feed is warming; the tick retries) or
 /// the channel is one of the diffing ones (`pushes` owns those): a
 /// serialization fault on these plain shapes is a bug, named here.
+#[allow(clippy::too_many_lines)] // one match over the market channels
 fn push_frame(sub: &Subscription, state: &ApiState, now_ms: u64) -> Option<String> {
     let feed = &state.feed;
     let push = match sub {
@@ -853,16 +870,21 @@ fn push_frame(sub: &Subscription, state: &ApiState, now_ms: u64) -> Option<Strin
             coin,
             n_sig_figs,
             mantissa,
-            ..
+            fast,
         } => match feed.book(coin, now_ms) {
-            Some(book) => WsPush::L2Book {
-                data: match n_sig_figs {
+            Some(book) => {
+                let book = match n_sig_figs {
                     Some(_) => {
                         super::info::aggregate_book(book, *n_sig_figs, mantissa.unwrap_or(1))
                     }
                     None => book,
-                },
-            },
+                };
+                if *fast {
+                    // The venue's fast book: the top levels only, tagged.
+                    return fast_book_frame(book);
+                }
+                WsPush::L2Book { data: book }
+            }
             // A book that vanished after the ack is an error frame, not
             // silence (the subscriber must know its channel stopped serving).
             None => WsPush::Error {
@@ -1672,6 +1694,46 @@ mod tests {
         let missing = push_frame(&book_sub("NOPE"), &state, 5_000).unwrap();
         let value: serde_json::Value = serde_json::from_str(&missing).unwrap();
         assert_eq!(value["channel"], "error");
+    }
+
+    /// `l2Book {fast: true}` is the venue's fast book: five levels a side and
+    /// a `fast` key; the plain subscription keeps the full book and no key.
+    #[test]
+    fn a_fast_l2_book_is_five_levels_tagged_fast() {
+        let feed = Arc::new(MarketFeed::memory());
+        let mut book = test_book("BTC", "100");
+        for i in 1..8 {
+            book.levels[0].push(Level {
+                px: Decimal::from(100 - i),
+                sz: Decimal::ONE,
+                n: 1,
+            });
+            book.levels[1].push(Level {
+                px: Decimal::from(101 + i),
+                sz: Decimal::ONE,
+                n: 1,
+            });
+        }
+        feed.put_book(book, 1_000);
+        let state = api_state(feed);
+        let fast = Subscription::L2Book {
+            coin: "BTC".into(),
+            n_sig_figs: None,
+            mantissa: None,
+            fast: true,
+        };
+        let frame = push_frame(&fast, &state, 5_000).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["channel"], "l2Book");
+        assert_eq!(value["data"]["fast"], true);
+        assert_eq!(value["data"]["levels"][0].as_array().unwrap().len(), 5);
+        assert_eq!(value["data"]["levels"][1].as_array().unwrap().len(), 5);
+        assert_eq!(value["data"]["levels"][0][0]["px"], "100.0");
+
+        let plain = push_frame(&book_sub("BTC"), &state, 5_000).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert!(value["data"].get("fast").is_none());
+        assert_eq!(value["data"]["levels"][0].as_array().unwrap().len(), 8);
     }
 
     /// `webData3` carries the identity facts and one state per dex in
