@@ -127,6 +127,16 @@ pub(crate) enum Subscription {
     UserFundings { user: Address },
     #[serde(rename = "activeAssetData")]
     ActiveAssetData { user: Address, coin: String },
+    /// The best bid and ask of a coin's book, pushed when either changes.
+    #[serde(rename = "bbo")]
+    Bbo { coin: String },
+    /// The account's order status changes (`open`, `filled`, `canceled`, ...).
+    #[serde(rename = "orderUpdates")]
+    OrderUpdates { user: Address },
+    /// The account's fills and funding payments, one event object per frame
+    /// (pushed on channel `user`).
+    #[serde(rename = "userEvents")]
+    UserEvents { user: Address },
 }
 
 /// A `dex` field: absent is `None`, a string is `Some`, and an explicit
@@ -192,6 +202,13 @@ pub(crate) enum WsPush {
     UserFundings { data: serde_json::Value },
     #[serde(rename = "activeAssetData")]
     ActiveAssetData { data: ActiveAssetData },
+    #[serde(rename = "bbo")]
+    Bbo { data: serde_json::Value },
+    #[serde(rename = "orderUpdates")]
+    OrderUpdates { data: serde_json::Value },
+    /// The `userEvents` subscription's frames (the venue's channel is `user`).
+    #[serde(rename = "user")]
+    UserEvent { data: serde_json::Value },
     #[serde(rename = "subscriptionResponse")]
     SubscriptionResponse { data: SubscriptionAck },
     #[serde(rename = "pong")]
@@ -317,6 +334,19 @@ enum Mem {
     Fills(Option<u64>),
     /// The newest funding `(time, coin)` already pushed.
     Fundings(Option<(u64, String)>),
+    /// The last best bid/ask pushed.
+    Bbo(Option<serde_json::Value>),
+    /// The orders already reported (`None` until primed).
+    Orders(Option<OrderMem>),
+    /// The newest fill id and funding `(time, coin)` already seen.
+    Events(Option<(u64, (u64, String))>),
+}
+
+/// The order ids an `orderUpdates` subscription has already reported.
+#[derive(Default)]
+struct OrderMem {
+    open: std::collections::BTreeSet<u64>,
+    done: std::collections::BTreeSet<u64>,
 }
 
 /// One live subscription and what it remembers.
@@ -339,6 +369,7 @@ fn is_market_channel(sub: &Subscription) -> bool {
             | Subscription::ActiveAssetCtx { .. }
             | Subscription::L2Book { .. }
             | Subscription::L2 { .. }
+            | Subscription::Bbo { .. }
             | Subscription::FastAssetCtxs
             | Subscription::Pac
     )
@@ -349,6 +380,7 @@ fn coin_of(sub: &Subscription) -> Option<&str> {
     match sub {
         Subscription::ActiveAssetCtx { coin }
         | Subscription::L2Book { coin, .. }
+        | Subscription::Bbo { coin }
         | Subscription::ActiveAssetData { coin, .. } => Some(coin),
         Subscription::L2 { c, .. } => Some(c),
         _ => None,
@@ -619,6 +651,18 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
             account_ok(user)?;
             Ok(Mem::Fundings(None))
         }
+        Subscription::Bbo { coin } => {
+            has_book(coin)?;
+            Ok(Mem::Bbo(None))
+        }
+        Subscription::OrderUpdates { user } => {
+            account_ok(user)?;
+            Ok(Mem::Orders(None))
+        }
+        Subscription::UserEvents { user } => {
+            account_ok(user)?;
+            Ok(Mem::Events(None))
+        }
     }
 }
 
@@ -697,6 +741,13 @@ pub(super) fn pushes(live: &mut Live, state: &ApiState, now_ms: u64) -> Vec<Stri
         }
         (Subscription::UserFundings { user }, Mem::Fundings(cursor)) => {
             user_fundings_push(state, *user, cursor)
+        }
+        (Subscription::Bbo { coin }, Mem::Bbo(last)) => bbo_push(state, coin, last, now_ms),
+        (Subscription::OrderUpdates { user }, Mem::Orders(seen)) => {
+            order_updates_push(state, *user, seen)
+        }
+        (Subscription::UserEvents { user }, Mem::Events(cursor)) => {
+            user_events_push(state, *user, cursor)
         }
         (sub, _) => push_frame(sub, state, now_ms).into_iter().collect(),
     }
@@ -949,6 +1000,137 @@ fn user_fundings_push(
         data["isSnapshot"] = serde_json::Value::Bool(true);
     }
     encode(&WsPush::UserFundings { data })
+}
+
+/// The `bbo` frame: the book's best bid and ask (`null` for an empty side),
+/// pushed on the first read and whenever either changes.
+fn bbo_push(
+    state: &ApiState,
+    coin: &str,
+    last: &mut Option<serde_json::Value>,
+    now_ms: u64,
+) -> Vec<String> {
+    let Some(book) = state.feed.book(coin, now_ms) else {
+        return Vec::new();
+    };
+    let side = |i: usize| {
+        book.levels[i]
+            .first()
+            .map_or(serde_json::Value::Null, |l| serde_json::json!(l))
+    };
+    let bbo = serde_json::json!([side(0), side(1)]);
+    if last.as_ref() == Some(&bbo) {
+        return Vec::new();
+    }
+    *last = Some(bbo.clone());
+    encode(&WsPush::Bbo {
+        data: serde_json::json!({ "coin": coin, "time": book.time, "bbo": bbo }),
+    })
+}
+
+/// One order as `orderUpdates` carries it (the venue's `WsBasicOrder`).
+fn ws_order(r: &crate::sim::order::RestingOrder, sz: &rust_decimal::Decimal) -> serde_json::Value {
+    let row = super::info::frontend_row(r);
+    let mut order = serde_json::json!({
+        "coin": row.coin,
+        "side": row.side,
+        "limitPx": row.limit_px,
+        "sz": super::info::dtext(sz),
+        "oid": row.oid,
+        "timestamp": row.timestamp,
+        "origSz": row.orig_sz,
+    });
+    if let Some(cloid) = r.cloid {
+        order["cloid"] = serde_json::Value::String(format!("{cloid:#x}"));
+    }
+    order
+}
+
+/// The `orderUpdates` frames: the account's orders whose status changed since
+/// the last tick (`open` when one starts resting; `filled`, `canceled` or
+/// `marginCanceled` when it ends). Nothing is pushed for what existed at
+/// subscribe time: the channel carries changes only.
+fn order_updates_push(state: &ApiState, user: Address, seen: &mut Option<OrderMem>) -> Vec<String> {
+    let Ok((resting, terminal)) = state.sim.order_history(user) else {
+        return Vec::new();
+    };
+    let prime = seen.is_none();
+    let mem = seen.get_or_insert_with(OrderMem::default);
+    let mut updates: Vec<(u64, serde_json::Value)> = Vec::new();
+    for r in &resting {
+        if mem.open.insert(r.oid) && !prime {
+            updates.push((
+                r.placed_ms,
+                serde_json::json!({
+                    "order": ws_order(r, &r.sz),
+                    "status": "open",
+                    "statusTimestamp": r.placed_ms,
+                }),
+            ));
+        }
+    }
+    for t in &terminal {
+        if mem.done.insert(t.order.oid) && !prime {
+            let sz = if matches!(t.status, crate::sim::order::TerminalStatus::Filled) {
+                rust_decimal::Decimal::ZERO
+            } else {
+                t.order.sz
+            };
+            updates.push((
+                t.status_ms,
+                serde_json::json!({
+                    "order": ws_order(&t.order, &sz),
+                    "status": super::info::terminal_status_label(t.status),
+                    "statusTimestamp": t.status_ms,
+                }),
+            ));
+        }
+    }
+    if updates.is_empty() {
+        return Vec::new();
+    }
+    updates.sort_by_key(|(time, _)| *time);
+    let rows: Vec<serde_json::Value> = updates.into_iter().map(|(_, row)| row).collect();
+    encode(&WsPush::OrderUpdates {
+        data: serde_json::Value::Array(rows),
+    })
+}
+
+/// The `userEvents` frames: `{"fills": [...]}` for new fills and one
+/// `{"funding": {...}}` per new funding payment. Nothing is pushed for what
+/// existed at subscribe time.
+fn user_events_push(
+    state: &ApiState,
+    user: Address,
+    cursor: &mut Option<(u64, (u64, String))>,
+) -> Vec<String> {
+    let fills = state.sim.user_fills(user).unwrap_or_default();
+    let fundings = state.sim.user_fundings(user, 0).unwrap_or_default();
+    let newest_fill = fills.last().map_or(0, |f| f.tid);
+    let newest_funding = fundings
+        .last()
+        .map_or((0, String::new()), |f| (f.time, f.coin.clone()));
+    let Some((last_fill, last_funding)) = cursor.clone() else {
+        *cursor = Some((newest_fill, newest_funding));
+        return Vec::new();
+    };
+    let mut frames = Vec::new();
+    let fresh: Vec<_> = fills.into_iter().filter(|f| f.tid > last_fill).collect();
+    if !fresh.is_empty() {
+        frames.extend(encode(&WsPush::UserEvent {
+            data: serde_json::json!({ "fills": fresh }),
+        }));
+    }
+    for f in fundings
+        .into_iter()
+        .filter(|f| (f.time, f.coin.as_str()) > (last_funding.0, last_funding.1.as_str()))
+    {
+        frames.extend(encode(&WsPush::UserEvent {
+            data: serde_json::json!({ "funding": f }),
+        }));
+    }
+    *cursor = Some((newest_fill.max(last_fill), newest_funding.max(last_funding)));
+    frames
 }
 
 /// The `spotState` channel's frame: the same balances `/info` serves, in the

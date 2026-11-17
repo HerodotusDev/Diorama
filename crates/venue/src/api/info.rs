@@ -108,7 +108,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             coin,
             n_sig_figs,
             mantissa,
-        } => l2_book(&coin, n_sig_figs, mantissa, &state).await,
+        } => l2_book(&coin, (n_sig_figs, mantissa), &state, &body).await,
         InfoRequest::MarginTable { id } => margin_table(id, &state),
         InfoRequest::ExchangeStatus => Ok(exchange_status()),
         InfoRequest::SpotMeta => {
@@ -763,7 +763,7 @@ fn status_inner(r: &crate::sim::order::RestingOrder, sz: String) -> StatusOrderI
 }
 
 /// The terminal status label (the docs' orderStatus strings).
-fn terminal_status_label(status: crate::sim::order::TerminalStatus) -> &'static str {
+pub(crate) fn terminal_status_label(status: crate::sim::order::TerminalStatus) -> &'static str {
     match status {
         crate::sim::order::TerminalStatus::Filled => "filled",
         crate::sim::order::TerminalStatus::Canceled => "canceled",
@@ -950,11 +950,20 @@ fn open_interest_caps(dex: &Option<String>, state: &ApiState) -> Result<Response
 /// named 400 — never silently ignored.
 async fn l2_book(
     coin: &str,
-    n_sig_figs: Option<u8>,
-    mantissa: Option<u8>,
+    (n_sig_figs, mantissa): (Option<u8>, Option<u8>),
     state: &ApiState,
+    body: &Bytes,
 ) -> Result<Response> {
     book_params_ok(n_sig_figs, mantissa)?;
+    // An aggregated book is the venue's own, built from its whole depth (twenty
+    // aggregated levels a side); the sim holds twenty raw levels, which would
+    // merge into one or two. A coin the scenario owns the book of is the sim's.
+    if n_sig_figs.is_some()
+        && state.feed.meta_for_coin(coin).is_some()
+        && !state.feed.scripted_book(coin)
+    {
+        return pass_through(state, body).await;
+    }
     // Every coin a dex lists (default or builder) is a market: its book is
     // the relayed live one (the read keeps the coin's stream wanted), fetched
     // once from the venue only when none has landed yet.
@@ -1006,7 +1015,14 @@ pub(crate) fn aggregate_book(
     let Some(n) = n_sig_figs else {
         return book;
     };
+    // The venue's aggregated books carry the raw book's spread (best ask less
+    // best bid, measured: `1.0` whatever the aggregation).
+    let spread = match (book.levels[0].first(), book.levels[1].first()) {
+        (Some(bid), Some(ask)) => Some(ask.px - bid.px),
+        _ => None,
+    };
     let mut out = book;
+    out.spread = spread;
     for side in 0..2usize {
         let mut merged: std::collections::BTreeMap<Decimal, (Decimal, u64)> =
             std::collections::BTreeMap::new();
@@ -1285,8 +1301,11 @@ mod tests {
         assert_eq!(a.levels[0][0].sz, "3".parse().unwrap());
         assert_eq!(a.levels[0][0].n, 3);
         assert_eq!(a.levels[1][0].px, "110".parse().unwrap());
+        // The aggregated book carries the raw book's spread (106.0 - 100.4).
+        assert_eq!(a.spread, Some("5.6".parse().unwrap()));
         // No params: verbatim, both sides in their own order.
         let c = aggregate_book(book, None, 1);
+        assert_eq!(c.spread, None, "a raw book has no spread field");
         assert_eq!(c.levels[0].len(), 2);
         assert_eq!(c.levels[0][0].px, "100.4".parse().unwrap());
         // The documented parameter set, refused by name otherwise.

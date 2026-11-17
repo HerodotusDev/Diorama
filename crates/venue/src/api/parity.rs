@@ -1071,6 +1071,61 @@ fn the_funding_stream_serves_flat_rows() {
     assert!(pushes(&mut live, &state, crate::now_ms()).is_empty());
 }
 
+/// `bbo` pushes the best bid and ask once, then only when one changes;
+/// `orderUpdates` and `userEvents` start quiet and report what happens after.
+#[test]
+fn bbo_order_updates_and_user_events_push_changes_only() {
+    let (state, user) = world();
+    let (_, first, mut bbo) = subscribe(&state, &serde_json::json!({"type": "bbo", "coin": "ETH"}));
+    assert_eq!(first[0]["channel"], "bbo");
+    assert_eq!(first[0]["data"]["coin"], "ETH");
+    assert_eq!(first[0]["data"]["bbo"].as_array().unwrap().len(), 2);
+    assert!(
+        pushes(&mut bbo, &state, crate::now_ms()).is_empty(),
+        "an unchanged book is silent"
+    );
+
+    let (_, first, mut updates) = subscribe(
+        &state,
+        &serde_json::json!({"type": "orderUpdates", "user": user}),
+    );
+    assert!(first.is_empty(), "the channel carries changes only");
+    let (_, first, mut events) = subscribe(
+        &state,
+        &serde_json::json!({"type": "userEvents", "user": user}),
+    );
+    assert!(first.is_empty(), "no snapshot on userEvents");
+
+    state
+        .sim
+        .order(
+            &state.feed,
+            user,
+            &Order {
+                coin: "ETH".into(),
+                is_buy: true,
+                size: "1".parse().unwrap(),
+                limit_px: None,
+                tif: Tif::Ioc,
+                reduce_only: false,
+                cloid: None,
+                trigger: None,
+            },
+        )
+        .unwrap();
+    let frames = pushes(&mut events, &state, crate::now_ms());
+    assert_eq!(frames.len(), 1);
+    let frame: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(frame["channel"], "user");
+    assert_eq!(frame["data"]["fills"].as_array().unwrap().len(), 1);
+    assert!(
+        pushes(&mut events, &state, crate::now_ms()).is_empty(),
+        "each fill is pushed once"
+    );
+    // An IOC that filled in full never rested: no order update.
+    assert!(pushes(&mut updates, &state, crate::now_ms()).is_empty());
+}
+
 /// The venue's quirks and errors on the subscriptions the dexes added,
 /// replayed from the capture: how many frames come back at all (a named
 /// dex's `allMids` is acked and then silent, an unlisted dex on
