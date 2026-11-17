@@ -1,0 +1,6 @@
+{
+  "name": "venue-sim-e2e",
+  "private": true,
+  "type": "module",
+  "dependencies": { "viem": "^2.57.20", "ws": "^8.18.0" }
+}

@@ -662,11 +662,10 @@ async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
         serde_json::json!({"type": "tokenDetails"}),
         serde_json::json!({"type": "vaultDetails"}),
         serde_json::json!({"type": "borrowLendReserveState"}),
-        // Account-specific types the sim does not model stay unrouted.
-        serde_json::json!({"type": "userRateLimit", "user": user}),
-        serde_json::json!({"type": "portfolio", "user": user}),
-        serde_json::json!({"type": "userFees", "user": user}),
-        serde_json::json!({"type": "historicalOrders", "user": user}),
+        // A type the venue does not know, and a ledger read without its user.
+        serde_json::json!({"type": "noSuchInfoType", "user": user}),
+        serde_json::json!({"type": "userFees"}),
+        serde_json::json!({"type": "userFillsByTime", "user": user}),
     ] {
         let (status, body) = info_raw(&state, request.clone()).await;
         assert_eq!(status, 422, "{request}");
@@ -675,6 +674,92 @@ async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
             "Failed to deserialize the JSON body into the target type"
         );
     }
+}
+
+/// The account-scoped types the venue serves and the sim has no typed route
+/// for: a simulated account answers from its own ledger (`userFillsByTime`,
+/// `historicalOrders`) or like a fresh venue account; any other user is the
+/// venue's verbatim answer.
+#[tokio::test]
+async fn account_types_without_a_typed_route_answer_for_a_simulated_account() {
+    let venue = mock_venue().await;
+    let (state, user) = world_on(&venue);
+    // userFillsByTime: the account's fills from `startTime`, oldest first.
+    let all = info_json(
+        &state,
+        serde_json::json!({"type": "userFills", "user": user}),
+    )
+    .await;
+    let all = all.as_array().unwrap();
+    assert!(all.len() >= 2);
+    let by_time = info_json(
+        &state,
+        serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": 0}),
+    )
+    .await;
+    let by_time = by_time.as_array().unwrap();
+    assert_eq!(by_time.len(), all.len());
+    let times: Vec<u64> = by_time
+        .iter()
+        .map(|f| f["time"].as_u64().unwrap())
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "oldest first");
+    let after = times[times.len() - 1] + 1;
+    let none = info_json(
+        &state,
+        serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": after}),
+    )
+    .await;
+    assert_eq!(none, serde_json::json!([]));
+    // historicalOrders: the resting orders, as `open`, in the orderStatus row shape.
+    let history = info_json(
+        &state,
+        serde_json::json!({"type": "historicalOrders", "user": user}),
+    )
+    .await;
+    let rows = history.as_array().unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        for key in ["order", "status", "statusTimestamp"] {
+            assert!(row.get(key).is_some(), "{key}");
+        }
+        assert_eq!(row["order"]["tif"], "Gtc");
+    }
+    assert!(rows.iter().all(|r| r["status"] == "open"));
+    // A fresh account: the static answers, and the venue asked about a neutral account.
+    for (kind, expected) in [
+        ("userRole", serde_json::json!({"role": "user"})),
+        ("subAccounts", Value::Null),
+        ("isVip", serde_json::json!(false)),
+        ("userVaultEquities", serde_json::json!([])),
+        ("extraAgents", serde_json::json!([])),
+    ] {
+        let got = info_json(&state, serde_json::json!({"type": kind, "user": user})).await;
+        assert_eq!(got, expected, "{kind}");
+    }
+    let fees = info_json(
+        &state,
+        serde_json::json!({"type": "userFees", "user": user}),
+    )
+    .await;
+    assert_eq!(
+        fees["forwarded"]["user"],
+        "0x0000000000000000000000000000000000000001"
+    );
+    // Another user is the venue's, verbatim.
+    let stranger = "0x00000000000000000000000000000000000000bb";
+    let theirs = info_json(
+        &state,
+        serde_json::json!({"type": "userFees", "user": stranger}),
+    )
+    .await;
+    assert_eq!(theirs["forwarded"]["user"], stranger);
+    let market = info_json(
+        &state,
+        serde_json::json!({"type": "recentTrades", "coin": "BTC"}),
+    )
+    .await;
+    assert_eq!(market["forwarded"]["coin"], "BTC");
 }
 
 /// The venue's order of the two ledgers: fills newest first, funding oldest

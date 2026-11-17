@@ -1469,6 +1469,29 @@ impl Sim {
         })
     }
 
+    /// Every order the account has on record, open ones first by time and
+    /// the terminal history after them: `(order, status label source)` rows the
+    /// `historicalOrders` read orders newest first.
+    pub(crate) fn order_history(
+        &self,
+        account: Address,
+    ) -> Result<(Vec<RestingOrder>, Vec<TerminalOrder>)> {
+        self.with_state(|st| {
+            Ok((
+                st.resting
+                    .values()
+                    .filter(|r| r.account == account)
+                    .cloned()
+                    .collect(),
+                st.terminal
+                    .values()
+                    .filter(|t| t.order.account == account)
+                    .cloned()
+                    .collect(),
+            ))
+        })
+    }
+
     pub(crate) fn resting_by_cloid(
         &self,
         account: Address,

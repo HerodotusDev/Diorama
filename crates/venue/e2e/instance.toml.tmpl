@@ -1,0 +1,56 @@
+# A local venue sim whose upstream is real mainnet (public feeds, read only). No anvil is needed: `anvil_url` is unset, so the
+# Core <-> EVM bridge is disabled (the sim still serves /info, /ws, /exchange and /control). run_sim.sh fills @STATE@.
+[instance]
+name = "venue-verify"
+namespace = "local"
+profile = "venue"
+
+[chains.venue]
+kind = "hyperliquid"
+source_urls = "@hyperevm"
+api_urls = "@hyperliquid_api"
+ws_urls = "@hyperliquid_ws"
+
+[endpoints.hyperevm]
+http = ["https://rpc.hyperliquid.xyz/evm"]
+chain_id = 999
+
+[endpoints.hyperliquid_api]
+http = ["https://api.hyperliquid.xyz"]
+roles = ["market_rest"]
+
+[endpoints.hyperliquid_ws]
+ws = ["wss://api.hyperliquid.xyz/ws"]
+roles = ["market_ws"]
+
+[services.engine]
+state_dir = "@STATE@/engstate"
+
+[services.venue_sim]
+state_dir = "@STATE@/state"
+
+[services.venue_sim.info]
+addr = "127.0.0.1"
+port = 8090
+
+[services.venue_sim.control]
+addr = "127.0.0.1"
+port = 8091
+
+[endpoints.anvil_v]
+http = ["http://127.0.0.1:18545"]
+chain_id = 999
+
+[services.engine.anvil]
+target_url = "@anvil_v"
+
+[services.engine.loops]
+poll_interval_ms = 2000
+max_gap_blocks = 900
+chunk_size = 500
+
+[services.engine.journal]
+dir = "@STATE@/engstate/journal"
+
+[services.engine.http]
+port = 18080

@@ -86,7 +86,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         // A type the sim does not serve is a type the real API does not know:
         // the same 422 (never a 200 with a bare string, which a typed client
         // would parse as data).
-        InfoRequest::Unrouted => Ok(deserialize_failure()),
+        InfoRequest::Unrouted => unrouted(&state, body).await,
         // ---- account-scoped: the sim's, or the venue's -------------------
         InfoRequest::ClearinghouseState { user, dex } => {
             clearinghouse(&state, body, user, dex).await
@@ -299,6 +299,125 @@ const ZERO_HASH: &str = "0x00000000000000000000000000000000000000000000000000000
 
 /// The real API's answer to a request it cannot deserialize (an unknown
 /// `type`, a missing field): HTTP 422, plain text.
+/// The neutral address the venue is asked about for a simulated account's
+/// figures the sim holds no ledger for (fee tier, rate limit, referral): a
+/// fresh account with no volume, which is what a sim account is.
+const NEUTRAL_USER: &str = "0x0000000000000000000000000000000000000001";
+
+/// The types the sim has no typed route for. The venue serves them, so the
+/// sim must too (a 422 for a type the venue knows would read as the sim being
+/// broken): the venue's market-wide ones are forwarded; `userFillsByTime` and
+/// `historicalOrders` are the account's own ledgers; the rest of the
+/// account-scoped ones answer for a simulated account like a fresh venue
+/// account (empty lists, or the venue's own answer for a neutral account) and
+/// are forwarded for any other user. A type the venue does not know is its 422.
+async fn unrouted(state: &ApiState, body: Bytes) -> Result<Response> {
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(deserialize_failure());
+    };
+    let kind = request
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let user = request
+        .get("user")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|u| u.parse::<Address>().ok());
+    match (kind, user) {
+        ("recentTrades" | "validatorSummaries", _) => pass_through(state, &body).await,
+        ("userFillsByTime", Some(user)) => {
+            let Some(start) = request.get("startTime").and_then(serde_json::Value::as_u64) else {
+                return Ok(deserialize_failure());
+            };
+            let end = request.get("endTime").and_then(serde_json::Value::as_u64);
+            match state.sim.user_fills(user) {
+                Some(fills) => Ok(Json(
+                    fills
+                        .into_iter()
+                        .filter(|f| f.time >= start && end.is_none_or(|e| f.time <= e))
+                        .take(USER_FILLS_PAGE)
+                        .collect::<Vec<_>>(),
+                )
+                .into_response()),
+                None => pass_through(state, &body).await,
+            }
+        }
+        ("historicalOrders", Some(user)) => historical_orders(state, &body, user).await,
+        (
+            "userRole"
+            | "subAccounts"
+            | "userVaultEquities"
+            | "delegations"
+            | "twapHistory"
+            | "userTwapSliceFills"
+            | "extraAgents"
+            | "isVip"
+            | "userToMultiSigSigners"
+            | "userFees"
+            | "userRateLimit"
+            | "referral"
+            | "legalCheck"
+            | "delegatorSummary"
+            | "portfolio",
+            Some(user),
+        ) => fresh_account_read(state, &body, kind, user, &request).await,
+        _ => Ok(deserialize_failure()),
+    }
+}
+
+/// An account-scoped read the sim holds no ledger for: a simulated account is
+/// a fresh venue account.
+async fn fresh_account_read(
+    state: &ApiState,
+    body: &Bytes,
+    kind: &str,
+    user: Address,
+    request: &serde_json::Value,
+) -> Result<Response> {
+    if state.sim.account(user)?.is_none() {
+        return pass_through(state, body).await;
+    }
+    let fixed = match kind {
+        "userRole" => Some(serde_json::json!({"role": "user"})),
+        "subAccounts" | "userToMultiSigSigners" => Some(serde_json::Value::Null),
+        "isVip" => Some(serde_json::json!(false)),
+        "userVaultEquities" | "delegations" | "twapHistory" | "userTwapSliceFills"
+        | "extraAgents" => Some(serde_json::json!([])),
+        _ => None,
+    };
+    if let Some(answer) = fixed {
+        return Ok(Json(answer).into_response());
+    }
+    let mut neutral = request.clone();
+    neutral["user"] = serde_json::Value::String(NEUTRAL_USER.to_string());
+    pass_through(state, &Bytes::from(neutral.to_string())).await
+}
+
+/// `historicalOrders`: the account's open orders and its terminal history,
+/// newest first (by status time), at most a page.
+async fn historical_orders(state: &ApiState, body: &Bytes, user: Address) -> Result<Response> {
+    if state.sim.account(user)?.is_none() {
+        return pass_through(state, body).await;
+    }
+    let (resting, terminal) = state.sim.order_history(user)?;
+    let mut rows: Vec<StatusOrder> = resting
+        .iter()
+        .map(|r| StatusOrder {
+            order: status_inner(r, dtext(&r.sz)),
+            status: "open",
+            status_timestamp: r.placed_ms,
+        })
+        .chain(terminal.iter().map(|t| StatusOrder {
+            order: status_inner(&t.order, dtext(&t.order.sz)),
+            status: terminal_status_label(t.status),
+            status_timestamp: t.status_ms,
+        }))
+        .collect();
+    rows.sort_by(|a, b| b.status_timestamp.cmp(&a.status_timestamp));
+    rows.truncate(USER_FILLS_PAGE);
+    Ok(Json(rows).into_response())
+}
+
 fn deserialize_failure() -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
