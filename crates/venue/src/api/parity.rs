@@ -681,6 +681,7 @@ async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
 /// `historicalOrders`) or like a fresh venue account; any other user is the
 /// venue's verbatim answer.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one table of account types
 async fn account_types_without_a_typed_route_answer_for_a_simulated_account() {
     let venue = mock_venue().await;
     let (state, user) = world_on(&venue);

@@ -179,7 +179,7 @@ const errText = (r) => (r.json?.status === "err" ? r.json.response : null);
   r = await w.userSend("userSetAbstraction", { user: w.address, abstraction: "portfolioMargin" });
   console.log("   portfolioMargin:", r.text.slice(0, 200));
   r = await w.userSend("userSetAbstraction", { user: w.address, abstraction: "nonsense" });
-  R.ok(errText(r), "unknown abstraction refused", r.text);
+  R.ok(errText(r) || /deserialize/i.test(r.text), "unknown abstraction refused (422 like real)", r.text);
   r = await w.userSend("userSetAbstraction", { user: new Wallet().address, abstraction: "disabled" });
   R.ok(errText(r), "setting another user's abstraction is refused", r.text);
   r = await w.userSend("userSetAbstraction", { user: w.address, abstraction: "disabled" });

@@ -1425,6 +1425,7 @@ impl FillFacts {
 
 /// Apply one fill to the account; the effect (the size before, the realized
 /// PnL of the closed part, the direction) is what the ledger records.
+#[allow(clippy::too_many_lines)] // one ledger update: position, margin and realized pnl
 pub(crate) fn apply_fill(
     account: &mut Account,
     fill: &FillFacts,

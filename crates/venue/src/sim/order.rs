@@ -971,6 +971,7 @@ impl Sim {
     /// `order` for a placer whose order carries a builder fee: the fee is
     /// charged on this take's notional with the taker fee, and credited to
     /// the builder when it is a simulated account.
+    #[allow(clippy::too_many_lines)] // one placement: validate, take, charge, credit
     fn order_with_builder(&self, feed: &MarketFeed, placer: Placer, req: &Order) -> Result<Fill> {
         let address = placer.address;
         let meta = feed.meta_for_lookup(&req.coin);
@@ -2728,6 +2729,7 @@ mod tests {
     /// isolated-only market; a new position opens in the mode the account
     /// last set, funding an isolated one from the balance.
     #[test]
+    #[allow(clippy::too_many_lines)] // one scenario
     fn a_new_position_opens_in_the_default_or_set_margin_mode() {
         use crate::wire::{LeverageType, MarginMode};
         let mut meta = meta_of(&[("BIG", 40), ("SMALL", 5), ("ISO", 10)]);
@@ -2790,10 +2792,10 @@ mod tests {
         sim.place(&feed, a, &reduce(Side::Sell, "3")).unwrap();
         let account = sim.account(a).unwrap().unwrap();
         assert!(account.positions.is_empty());
-        let fees = (dec("202") + dec("101") + dec("300")) * taker_fee();
+        let charged = (dec("202") + dec("101") + dec("300")) * taker_fee();
         assert_eq!(
             account.perp_balance(""),
-            dec("1000") - fees + dec("3") * (dec("100") - dec("101"))
+            dec("1000") - charged + dec("3") * (dec("100") - dec("101"))
         );
     }
 

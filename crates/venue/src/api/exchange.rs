@@ -267,15 +267,14 @@ fn dispatch(state: &Arc<ApiState>, owner: Address, body: &Bytes, req: &ExchangeB
 
 /// A transfer's `destination` string as an address: the venue reads it as a
 /// free string and refuses a malformed one only after the signature held.
-fn destination_of(text: &str) -> std::result::Result<Address, Response> {
+fn destination_of(text: &str) -> std::result::Result<Address, String> {
     text.parse::<Address>().map_err(|_| {
-        err_envelope(format!(
-            "venue-sim: the destination `{text}` is not an address (0x and 40 hex digits)"
-        ))
+        format!("venue-sim: the destination `{text}` is not an address (0x and 40 hex digits)")
     })
 }
 
 /// The transfer and account-setup actions (`user_actions.rs`).
+#[allow(clippy::too_many_lines)] // one dispatch arm per user-signed action
 fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -> Response {
     match action {
         ExchangeAction::UsdClassTransfer { amount, to_perp } => {
@@ -301,7 +300,7 @@ fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -
                     from_sub_account,
                 },
             ),
-            Err(response) => response,
+            Err(text) => err_envelope(text),
         },
         ExchangeAction::SpotSend {
             destination,
@@ -309,14 +308,14 @@ fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -
             amount,
         } => match destination_of(destination) {
             Ok(destination) => user_actions::spot_send(state, owner, destination, (token, amount)),
-            Err(response) => response,
+            Err(text) => err_envelope(text),
         },
         ExchangeAction::UsdSend {
             destination,
             amount,
         } => match destination_of(destination) {
             Ok(destination) => user_actions::usd_send(state, owner, destination, amount),
-            Err(response) => response,
+            Err(text) => err_envelope(text),
         },
         ExchangeAction::Withdraw3 => user_actions::withdraw3(),
         ExchangeAction::ApproveAgent {

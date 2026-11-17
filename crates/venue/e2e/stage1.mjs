@@ -43,8 +43,12 @@ for (const c of sample.filter((c) => metaCoins.has(c))) {
   const t0 = Date.now();
   const b = (await simInfo({ type: "l2Book", coin: c })).json;
   const ms = Date.now() - t0;
-  const ok = b && b.coin === c && b.levels?.[0]?.length > 0 && b.levels?.[1]?.length > 0;
-  R.ok(ok, `l2Book ${c} has both sides`, b && { coin: b.coin, bids: b.levels?.[0]?.length, asks: b.levels?.[1]?.length });
+  // a delisted coin has no book on real either (both sides empty); a live one has both
+  const delisted = sm.some((m) => m.universe.some((u) => u.name === c && u.isDelisted));
+  const ok = delisted
+    ? b && b.coin === c && b.levels?.[0]?.length === 0 && b.levels?.[1]?.length === 0
+    : b && b.coin === c && b.levels?.[0]?.length > 0 && b.levels?.[1]?.length > 0;
+  R.ok(ok, `l2Book ${c} has the venue's sides`, b && { coin: b.coin, bids: b.levels?.[0]?.length, asks: b.levels?.[1]?.length });
   const age = b?.time ? Date.now() - b.time : null;
   console.log(`l2Book ${c}: first read ${ms}ms, bids ${b?.levels?.[0]?.length} asks ${b?.levels?.[1]?.length}, age ${age}ms`);
 }

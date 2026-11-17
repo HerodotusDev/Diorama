@@ -265,6 +265,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)] // a table helper: callers pass literals
     fn user(extra: Value) -> Value {
         let mut base = json!({
             "type": "usdClassTransfer", "hyperliquidChain": "Mainnet",
@@ -293,7 +294,7 @@ mod tests {
             json!({"hyperliquidChain": ""}),
             json!({"signatureChainId": "0x"}),
             json!({"signatureChainId": "zz"}),
-            json!({"signatureChainId": 421614}),
+            json!({"signatureChainId": 421_614}),
             json!({"amount": 1}),
             json!({"toPerp": "true"}),
             json!({"nonce": "5"}),

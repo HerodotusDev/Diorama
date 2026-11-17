@@ -311,6 +311,7 @@ const NEUTRAL_USER: &str = "0x0000000000000000000000000000000000000001";
 /// account-scoped ones answer for a simulated account like a fresh venue
 /// account (empty lists, or the venue's own answer for a neutral account) and
 /// are forwarded for any other user. A type the venue does not know is its 422.
+#[allow(clippy::too_many_lines)] // one table of account-scoped info types
 async fn unrouted(state: &ApiState, body: Bytes) -> Result<Response> {
     let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return Ok(deserialize_failure());
@@ -413,7 +414,7 @@ async fn historical_orders(state: &ApiState, body: &Bytes, user: Address) -> Res
             status_timestamp: t.status_ms,
         }))
         .collect();
-    rows.sort_by(|a, b| b.status_timestamp.cmp(&a.status_timestamp));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.status_timestamp));
     rows.truncate(USER_FILLS_PAGE);
     Ok(Json(rows).into_response())
 }
