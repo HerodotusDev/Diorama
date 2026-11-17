@@ -12,7 +12,10 @@ pub(crate) mod cors;
 pub(crate) mod exchange;
 pub(crate) mod info;
 #[cfg(test)]
+mod liquidation_parity;
+#[cfg(test)]
 mod parity;
+mod shape;
 pub(crate) mod signing;
 mod user_actions;
 pub(crate) mod ws;
@@ -24,6 +27,11 @@ use crate::feed::MarketFeed;
 use crate::sim::Sim;
 use axum::Router;
 use std::sync::Arc;
+
+/// How long a change to the market feed waits before the websocket composes
+/// and pushes it: a burst of writes (a book and its ctx landing together)
+/// becomes one frame. Nothing is pushed when nothing changed.
+const DEFAULT_MARKET_COALESCE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Everything both routers read. Built once by the bin.
 pub struct ApiState {
@@ -45,6 +53,12 @@ pub struct ApiState {
     /// The venue websocket's push cadence (the account automaton's configured
     /// tick, not a second hardcoded second).
     pub push_interval: std::time::Duration,
+    /// The market-data channels (`l2Book`, `l2`, `bbo`, `activeAssetCtx`,
+    /// `allMids`, `fastAssetCtxs`, `pac`) are event driven: a feed change wakes
+    /// the session, which waits this long to batch a burst and then pushes only
+    /// the content that changed (the real venue pushes on change, not on a
+    /// clock).
+    pub market_coalesce: std::time::Duration,
     /// The relayed candle streams (the venue serves candles; the sim has no
     /// trade tape to build them from).
     pub candles: Arc<candles::CandleHub>,
@@ -76,8 +90,17 @@ impl ApiState {
             bridge,
             ws_pool: None,
             push_interval,
+            market_coalesce: DEFAULT_MARKET_COALESCE,
             candles: Arc::new(candles::CandleHub::default()),
         })
+    }
+
+    /// Set the market-data channels' coalescing window.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_market_coalesce(mut self, window: std::time::Duration) -> Self {
+        self.market_coalesce = window;
+        self
     }
 
     /// Attach the market websocket lane's pool so `/metrics` can expose its
@@ -89,41 +112,27 @@ impl ApiState {
         self
     }
 
-    /// Readiness: the market plane has the default dex's meta and the dex
-    /// registry, and every configured market's context is fresher than
-    /// `max_stale_ms` (the plan's freshness gate). The builder dexes' own
-    /// contexts are deliberately not part of it: they refresh on a staggered
-    /// cadence and a slow dex must not take the pod out of rotation.
+    /// Readiness: the market plane has the default dex's meta, the dex
+    /// registry and the spot token registry, and the default dex's data is
+    /// fresher than `max_stale_ms` (the plan's freshness gate: the contexts
+    /// of its largest coins by volume). No coin list is configured: every
+    /// coin of every dex is a market, and none is singled out. The builder
+    /// dexes' own contexts are deliberately not part of it: a slow dex must
+    /// not take the pod out of rotation. A coin's book is read on demand and
+    /// is not a readiness fact.
     pub fn ready(&self, max_stale_ms: u64) -> bool {
         if self.feed.meta().is_none() || !self.feed.registry_loaded() {
             return false;
         }
         // The spot token registry is part of the served contract (spot deals,
         // `spotClearinghouseState`'s token mapping). The poller fetches it in
-        // the same pass as the meta, one HEAVY call later — readiness that
+        // the same pass as the meta, one HEAVY call later: readiness that
         // passed between the two left the first spot deal hitting the gap
         // (found by the local run).
         if !self.feed.spot_registry_loaded() {
             return false;
         }
-        let now = crate::now_ms();
-        self.feed.markets.iter().all(|coin| {
-            let fresh_mark = self
-                .feed
-                .stale_ms(coin, now)
-                .map(|stale| stale <= max_stale_ms)
-                .unwrap_or(false);
-            // The served book is part of the same contract (the consumer's l2Book
-            // read). Presence is not enough: a live book older than the
-            // freshness window is stale and the order lane refuses it. A
-            // scripted book's present is never stale; a warming book is not
-            // ready.
-            let fresh_book = matches!(
-                self.feed.book_age(coin, now, max_stale_ms),
-                crate::feed::BookAge::Scripted | crate::feed::BookAge::Fresh
-            );
-            fresh_mark && fresh_book
-        })
+        self.feed.default_dex_fresh(crate::now_ms(), max_stale_ms)
     }
 }
 
@@ -218,3 +227,68 @@ pub async fn serve(addr: String, router: Router) -> Result<()> {
 // The HTTP mapping of the error taxonomy lives in the engine's `http` module
 // (one impl for both surfaces: the engine's admin routes and the simulator's
 // info/control routers).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::test_ctx;
+    use std::time::Duration;
+
+    fn state(feed: Arc<MarketFeed>) -> ApiState {
+        let api = RestClient::new(&["http://127.0.0.1:1".to_string()]).unwrap();
+        ApiState::new(
+            feed,
+            Arc::new(Sim::memory()),
+            api,
+            None,
+            None,
+            Duration::from_secs(45),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    /// Readiness has no market list: it needs the default dex's meta, the dex
+    /// registry, the spot registry and fresh default-dex data (its largest
+    /// coins, whichever they are). A builder dex that has no data (or a slow
+    /// one) never holds the pod out of rotation.
+    #[test]
+    fn readiness_follows_the_registries_and_the_default_dex_data() {
+        let feed = Arc::new(MarketFeed::memory());
+        let api = state(feed.clone());
+        let max = MarketFeed::MAX_STALE_MS;
+        assert!(!api.ready(max), "nothing has landed");
+
+        let now = crate::now_ms();
+        let metas = vec![
+            crate::sim::meta_of(&[("BTC", 40), ("HYPE", 10)]),
+            crate::sim::meta_of(&[("xyz:TSLA", 10)]),
+        ];
+        let dexs = vec![(String::new(), None), ("xyz".to_string(), None)];
+        assert!(feed.put_perp_dexs(dexs, metas, now));
+        feed.put_spot_meta(crate::wire::SpotMeta {
+            tokens: vec![],
+            universe: vec![],
+        });
+        assert!(!api.ready(max), "no default-dex data yet");
+
+        feed.put_ctx("BTC".into(), test_ctx("100", "100"), now);
+        feed.put_ctx("HYPE".into(), test_ctx("10", "10"), now);
+        assert!(
+            api.ready(max),
+            "the builder dex has no data and does not matter"
+        );
+
+        feed.put_ctx("HYPE".into(), test_ctx("10", "10"), now - 2 * max);
+        assert!(!api.ready(max), "a stale default-dex coin is not ready");
+    }
+
+    #[test]
+    fn the_market_channels_coalesce_briefly_and_the_account_tick_is_kept() {
+        let api = state(Arc::new(MarketFeed::memory()));
+        assert_eq!(api.push_interval, Duration::from_secs(1));
+        assert_eq!(api.market_coalesce, Duration::from_millis(25));
+        let api = api.with_market_coalesce(Duration::from_millis(50));
+        assert_eq!(api.market_coalesce, Duration::from_millis(50));
+    }
+}

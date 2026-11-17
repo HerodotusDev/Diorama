@@ -68,7 +68,9 @@ pub(crate) fn system_address(token_index: u64) -> Address {
 
 /// The token index a system address encodes (`None` when it is not one).
 pub(crate) fn token_index_of(address: Address) -> Option<u64> {
-    if address.0[0] != 0x20 || address == HYPE_SYSTEM {
+    // 0x20, eleven zero bytes, then the 8-byte index: an ordinary wallet that merely
+    // starts with 0x20 is not a system address.
+    if address.0[0] != 0x20 || address.0[1..12].iter().any(|b| *b != 0) || address == HYPE_SYSTEM {
         return None;
     }
     let mut idx = [0u8; 8];
@@ -365,6 +367,11 @@ mod tests {
         assert_eq!(token_index_of(system_address(200)), Some(200));
         assert_eq!(token_index_of(HYPE_SYSTEM), None);
         assert_eq!(token_index_of(Address::ZERO), None);
+        // an ordinary wallet whose first byte happens to be 0x20 is not a system address
+        assert_eq!(
+            token_index_of(address!("20a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3")),
+            None
+        );
     }
 
     /// The measured USDC row: Core wei 8, EVM 6 (`evm_extra_wei_decimals -2`).

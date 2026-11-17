@@ -20,6 +20,7 @@
 pub(crate) mod budget;
 pub(crate) mod dex;
 pub(crate) mod metrics;
+pub(crate) mod relay;
 pub(crate) mod rest;
 pub(crate) mod ws;
 
@@ -34,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// The scenario's owned market values (persisted).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -116,7 +117,14 @@ struct Cache {
     ctxs: BTreeMap<String, AssetCtx>,
     ctx_at: BTreeMap<String, u64>,
     books: BTreeMap<String, L2Book>,
+    /// The instant of the book's last **update** (what the served `time`
+    /// carries).
     book_at: BTreeMap<String, u64>,
+    /// The instant the book was last known current: its last update, or the
+    /// last moment a live relay stream confirmed it unchanged (the venue
+    /// pushes a book on change only, so a quiet coin's book is silent while
+    /// being exactly right). The freshness gates read this, not `book_at`.
+    book_live_at: BTreeMap<String, u64>,
     /// `allMids` per dex (the default dex's also carries the spot `@N` and
     /// outcome `#N` keys, exactly as the venue's default `allMids` does).
     mids: BTreeMap<String, BTreeMap<String, Decimal>>,
@@ -128,14 +136,9 @@ struct Cache {
     oi_caps: BTreeMap<String, Vec<String>>,
 }
 
-/// How long a book nobody asked for is kept fresh: a coin an order was placed
-/// on, or an `l2Book` read or subscription named, is polled until it has been
-/// idle this long (a position or resting order keeps itself wanted).
-pub(crate) const WANTED_BOOK_TTL_MS: u64 = 10 * 60 * 1000;
-
-/// The most books the wanted set polls at once (the oldest idle one makes
-/// room): each costs `l2Book` weight every refresh inside the shared budget.
-const WANTED_BOOKS_MAX: usize = 128;
+/// A context pushed by the socket this recently is not overwritten by a REST
+/// snapshot (the snapshot may be older than the push by a poll's latency).
+const WS_CTX_PRIORITY_MS: u64 = 3_000;
 
 /// USDC's token id on the venue (spot token 0), as the transfer actions write
 /// it (`USDC:0x6d1e...`).
@@ -151,9 +154,9 @@ pub struct MarketFeed {
     /// The rate budget meter (shared with the passthrough reads).
     pub(crate) budget: Budget,
     pub(crate) metrics: FeedMetrics,
-    /// The configured markets (books are cached for these; the staleness
-    /// gauges are per-coin over this set).
-    pub markets: Vec<String>,
+    /// Which coins the upstream socket carries a book for (demand-driven):
+    /// see [`relay`].
+    pub(crate) relay: Arc<relay::Relay>,
     /// The overrides' state file; `None` keeps them in memory only.
     path: Option<PathBuf>,
     /// Serializes persists (snapshot + write): a concurrent pair must not let
@@ -162,14 +165,16 @@ pub struct MarketFeed {
     /// The staleness drill: live writes are dropped until this deadline
     /// (0 = not stalled). The scripted plane is never gated.
     stalled_until_ms: AtomicU64,
-    /// The books wanted beyond the configured markets: coin to the instant
-    /// (ms) it was last wanted. The poller keeps them fresh; one idle past
-    /// [`WANTED_BOOK_TTL_MS`] is dropped with its cached book.
-    wanted_books: std::sync::Mutex<BTreeMap<String, u64>>,
     /// The venue API client the on-demand book read uses (attached by the
     /// service; absent in fixtures, where [`Self::ensure_book`] only serves
     /// what is cached).
     rest: std::sync::OnceLock<rest::RestClient>,
+    /// A monotonic version bumped by every write that can change what a market
+    /// channel serves (a live ctx, book or mids write, a scripted override, a
+    /// consumed level). A downstream websocket wakes on it, composes its
+    /// channels and pushes only what changed. A relay confirmation (the book
+    /// is unchanged) does not bump it.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 /// A live context with the scenario's overrides applied: the one composition
@@ -210,36 +215,46 @@ fn compose_ctx(
 
 impl MarketFeed {
     /// Load the persisted overrides beside the live cache.
-    pub fn load(path: PathBuf, markets: Vec<String>) -> Result<Self> {
+    pub fn load(path: PathBuf) -> Result<Self> {
         let overrides = store::load::<Overrides>(&path, "feed overrides")?.unwrap_or_default();
         Ok(Self {
             cache: RwLock::new(Cache::default()),
             overrides: RwLock::new(overrides),
             budget: Budget::default(),
-            metrics: FeedMetrics::new(&markets),
-            markets,
+            metrics: FeedMetrics::default(),
+            relay: Arc::default(),
             path: Some(path),
             persist_lock: std::sync::Mutex::new(()),
             stalled_until_ms: AtomicU64::new(0),
-            wanted_books: std::sync::Mutex::new(BTreeMap::new()),
             rest: std::sync::OnceLock::new(),
+            changes: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// Signal that the market content may have changed (see `changes`).
+    fn notify(&self) {
+        self.changes.send_modify(|version| *version += 1);
+    }
+
+    /// The change signal a websocket session waits on.
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// An in-memory feed (tests only: no production path builds one).
     #[cfg(test)]
-    pub fn memory(markets: Vec<String>) -> Self {
+    pub fn memory() -> Self {
         Self {
             cache: RwLock::new(Cache::default()),
             overrides: RwLock::new(Overrides::default()),
             budget: Budget::default(),
-            metrics: FeedMetrics::new(&markets),
-            markets,
+            metrics: FeedMetrics::default(),
+            relay: Arc::default(),
             path: None,
             persist_lock: std::sync::Mutex::new(()),
             stalled_until_ms: AtomicU64::new(0),
-            wanted_books: std::sync::Mutex::new(BTreeMap::new()),
             rest: std::sync::OnceLock::new(),
+            changes: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -258,6 +273,7 @@ impl MarketFeed {
             crate::now_ms().saturating_add(seconds.saturating_mul(1_000))
         };
         self.stalled_until_ms.store(until, Ordering::Relaxed);
+        self.notify();
         until
     }
 
@@ -278,7 +294,8 @@ impl MarketFeed {
         // The book's own stamp, not the context's: a REST-only book stall
         // leaves `ctx_at` advancing on the WS lane while `l2Book` freezes.
         // Gating on the context is what let a stale book pass readiness.
-        match self.read().book_at.get(coin).copied() {
+        // The stamp is the last update or the last relay confirmation.
+        match self.read().book_live_at.get(coin).copied() {
             None => BookAge::Warming,
             Some(at) => {
                 let age = now_ms.saturating_sub(at);
@@ -367,47 +384,20 @@ impl MarketFeed {
         let _ = self.rest.set(rest);
     }
 
-    fn wanted(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, u64>> {
-        self.wanted_books
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Ask for `coin`'s book to be kept fresh (an order on it, a position or
-    /// resting order in it, an `l2Book` read or subscription for it). `true`
-    /// when the coin is polled from now on: a configured market always is, a
-    /// coin some dex lists is added to the wanted set (idle past the TTL it is
-    /// dropped again), anything else is `false`.
+    /// Ask for `coin`'s book to be kept live (an order on it, a position or
+    /// resting order in it, an `l2Book` read): the upstream socket carries its
+    /// `l2Book` stream until the grace window after the last such ask has run
+    /// out. `true` when some dex lists the coin; anything else is `false` (an
+    /// unlisted coin is never subscribed: the venue closes the socket on one).
     pub(crate) fn want_book(&self, coin: &str) -> bool {
         self.want_book_at(coin, crate::now_ms())
     }
 
     fn want_book_at(&self, coin: &str, now_ms: u64) -> bool {
-        if self.markets.iter().any(|m| m == coin) {
-            return true;
-        }
         if self.meta_for_coin(coin).is_none() {
             return false;
         }
-        let evicted = {
-            let mut wanted = self.wanted();
-            let mut evicted = None;
-            if !wanted.contains_key(coin) && wanted.len() >= WANTED_BOOKS_MAX {
-                // Make room: the coin idle the longest goes.
-                evicted = wanted
-                    .iter()
-                    .min_by_key(|(_, at)| **at)
-                    .map(|(c, _)| c.clone());
-                if let Some(oldest) = &evicted {
-                    wanted.remove(oldest);
-                }
-            }
-            wanted.insert(coin.to_string(), now_ms);
-            evicted
-        };
-        if let Some(oldest) = evicted {
-            self.evict_book(&oldest);
-        }
+        self.relay.touch(coin, now_ms);
         true
     }
 
@@ -420,25 +410,60 @@ impl MarketFeed {
         }
     }
 
-    /// The coins the poller reads books for besides the configured markets,
-    /// expired ones dropped (with the book they cached).
+    /// Hold `coin` wanted for as long as the lease lives (a downstream
+    /// websocket subscription on it). `None` for a coin no dex lists.
+    pub(crate) fn lease_coin(&self, coin: &str) -> Option<relay::Lease> {
+        self.meta_for_coin(coin)?;
+        Some(self.relay.lease(coin, crate::now_ms()))
+    }
+
+    /// The coins the poller backfills books for: every wanted coin (the ones
+    /// the relay carries a stream for), most important first. A coin whose
+    /// grace ran out is dropped here with its cached book.
     pub(crate) fn wanted_coins(&self, now_ms: u64) -> Vec<String> {
-        let (live, expired) = {
-            let mut wanted = self.wanted();
-            let expired: Vec<String> = wanted
-                .iter()
-                .filter(|(_, at)| now_ms.saturating_sub(**at) > WANTED_BOOK_TTL_MS)
-                .map(|(coin, _)| coin.clone())
-                .collect();
-            for coin in &expired {
-                wanted.remove(coin);
-            }
-            (wanted.keys().cloned().collect::<Vec<String>>(), expired)
-        };
+        let (wanted, expired) = self.relay.sweep(now_ms);
         for coin in &expired {
             self.evict_book(coin);
         }
-        live
+        wanted
+    }
+
+    /// The coins whose context stream is permanent: every live (not delisted)
+    /// coin of every dex. A delisted coin's mark is a settlement price that
+    /// barely moves; it is refreshed by the REST sweep, or streamed while it
+    /// is wanted.
+    pub(crate) fn permanent_ctx_coins(&self) -> Vec<String> {
+        let c = self.read();
+        c.registry
+            .dexs()
+            .iter()
+            .flat_map(|d| d.meta.universe.iter())
+            .filter(|a| !a.is_delisted.unwrap_or(false))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// The streams the upstream socket should carry now, and the books whose
+    /// grace has run out (evicted from the cache).
+    pub(crate) fn desired_streams(&self, now_ms: u64) -> std::collections::BTreeSet<relay::Stream> {
+        let wanted = self.wanted_coins(now_ms);
+        let permanent = self.permanent_ctx_coins();
+        self.relay.desired(&permanent, &wanted, now_ms)
+    }
+
+    /// A relay stream is live for these coins' books: the venue pushes a book
+    /// on change only, so a quiet book is current as long as its stream is
+    /// healthy. The websocket lane calls this while the socket is delivering.
+    pub(crate) fn confirm_books<'a>(&self, coins: impl IntoIterator<Item = &'a str>, now_ms: u64) {
+        if self.stalled() {
+            return;
+        }
+        let mut c = self.write();
+        for coin in coins {
+            if c.books.contains_key(coin) {
+                c.book_live_at.insert(coin.to_string(), now_ms);
+            }
+        }
     }
 
     /// Forget a cached live book (a scripted one is the scenario's and stays).
@@ -446,6 +471,9 @@ impl MarketFeed {
         let mut c = self.write();
         c.books.remove(coin);
         c.book_at.remove(coin);
+        c.book_live_at.remove(coin);
+        drop(c);
+        self.notify();
     }
 
     /// The coin's book, fetching it from the venue once when it is not cached
@@ -536,6 +564,8 @@ impl MarketFeed {
         let mut c = self.write();
         c.registry.put_meta("", meta);
         c.meta_at = Some(now_ms);
+        drop(c);
+        self.notify();
     }
 
     /// One dex's meta (the default dex is `""`); a dex the registry does not
@@ -549,6 +579,7 @@ impl MarketFeed {
             return;
         }
         self.write().registry.put_meta(dex, meta);
+        self.notify();
     }
 
     /// The venue's dex list with every dex's meta (`perpDexs` +
@@ -571,6 +602,8 @@ impl MarketFeed {
         c.registry = registry;
         c.registry_loaded = true;
         c.meta_at = Some(now_ms);
+        drop(c);
+        self.notify();
         true
     }
 
@@ -591,10 +624,16 @@ impl MarketFeed {
         }
         let mut c = self.write();
         for (asset, ctx) in meta.universe.iter().zip(ctxs) {
+            // The socket's fresher push wins over this snapshot.
+            if Self::ws_ctx_is_newer(&c, &asset.name, now_ms) {
+                continue;
+            }
             c.ctx_at.insert(asset.name.clone(), now_ms);
             c.ctxs.insert(asset.name.clone(), ctx);
         }
         c.registry.refresh_meta(dex, meta);
+        drop(c);
+        self.notify();
     }
 
     pub(crate) fn put_spot_meta(&self, spot: crate::wire::SpotMeta) {
@@ -629,6 +668,35 @@ impl MarketFeed {
         self.read().oi_caps.get(dex).cloned()
     }
 
+    /// Whether the coin's context was updated so recently that a REST
+    /// snapshot taken now must not overwrite it (the socket's push may be
+    /// newer than the snapshot's data).
+    fn ws_ctx_is_newer(c: &Cache, coin: &str, now_ms: u64) -> bool {
+        c.ctx_at
+            .get(coin)
+            .is_some_and(|at| now_ms.saturating_sub(*at) < WS_CTX_PRIORITY_MS)
+    }
+
+    /// A context from a REST snapshot: the gap reconciliation. A coin the
+    /// socket pushed a moment ago keeps the push.
+    pub(crate) fn put_ctx_backfill(&self, coin: String, ctx: AssetCtx, now_ms: u64) {
+        if self.stalled() {
+            tracing::debug!(coin = %coin, "live ctx dropped: the feed is stalled (the staleness drill)");
+            return;
+        }
+        let mut c = self.write();
+        if Self::ws_ctx_is_newer(&c, &coin, now_ms) {
+            return;
+        }
+        c.ctx_at.insert(coin.clone(), now_ms);
+        let changed = c.ctxs.get(&coin) != Some(&ctx);
+        c.ctxs.insert(coin, ctx);
+        drop(c);
+        if changed {
+            self.notify();
+        }
+    }
+
     pub(crate) fn put_ctx(&self, coin: String, ctx: AssetCtx, now_ms: u64) {
         if self.stalled() {
             tracing::debug!(coin = %coin, "live ctx dropped: the feed is stalled (the staleness drill)");
@@ -636,7 +704,12 @@ impl MarketFeed {
         }
         let mut c = self.write();
         c.ctx_at.insert(coin.clone(), now_ms);
+        let changed = c.ctxs.get(&coin) != Some(&ctx);
         c.ctxs.insert(coin, ctx);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     pub(crate) fn put_book(&self, book: L2Book, now_ms: u64) {
@@ -662,7 +735,16 @@ impl MarketFeed {
         }
         let mut c = self.write();
         c.book_at.insert(book.coin.clone(), now_ms);
+        c.book_live_at.insert(book.coin.clone(), now_ms);
+        let changed = c
+            .books
+            .get(&book.coin)
+            .is_none_or(|old| old.levels != book.levels);
         c.books.insert(book.coin.clone(), book);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     /// Prune the coin's consumptions against the base it will serve (a live
@@ -701,8 +783,13 @@ impl MarketFeed {
             return;
         }
         let mut c = self.write();
+        let changed = c.mids.get("") != Some(&mids);
         c.mids.insert(String::new(), mids);
         c.mids_at.insert(String::new(), now_ms);
+        drop(c);
+        if changed {
+            self.notify();
+        }
     }
 
     /// `allMids {dex:"ALL_DEXS"}`: every dex's coins in one answer, split by
@@ -729,9 +816,15 @@ impl MarketFeed {
                 .or_default()
                 .insert(coin, mid);
         }
+        let mut changed = false;
         for (dex, mids) in by_dex {
             c.mids_at.insert(dex.clone(), now_ms);
+            changed |= c.mids.get(&dex) != Some(&mids);
             c.mids.insert(dex, mids);
+        }
+        drop(c);
+        if changed {
+            self.notify();
         }
     }
 
@@ -741,11 +834,13 @@ impl MarketFeed {
         self.write_overrides()
             .prices
             .insert(coin.to_string(), price);
+        self.notify();
         self.persist()
     }
 
     pub fn clear_price(&self, coin: &str) -> Result<()> {
         self.write_overrides().prices.remove(coin);
+        self.notify();
         self.persist()
     }
 
@@ -762,6 +857,7 @@ impl MarketFeed {
                 }
             }
         }
+        self.notify();
         self.persist()
     }
 
@@ -771,6 +867,7 @@ impl MarketFeed {
             o.funding.remove(coin);
             o.funding_expires_ms.remove(coin);
         }
+        self.notify();
         self.persist()
     }
 
@@ -797,6 +894,7 @@ impl MarketFeed {
             }
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -818,6 +916,7 @@ impl MarketFeed {
             self.metrics.add_owned_pruned(pruned as u64);
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -830,6 +929,7 @@ impl MarketFeed {
             o.consumptions.retain(|c| c.coin != coin);
         }
         self.metrics.set_owned_levels(self.owned_levels());
+        self.notify();
         self.persist()
     }
 
@@ -838,6 +938,7 @@ impl MarketFeed {
     pub fn clear_overrides(&self) -> Result<()> {
         *self.write_overrides() = Overrides::default();
         self.metrics.set_owned_levels(0);
+        self.notify();
         self.persist()
     }
 
@@ -1090,11 +1191,12 @@ impl MarketFeed {
             .collect()
     }
 
-    /// Every coin the sim may hold a mark for: each dex's universe plus the
-    /// configured markets (a fixture feed has markets and no registry).
+    /// Every coin the sim may hold a mark for: each dex's universe plus any
+    /// coin a context has landed for (a fixture feed has contexts and no
+    /// registry).
     pub(crate) fn all_coins(&self) -> Vec<String> {
-        let mut coins: Vec<String> = self.markets.clone();
         let c = self.read();
+        let mut coins: Vec<String> = c.ctxs.keys().cloned().collect();
         for dex in c.registry.dexs() {
             coins.extend(dex.meta.universe.iter().map(|a| a.name.clone()));
         }
@@ -1201,6 +1303,23 @@ impl MarketFeed {
         let overrides = self.read_overrides().clone();
         let c = self.read();
         let mut mids = c.mids.get(dex).cloned().unwrap_or_default();
+        // The context stream carries each coin's mid (`midPx`) about once a
+        // second, far fresher than the `allMids` snapshot for a builder dex
+        // (the venue's socket never pushes those). A context newer than the
+        // dex's mids snapshot wins for its coin.
+        let snapshot_at = c.mids_at.get(dex).copied().unwrap_or(0);
+        if let Some(info) = c.registry.dex(dex) {
+            for asset in &info.meta.universe {
+                let fresher = c
+                    .ctx_at
+                    .get(&asset.name)
+                    .is_some_and(|at| *at > snapshot_at);
+                if let (true, Some(mid)) = (fresher, c.ctxs.get(&asset.name).and_then(|x| x.mid_px))
+                {
+                    mids.insert(asset.name.clone(), mid);
+                }
+            }
+        }
         for (coin, p) in &overrides.prices {
             if dex_of_coin(coin) == dex {
                 mids.insert(coin.clone(), p.mark);
@@ -1227,14 +1346,112 @@ impl MarketFeed {
     }
 
     /// Publish the staleness gauges + budget use (the poller calls this per
-    /// pass; the metrics endpoint renders the rest).
+    /// pass; the metrics endpoint renders the rest). One staleness series per
+    /// live coin that has a context.
     pub fn publish_metrics(&self, now_ms: u64) {
         self.metrics.set_budget_used(self.budget.used());
-        for coin in &self.markets {
-            if let Some(stale) = self.stale_ms(coin, now_ms) {
-                self.metrics.set_stale(coin, stale);
+        let stale: Vec<(String, u64)> = {
+            let c = self.read();
+            c.registry
+                .dexs()
+                .iter()
+                .flat_map(|d| d.meta.universe.iter())
+                .filter(|a| !a.is_delisted.unwrap_or(false))
+                .filter_map(|a| {
+                    let at = c.ctx_at.get(&a.name)?;
+                    Some((a.name.clone(), now_ms.saturating_sub(*at)))
+                })
+                .collect()
+        };
+        self.metrics.set_stale_all(stale);
+    }
+
+    /// Whether the socket keeps `dex`'s contexts fresh: every live (not
+    /// delisted) coin of the dex has one younger than `max_ms`. A dex with no
+    /// live coin, or one not in the registry, is not carried.
+    pub(crate) fn dex_ctxs_fresh(&self, dex: &str, now_ms: u64, max_ms: u64) -> bool {
+        let c = self.read();
+        let Some(info) = c.registry.dex(dex) else {
+            return false;
+        };
+        let mut any = false;
+        for asset in &info.meta.universe {
+            // A delisted coin streams nothing, so its (static) context only
+            // ever comes from the REST read: until one landed, the dex is not
+            // carried (`metaAndAssetCtxs` serves the whole universe, so a
+            // dex missing a delisted coin's row would stay unserved forever).
+            if asset.is_delisted.unwrap_or(false) {
+                if !c.ctxs.contains_key(&asset.name) {
+                    return false;
+                }
+                continue;
+            }
+            any = true;
+            if !c
+                .ctx_at
+                .get(&asset.name)
+                .is_some_and(|at| now_ms.saturating_sub(*at) <= max_ms)
+            {
+                return false;
             }
         }
+        any
+    }
+
+    /// The coin-count fact of the heartbeat line: live coins with a context
+    /// fresher than `max_ms`, and live coins in all.
+    pub(crate) fn ctx_freshness(&self, now_ms: u64, max_ms: u64) -> (usize, usize) {
+        let c = self.read();
+        let mut fresh = 0usize;
+        let mut total = 0usize;
+        for asset in c
+            .registry
+            .dexs()
+            .iter()
+            .flat_map(|d| d.meta.universe.iter())
+            .filter(|a| !a.is_delisted.unwrap_or(false))
+        {
+            total += 1;
+            if c.ctx_at
+                .get(&asset.name)
+                .is_some_and(|at| now_ms.saturating_sub(*at) <= max_ms)
+            {
+                fresh += 1;
+            }
+        }
+        (fresh, total)
+    }
+
+    /// Whether the default dex's data is fresh: the contexts of its largest
+    /// coins (by `dayNtlVlm`) are all newer than `max_ms`. A fixture or boot
+    /// state with no contexts is not fresh. Built for readiness: it does not
+    /// depend on any one coin, and it never looks at a builder dex.
+    pub(crate) fn default_dex_fresh(&self, now_ms: u64, max_ms: u64) -> bool {
+        const LARGEST: usize = 3;
+        let c = self.read();
+        let Some(info) = c.registry.dex("") else {
+            return false;
+        };
+        let mut by_volume: Vec<(&str, Decimal)> = info
+            .meta
+            .universe
+            .iter()
+            .filter(|a| !a.is_delisted.unwrap_or(false))
+            .filter_map(|a| {
+                c.ctxs
+                    .get(&a.name)
+                    .map(|ctx| (a.name.as_str(), ctx.day_ntl_vlm))
+            })
+            .collect();
+        if by_volume.is_empty() {
+            return false;
+        }
+        by_volume.sort_by_key(|a| std::cmp::Reverse(a.1));
+        by_volume.iter().take(LARGEST).all(|(coin, _)| {
+            c.ctx_at
+                .get(*coin)
+                .is_some_and(|at| now_ms.saturating_sub(*at) <= max_ms)
+        })
     }
 
     fn persist(&self) -> Result<()> {
@@ -1315,7 +1532,7 @@ pub(crate) mod tests {
     /// fallback otherwise (the order lane's rule, named once).
     #[test]
     fn mark_or_answers_the_mark_then_the_fallback() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         assert_eq!(feed.mark_or("BTC", Decimal::from(42)), Decimal::from(42));
         feed.own_price(
             "BTC",
@@ -1330,7 +1547,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_consumption_with_an_invalid_side_is_pruned_not_clamped() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         let book = L2Book {
             coin: "BTC".into(),
             time: 1,
@@ -1360,7 +1577,7 @@ pub(crate) mod tests {
 
     #[test]
     fn live_updates_leave_a_scripted_books_consumptions_alone() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         let scripted = |px: &str| L2Book {
             coin: "BTC".into(),
             time: 1,
@@ -1401,7 +1618,7 @@ pub(crate) mod tests {
 
     #[test]
     fn overrides_compose_over_the_cache() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1_000);
         assert_eq!(feed.mark("BTC"), Some(Decimal::from(100)));
         assert_eq!(feed.oracle("BTC"), Some(Decimal::from(101)));
@@ -1426,7 +1643,7 @@ pub(crate) mod tests {
 
     #[test]
     fn scripted_book_wins_and_is_stamped_now() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         let book = |px: &str| L2Book {
             coin: "BTC".into(),
             time: 1,
@@ -1465,7 +1682,7 @@ pub(crate) mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one rendering/transition table: splitting it would hide the field-to-line mapping
     fn a_stall_drops_live_updates_and_book_freshness_is_live_only() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         let now = crate::now_ms();
         let book = |px: &str| L2Book {
             coin: "BTC".into(),
@@ -1534,7 +1751,7 @@ pub(crate) mod tests {
 
     #[test]
     fn staleness_tracks_ctx_updates() {
-        let feed = MarketFeed::memory(vec!["BTC".into(), "ETH".into()]);
+        let feed = MarketFeed::memory();
         assert_eq!(feed.stale_ms("BTC", 10_000), None);
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 8_000);
         assert_eq!(feed.stale_ms("BTC", 10_000), Some(2_000));
@@ -1547,7 +1764,7 @@ pub(crate) mod tests {
     /// expired its proof gate. The two bits must stay separate.
     #[test]
     fn funding_ownership_does_not_own_the_mark() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         feed.put_meta(
             crate::wire::Meta {
                 universe: vec![crate::wire::AssetInfo {
@@ -1589,7 +1806,7 @@ pub(crate) mod tests {
     /// ownership bit clears, without a control write.
     #[test]
     fn an_expired_funding_override_is_inert() {
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1_000);
         feed.own_funding("BTC", Decimal::new(5, 2), Some(1_000))
             .unwrap();
@@ -1635,7 +1852,7 @@ pub(crate) mod tests {
     /// previous registry stays).
     #[test]
     fn the_perp_dexs_registry_lands_aligned_or_not_at_all() {
-        let feed = MarketFeed::memory(vec![]);
+        let feed = MarketFeed::memory();
         let metas = vec![
             crate::sim::meta_of(&[("BTC", 40)]),
             crate::sim::meta_of(&[("xyz:TSLA", 10)]),
@@ -1730,7 +1947,7 @@ pub(crate) mod tests {
     /// "nothing capped".
     #[test]
     fn open_interest_caps_are_per_dex() {
-        let feed = MarketFeed::memory(vec![]);
+        let feed = MarketFeed::memory();
         assert_eq!(feed.open_interest_caps_of("xyz"), None);
         feed.put_oi_caps_of("xyz", vec!["xyz:TSLA".into()]);
         feed.put_oi_caps(vec!["BTC".into()]);
@@ -1742,25 +1959,24 @@ pub(crate) mod tests {
         assert_eq!(feed.open_interest_caps_of("flx"), None);
     }
 
-    /// The wanted set: a coin some dex lists is polled from the moment it is
-    /// wanted until it has idled past the TTL, then dropped with its cached
-    /// book; a configured market is always polled (never listed here), a coin
+    /// The wanted set: every coin some dex lists (default or builder, no coin
+    /// singled out) is wanted from the moment it is asked for until it has
+    /// idled past the grace window, then dropped with its cached book; a coin
     /// no dex lists is never wanted.
     #[test]
     fn a_wanted_book_idles_out_with_its_cache() {
-        let feed = MarketFeed::memory(vec!["BTC".to_string()]);
+        let feed = MarketFeed::memory();
         feed.put_meta(crate::sim::meta_of(&[("BTC", 40), ("SOL", 20)]), 1);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), 1);
-        assert!(
-            feed.want_book("BTC"),
-            "a configured market is always polled"
-        );
+        assert!(feed.want_book("BTC"), "a default coin is a market");
         assert!(feed.want_book("SOL"));
-        assert!(feed.want_book("xyz:TSLA"));
+        assert!(feed.want_book("xyz:TSLA"), "so is a builder coin");
         assert!(!feed.want_book("NOPE"), "no dex lists it");
         assert!(!feed.want_book("xyz:NOPE"), "the dex does not list it");
         let now = crate::now_ms();
-        assert_eq!(feed.wanted_coins(now), ["SOL", "xyz:TSLA"]);
+        let mut wanted = feed.wanted_coins(now);
+        wanted.sort();
+        assert_eq!(wanted, ["BTC", "SOL", "xyz:TSLA"]);
 
         let level = |px: &str| Level {
             px: px.parse().unwrap(),
@@ -1777,21 +1993,201 @@ pub(crate) mod tests {
             now,
         );
         assert!(feed.book("SOL", now).is_some());
-        // Held coins keep themselves wanted: SOL is touched a second on, TSLA
-        // is not.
+        // Held coins keep themselves wanted: SOL is touched a second on, the
+        // rest are not.
         assert!(feed.want_book_at("SOL", now + 1_000));
-        let later = now + WANTED_BOOK_TTL_MS + 1;
+        let later = now + relay::GRACE_MS + 1;
         assert_eq!(
             feed.wanted_coins(later),
             ["SOL"],
-            "the coin touched just now stays, the idle one is dropped"
+            "the coin touched just now stays, the idle ones are dropped"
         );
-        let much_later = later + 1_000 + WANTED_BOOK_TTL_MS;
+        let much_later = later + 1_000 + relay::GRACE_MS;
         assert!(feed.wanted_coins(much_later).is_empty());
         assert!(
             feed.book("SOL", much_later).is_none(),
             "an idle coin's cached book goes with it"
         );
+    }
+
+    /// A quiet book (the venue pushes on change only) is current while its
+    /// stream is confirmed: the freshness gate reads the confirmation, the
+    /// served `time` stays the last update's.
+    #[test]
+    fn a_confirmed_quiet_book_stays_fresh_without_moving_its_time() {
+        let feed = MarketFeed::memory();
+        let level = |px: &str| Level {
+            px: px.parse().unwrap(),
+            sz: Decimal::ONE,
+            n: 1,
+        };
+        feed.put_book(
+            L2Book {
+                coin: "BTC".into(),
+                time: 0,
+                levels: [vec![level("99")], vec![level("101")]],
+                spread: None,
+            },
+            1_000,
+        );
+        let window = MarketFeed::MAX_STALE_MS;
+        assert_eq!(feed.book_age("BTC", 1_000 + window, window), BookAge::Fresh);
+        assert!(matches!(
+            feed.book_age("BTC", 2_000 + window, window),
+            BookAge::Stale(_)
+        ));
+        feed.confirm_books(["BTC", "ETH"], 2_000 + window);
+        assert_eq!(
+            feed.book_age("BTC", 2_000 + window, window),
+            BookAge::Fresh,
+            "the confirmation keeps it current"
+        );
+        assert_eq!(
+            feed.book_age("ETH", 2_000 + window, window),
+            BookAge::Warming,
+            "a coin with no book is not conjured by a confirmation"
+        );
+        assert_eq!(
+            feed.book("BTC", 9_999).unwrap().time,
+            1_000,
+            "the served time is the last real update"
+        );
+    }
+
+    /// Every coin of every dex has a permanent context stream except the
+    /// delisted ones, which are streamed only while wanted; a wanted coin
+    /// also gets its book stream, a coin no dex lists gets nothing.
+    #[test]
+    fn the_desired_streams_cover_every_live_coin_and_the_wanted_books() {
+        use relay::Stream;
+        let feed = MarketFeed::memory();
+        let mut default = crate::sim::meta_of(&[("BTC", 40), ("OLD", 10)]);
+        default.universe[1].is_delisted = Some(true);
+        feed.put_meta(default, 1);
+        feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), 1);
+        let now = crate::now_ms();
+        let streams = feed.desired_streams(now);
+        assert!(streams.contains(&Stream::Ctx("BTC".into())));
+        assert!(streams.contains(&Stream::Ctx("xyz:TSLA".into())));
+        assert!(
+            !streams.contains(&Stream::Ctx("OLD".into())),
+            "a delisted coin is not streamed unasked"
+        );
+        assert!(!streams.iter().any(|s| matches!(s, Stream::Book(_))));
+
+        assert!(feed.want_book("OLD"));
+        assert!(feed.want_book("xyz:TSLA"));
+        assert!(!feed.want_book("NOPE"));
+        let lease = feed.lease_coin("BTC").expect("listed");
+        assert!(feed.lease_coin("NOPE").is_none());
+        let streams = feed.desired_streams(now);
+        for coin in ["OLD", "xyz:TSLA", "BTC"] {
+            assert!(streams.contains(&Stream::Book(coin.into())), "{coin} book");
+        }
+        assert!(
+            streams.contains(&Stream::Ctx("OLD".into())),
+            "a wanted delisted coin is streamed"
+        );
+        assert!(!streams.contains(&Stream::Book("NOPE".into())));
+        drop(lease);
+    }
+
+    /// Readiness reads the default dex's largest coins, whichever they are,
+    /// and nothing from a builder dex.
+    #[test]
+    fn default_dex_freshness_follows_the_largest_coins_not_a_fixed_list() {
+        let feed = MarketFeed::memory();
+        assert!(!feed.default_dex_fresh(10, 100), "nothing landed");
+        feed.put_meta(crate::sim::meta_of(&[("AAA", 10), ("BBB", 10)]), 1);
+        feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), 1);
+        let mut big = test_ctx("1", "1");
+        big.day_ntl_vlm = Decimal::from(1_000);
+        feed.put_ctx("AAA".into(), big, 50);
+        feed.put_ctx("BBB".into(), test_ctx("1", "1"), 5);
+        assert!(feed.default_dex_fresh(100, 100), "both inside the window");
+        assert!(
+            !feed.default_dex_fresh(150, 100),
+            "the stale small coin counts: the top three are all read"
+        );
+        // A builder coin's age never matters.
+        feed.put_ctx("xyz:TSLA".into(), test_ctx("1", "1"), 1);
+        assert!(feed.default_dex_fresh(100, 100));
+    }
+
+    /// The socket's push is not overwritten by a REST snapshot taken within
+    /// its priority window; a stale coin is backfilled; a builder dex whose
+    /// coins are all fresh is carried by the socket.
+    #[test]
+    fn a_rest_snapshot_backfills_but_never_overwrites_a_fresher_push() {
+        let feed = MarketFeed::memory();
+        feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:A", 10)]), 1);
+        feed.put_ctx("xyz:A".into(), test_ctx("5", "5"), 10_000);
+        feed.put_ctx_backfill("xyz:A".into(), test_ctx("4", "4"), 10_500);
+        assert_eq!(feed.mark("xyz:A"), Some(Decimal::from(5)), "the push wins");
+        feed.put_ctx_backfill(
+            "xyz:A".into(),
+            test_ctx("4", "4"),
+            10_000 + WS_CTX_PRIORITY_MS,
+        );
+        assert_eq!(feed.mark("xyz:A"), Some(Decimal::from(4)), "backfilled");
+        assert!(feed.dex_ctxs_fresh("xyz", 12_000, 15_000));
+        assert!(!feed.dex_ctxs_fresh("xyz", 40_000, 15_000));
+        assert!(!feed.dex_ctxs_fresh("nope", 12_000, 15_000));
+    }
+
+    /// A dex with delisted coins is carried by the socket only once the REST
+    /// read has landed the delisted coins' static contexts (the socket never
+    /// streams them): otherwise `metaAndAssetCtxs {dex}` would stay a 503.
+    #[test]
+    fn a_dex_with_delisted_coins_needs_their_rest_context_once() {
+        let feed = MarketFeed::memory();
+        let mut meta = crate::sim::meta_of(&[("xyz:A", 10), ("xyz:OLD", 10)]);
+        meta.universe[1].is_delisted = Some(true);
+        feed.put_dex_meta("xyz", meta.clone(), 1);
+        feed.put_ctx("xyz:A".into(), test_ctx("5", "5"), 10_000);
+        assert!(
+            !feed.dex_ctxs_fresh("xyz", 12_000, 15_000),
+            "the delisted coin has no context yet: the REST read is still owed"
+        );
+        feed.put_dex_ctxs(
+            "xyz",
+            meta,
+            vec![test_ctx("5", "5"), test_ctx("2", "2")],
+            11_000,
+        );
+        assert!(feed.dex_ctxs_fresh("xyz", 12_000, 15_000));
+        assert!(feed.meta_and_ctxs_of("xyz").is_some_and(|m| m.1.len() == 2));
+    }
+
+    /// `allMids` for a dex takes the context's mid when the context is newer
+    /// than the dex's mids snapshot (the builder dexes' mids are otherwise
+    /// the REST sweep's), and keeps the snapshot's spot keys.
+    #[test]
+    fn a_newer_context_mid_wins_over_the_mids_snapshot() {
+        let feed =
+            crate::sim::feed_with_dexs(&[], &[("", &[("BTC", 40)]), ("xyz", &[("xyz:A", 10)])]);
+        let mids: BTreeMap<String, Decimal> = [("BTC", "100"), ("@107", "5"), ("xyz:A", "7")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.parse().unwrap()))
+            .collect();
+        feed.put_all_dexs_mids(mids, 1_000);
+        let mut ctx = test_ctx("9", "9");
+        ctx.mid_px = Some(Decimal::from(9));
+        feed.put_ctx("xyz:A".into(), ctx.clone(), 2_000);
+        assert_eq!(feed.all_mids_of("xyz").0["xyz:A"], Decimal::from(9));
+        ctx.mid_px = Some(Decimal::from(101));
+        feed.put_ctx("BTC".into(), ctx, 2_000);
+        let default = feed.all_mids().0;
+        assert_eq!(default["BTC"], Decimal::from(101));
+        assert_eq!(default["@107"], Decimal::from(5), "spot keys stay");
+        // A snapshot newer than the context wins back.
+        feed.put_all_dexs_mids(
+            [("xyz:A".to_string(), Decimal::from(8))]
+                .into_iter()
+                .collect(),
+            3_000,
+        );
+        assert_eq!(feed.all_mids_of("xyz").0["xyz:A"], Decimal::from(8));
     }
 
     /// A venue stand-in answering `l2Book` for any coin, counting the reads.
@@ -1825,7 +2221,7 @@ pub(crate) mod tests {
     async fn ensure_book_fetches_once_and_keeps_the_coin_wanted() {
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let url = l2_server(reads.clone()).await;
-        let feed = std::sync::Arc::new(MarketFeed::memory(vec!["BTC".to_string()]));
+        let feed = std::sync::Arc::new(MarketFeed::memory());
         feed.put_meta(crate::sim::meta_of(&[("BTC", 40)]), 1);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), 1);
         // No client attached: nothing to fetch with.
@@ -1858,7 +2254,7 @@ pub(crate) mod tests {
     /// resolves (with its published id) before the registry lands.
     #[test]
     fn a_token_resolves_by_name_and_id() {
-        let feed = MarketFeed::memory(Vec::new());
+        let feed = MarketFeed::memory();
         let usdc_id = "USDC:0x6d1e7cde53ba9467b783cb7c530ce054";
         assert_eq!(feed.resolve_token("USDC"), Some((0, "USDC".to_string())));
         assert_eq!(feed.resolve_token(usdc_id), Some((0, "USDC".to_string())));

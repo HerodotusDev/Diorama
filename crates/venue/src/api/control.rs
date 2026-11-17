@@ -34,7 +34,7 @@ fn require_tracked(feed: &crate::feed::MarketFeed, coin: &str) -> Result<()> {
         return Ok(());
     }
     Err(Error::NotFound {
-        what: format!("coin `{coin}` (not in the venue's tracked markets)"),
+        what: format!("coin `{coin}` (not listed by the venue)"),
     })
 }
 
@@ -211,8 +211,8 @@ pub(crate) async fn order(
 ) -> Result<Json<OrderResponse>> {
     let address = req.address;
     let order: crate::sim::order::Order = req.into();
-    // The fill walks the coin's book: one outside the configured markets gets
-    // it on demand.
+    // The fill walks the coin's book: the relayed live one, read once from
+    // the venue when none has landed yet.
     let _ = state.feed.ensure_book(&order.coin).await;
     let fill = state.sim.order(&state.feed, address, &order)?;
     // The fill's provenance, so every fill is self-explaining: the levels it
@@ -411,6 +411,11 @@ fn move_price(
     match req.pct {
         None => {
             feed.clear_price(&req.coin)?;
+            // The move owned the whole perp market (below), so the hand-back
+            // restores all of it: a book left at the shocked price would keep
+            // serving (and liquidating against) the old level while the mark
+            // is live again.
+            feed.clear_book(&req.coin)?;
             Ok(PriceMoveResponse {
                 coin: req.coin,
                 owned: false,
@@ -896,5 +901,55 @@ mod confirm_tests {
             dry_run: false,
         };
         assert!(require_confirm(&right, "reset").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod price_move_tests {
+    use super::*;
+    use crate::wire::Level;
+
+    fn book(px: &str) -> L2Book {
+        let level = |px: &str| Level {
+            px: px.parse().unwrap(),
+            sz: Decimal::ONE,
+            n: 1,
+        };
+        L2Book {
+            coin: "BTC".into(),
+            time: 1,
+            levels: [vec![level(px)], vec![level(px)]],
+            spread: None,
+        }
+    }
+
+    /// A crash owns the mark, the oracle and the book; handing the coin back
+    /// restores all three (a book left at the shocked price kept serving, and
+    /// liquidating against, the old level while the mark was live again).
+    #[test]
+    fn the_hand_back_of_a_price_move_restores_the_live_book_too() {
+        let feed = crate::feed::MarketFeed::memory();
+        feed.put_ctx("BTC".into(), crate::wire::test_ctx("100", "100"), 1_000);
+        feed.put_book(book("100"), 1_000);
+        let moved = |pct: Option<&str>| {
+            move_price(
+                &feed,
+                PriceMoveRequest {
+                    coin: "BTC".into(),
+                    pct: pct.map(|p| p.parse().unwrap()),
+                },
+                PriceMove::Crash,
+            )
+            .unwrap()
+        };
+        assert!(moved(Some("50")).owned);
+        let px = |feed: &crate::feed::MarketFeed| {
+            feed.book("BTC", crate::now_ms()).unwrap().levels[0][0].px
+        };
+        assert_eq!(px(&feed), Decimal::from(50));
+        assert_eq!(feed.mark("BTC"), Some(Decimal::from(50)));
+        assert!(!moved(None).owned);
+        assert_eq!(feed.mark("BTC"), Some(Decimal::from(100)));
+        assert_eq!(px(&feed), Decimal::from(100), "the book is live again");
     }
 }

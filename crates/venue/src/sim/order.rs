@@ -13,7 +13,7 @@
 //! verified (the devnet has no keys — the anvil-impersonation analogue), and
 //! the depth is the served book's (the live book minus what the devnet
 //! already consumed, so a second order sees the first one's impact).
-use super::ledger::{FillRecord, Liquidity};
+use super::ledger::{FillLiquidation, FillRecord, LiquidationMethod, Liquidity};
 use super::validate::{validate_order, validate_trigger_side};
 use super::Sim;
 use crate::error::{Error, Result};
@@ -369,6 +369,27 @@ fn switch_position_mode(
     Ok(())
 }
 
+/// The venue's default for a coin the account never set a leverage on
+/// (measured on the real `activeAssetData` of accounts with no position, on
+/// every dex): cross at the asset's max leverage capped at 20x, and for an
+/// isolated-only market (`noCross`/`strictIsolated`) isolated at that value.
+pub(crate) fn default_leverage(
+    coin: &str,
+    meta: &crate::wire::Meta,
+) -> super::account::LeverageSetting {
+    /// The venue's default leverage cap for a new account's coin.
+    const DEFAULT_LEVERAGE_CAP: u32 = 20;
+    let max = super::account::max_leverage(coin, Some(meta)).unwrap_or(1);
+    super::account::LeverageSetting {
+        mode: if super::account::isolated_only(coin, Some(meta)) {
+            crate::wire::LeverageType::Isolated
+        } else {
+            crate::wire::LeverageType::Cross
+        },
+        leverage: max.clamp(1, DEFAULT_LEVERAGE_CAP),
+    }
+}
+
 fn validate_leverage(
     coin: &str,
     mode: crate::wire::LeverageType,
@@ -421,6 +442,35 @@ pub(crate) fn taker_fee() -> Decimal {
 
 pub(crate) fn maker_fee() -> Decimal {
     Decimal::new(15, 5)
+}
+
+/// The fee multiplier a builder-deployed (HIP-3) market charges over the base
+/// tier: the deployer's `deployerFeeScale` `s` makes it `1 + s` below 1 and
+/// `2 * s` from 1 up (the docs' HIP-3 fee rule, measured on real fills: scale
+/// 1.0 charges twice the base), and a market in `growthMode` pays 10% of that
+/// (the docs' 90% reduction: real xyz fills cost 0.2 of the base). The default
+/// dex has no scale and charges the base tier.
+pub(crate) fn dex_fee_multiplier(meta: Option<&crate::wire::Meta>, coin: &str) -> Decimal {
+    let Some(asset) = meta.and_then(|m| m.universe.iter().find(|a| a.name == coin)) else {
+        return Decimal::ONE;
+    };
+    let Some(scale) = asset
+        .deployer_fee_scale
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+    else {
+        return Decimal::ONE;
+    };
+    let factor = if scale < Decimal::ONE {
+        Decimal::ONE + scale
+    } else {
+        scale * Decimal::TWO
+    };
+    if asset.growth_mode.as_deref() == Some("enabled") {
+        factor * Decimal::new(1, 1)
+    } else {
+        factor
+    }
 }
 
 /// The venue's perp builder-fee cap (docs: 0.1%), in the wire's unit of
@@ -781,6 +831,7 @@ impl Sim {
     /// A liquidation's market close: the same walk as an order, but with no
     /// fee (docs: "there is no clearance fee on liquidations") and no opening
     /// probe (the venue closes regardless of the resulting margin).
+    #[allow(clippy::too_many_lines)] // the walk, the apply, the record and the settle: one close
     pub(crate) fn liquidate_position(
         &self,
         feed: &MarketFeed,
@@ -824,6 +875,11 @@ impl Sim {
         self.record_fill(
             address,
             &FillRecord {
+                liquidation: Some(FillLiquidation::new(
+                    address,
+                    feed.mark_or(coin, avg_px),
+                    LiquidationMethod::Market,
+                )),
                 facts: &facts,
                 effect,
                 oid,
@@ -915,6 +971,7 @@ impl Sim {
     /// `order` for a placer whose order carries a builder fee: the fee is
     /// charged on this take's notional with the taker fee, and credited to
     /// the builder when it is a simulated account.
+    #[allow(clippy::too_many_lines)] // one placement: validate, take, charge, credit
     fn order_with_builder(&self, feed: &MarketFeed, placer: Placer, req: &Order) -> Result<Fill> {
         let address = placer.address;
         let meta = feed.meta_for_lookup(&req.coin);
@@ -924,16 +981,21 @@ impl Sim {
         // the fill is canceled (the venue's `marginCanceled`), never filled.
         let resting = self.remargin_makers(feed, req, resting)?;
         let (legs, filled, avg_px) = walk_served_book(feed, meta.as_ref(), req, &resting)?;
-        let leverage = self.leverage_for(address, &req.coin, meta.as_ref())?;
+        let setting = self.leverage_setting_for(address, &req.coin, meta.as_ref())?;
         let notional = super::account::mul(filled, avg_px, super::account::FILL_NOTIONAL)?;
         let facts = super::account::FillFacts {
             coin: req.coin.clone(),
             side: req.side(),
             size: filled,
             px: avg_px,
-            leverage,
+            leverage: setting.leverage,
+            mode: setting.mode,
             reduce: req.reduce(),
-            fee: super::account::mul(notional, taker_fee(), "taker fee")?,
+            fee: super::account::mul(
+                notional,
+                taker_fee() * dex_fee_multiplier(meta.as_ref(), &req.coin),
+                "taker fee",
+            )?,
             builder: placer.builder.map(|b| b.charge(notional)).transpose()?,
         };
         let effect = self.land_fill(feed, address, &facts, meta.as_ref())?;
@@ -942,6 +1004,7 @@ impl Sim {
         self.record_fill(
             address,
             &FillRecord {
+                liquidation: None,
                 facts: &facts,
                 effect,
                 oid,
@@ -984,7 +1047,7 @@ impl Sim {
                     consumed.push(c.clone());
                 }
                 Candidate::Maker { oid, maker, px, sz } => {
-                    let leverage = self.leverage_for(*maker, &req.coin, meta)?;
+                    let setting = self.leverage_setting_for(*maker, &req.coin, meta)?;
                     let notional = super::account::mul(*sz, *px, "maker notional")?;
                     let (reduce, cloid, builder) = self.resting_traits(*oid)?;
                     let facts = super::account::FillFacts {
@@ -992,9 +1055,14 @@ impl Sim {
                         side: req.side().flip(),
                         size: *sz,
                         px: *px,
-                        leverage,
+                        leverage: setting.leverage,
+                        mode: setting.mode,
                         reduce,
-                        fee: super::account::mul(notional, maker_fee(), "maker fee")?,
+                        fee: super::account::mul(
+                            notional,
+                            maker_fee() * dex_fee_multiplier(meta, &req.coin),
+                            "maker fee",
+                        )?,
                         builder: builder.map(|b| b.charge(notional)).transpose()?,
                     };
                     let effect = self.with_account_now(*maker, feed, |account| {
@@ -1004,6 +1072,7 @@ impl Sim {
                     self.record_fill(
                         *maker,
                         &FillRecord {
+                            liquidation: None,
                             facts: &facts,
                             effect,
                             oid: *oid,
@@ -1401,6 +1470,29 @@ impl Sim {
         })
     }
 
+    /// Every order the account has on record, open ones first by time and
+    /// the terminal history after them: `(order, status label source)` rows the
+    /// `historicalOrders` read orders newest first.
+    pub(crate) fn order_history(
+        &self,
+        account: Address,
+    ) -> Result<(Vec<RestingOrder>, Vec<TerminalOrder>)> {
+        self.with_state(|st| {
+            Ok((
+                st.resting
+                    .values()
+                    .filter(|r| r.account == account)
+                    .cloned()
+                    .collect(),
+                st.terminal
+                    .values()
+                    .filter(|t| t.order.account == account)
+                    .cloned()
+                    .collect(),
+            ))
+        })
+    }
+
     pub(crate) fn resting_by_cloid(
         &self,
         account: Address,
@@ -1513,10 +1605,10 @@ impl Sim {
     }
 
     /// The leverage a fill uses: the position's own, else the account's
-    /// per-coin setting, else the asset's max leverage (the venue's default
-    /// for a new position on a known coin). A missing live meta is warming
-    /// and an unknown asset (or a zero max leverage) is a named refusal: the
-    /// old 20× fallback fabricated a margin bound for a coin the venue never
+    /// per-coin setting, else the venue's default for a new position on a
+    /// known coin ([`default_leverage`]). A missing live meta is warming and an
+    /// unknown asset (or a zero max leverage) is a named refusal: the old 20x
+    /// fallback fabricated a margin bound for a coin the venue never
     /// described.
     pub(crate) fn leverage_for(
         &self,
@@ -1524,24 +1616,33 @@ impl Sim {
         coin: &str,
         meta: Option<&crate::wire::Meta>,
     ) -> Result<u32> {
-        if let Some(p) = self
-            .state
-            .lock()?
-            .accounts
-            .get(&address)
-            .and_then(|a| a.positions.get(coin))
-        {
-            return Ok(p.leverage_value);
+        Ok(self.leverage_setting_for(address, coin, meta)?.leverage)
+    }
+
+    /// [`Self::leverage_for`] with the margin mode: a new position opens in
+    /// the mode and at the leverage the account last set for the coin (the
+    /// venue keeps the setting beyond the position), else the venue's default.
+    pub(crate) fn leverage_setting_for(
+        &self,
+        address: Address,
+        coin: &str,
+        meta: Option<&crate::wire::Meta>,
+    ) -> Result<super::account::LeverageSetting> {
+        let state = self.state.lock()?;
+        let account = state.accounts.get(&address);
+        if let Some(p) = account.and_then(|a| a.positions.get(coin)) {
+            return Ok(super::account::LeverageSetting {
+                mode: p.leverage,
+                leverage: p.leverage_value,
+            });
         }
-        if let Some(s) = self
-            .state
-            .lock()?
-            .accounts
-            .get(&address)
-            .and_then(|a| a.leverage_settings.get(coin))
-        {
-            return Ok(s.leverage.max(1));
+        if let Some(s) = account.and_then(|a| a.leverage_settings.get(coin)) {
+            return Ok(super::account::LeverageSetting {
+                mode: s.mode,
+                leverage: s.leverage.max(1),
+            });
         }
+        drop(state);
         let meta = meta.ok_or(crate::error::Error::Warming)?;
         let asset = meta
             .asset(coin)
@@ -1553,7 +1654,7 @@ impl Sim {
                 what: format!("a positive max leverage for `{coin}` in the live meta"),
             });
         }
-        Ok(asset.max_leverage)
+        Ok(default_leverage(coin, meta))
     }
 
     /// The next order id (the venue's own numbering; monotonic across the
@@ -1770,7 +1871,7 @@ mod tests {
     /// The same feed before `perpsAtOpenInterestCap` has answered: the cap
     /// set is unknown.
     fn live_feed(book: L2Book, meta: Meta) -> MarketFeed {
-        let feed = MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = MarketFeed::memory();
         // Honest stamps: the lane's freshness gate reads the ctx age, and a
         // fixture stamped at the epoch would read as permanently stale.
         let now = crate::now_ms();
@@ -2623,6 +2724,81 @@ mod tests {
         assert!(format!("{err}").contains("open-order limit"), "{err}");
     }
 
+    /// The venue's default leverage for a coin the account never set (measured
+    /// on real `activeAssetData`): cross at min(max, 20), isolated on an
+    /// isolated-only market; a new position opens in the mode the account
+    /// last set, funding an isolated one from the balance.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one scenario
+    fn a_new_position_opens_in_the_default_or_set_margin_mode() {
+        use crate::wire::{LeverageType, MarginMode};
+        let mut meta = meta_of(&[("BIG", 40), ("SMALL", 5), ("ISO", 10)]);
+        meta.universe[2].margin_mode = Some(MarginMode::NoCross);
+        meta.universe[2].only_isolated = Some(true);
+        let d = |c: &str| default_leverage(c, &meta);
+        assert_eq!(
+            (d("BIG").mode, d("BIG").leverage),
+            (LeverageType::Cross, 20)
+        );
+        assert_eq!(
+            (d("SMALL").mode, d("SMALL").leverage),
+            (LeverageType::Cross, 5)
+        );
+        assert_eq!(
+            (d("ISO").mode, d("ISO").leverage),
+            (LeverageType::Isolated, 10)
+        );
+
+        // An order after `updateLeverage` isolated opens an isolated position
+        // whose margin left the balance (the venue's isolated open).
+        let feed = feed_with_book(
+            book("ETH", &[("100", "9")], &[("101", "9")]),
+            meta_with("ETH", 25),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        sim.set_leverage(
+            a,
+            "ETH",
+            crate::sim::account::LeverageSetting {
+                mode: LeverageType::Isolated,
+                leverage: 5,
+            },
+            feed.meta().as_ref(),
+        )
+        .unwrap();
+        sim.place(&feed, a, &ioc(Side::Buy, "2")).unwrap();
+        let account = sim.account(a).unwrap().unwrap();
+        let p = account.positions.get("ETH").unwrap();
+        assert_eq!(p.leverage, LeverageType::Isolated);
+        assert_eq!(p.leverage_value, 5);
+        // 2 at 101 = 202 notional at 5x = 40.4 isolated margin.
+        assert_eq!(p.isolated_margin, dec("40.4"));
+        assert_eq!(p.margin_used, dec("40.4"));
+        assert_eq!(
+            account.perp_balance(""),
+            dec("1000") - dec("40.4") - dec("202") * taker_fee()
+        );
+        // A second take adds its own initial margin; a full close returns it.
+        sim.place(&feed, a, &ioc(Side::Buy, "1")).unwrap();
+        let p = sim
+            .account(a)
+            .unwrap()
+            .unwrap()
+            .positions
+            .get("ETH")
+            .cloned()
+            .unwrap();
+        assert_eq!(p.isolated_margin, dec("60.6"));
+        sim.place(&feed, a, &reduce(Side::Sell, "3")).unwrap();
+        let account = sim.account(a).unwrap().unwrap();
+        assert!(account.positions.is_empty());
+        let charged = (dec("202") + dec("101") + dec("300")) * taker_fee();
+        assert_eq!(
+            account.perp_balance(""),
+            dec("1000") - charged + dec("3") * (dec("100") - dec("101"))
+        );
+    }
+
     /// The docs' margin modes and the leverage bound: a strict-isolated or
     /// no-cross asset refuses cross leverage, and leverage cannot exceed the
     /// asset's max ("any integer between 1 and the max leverage").
@@ -2755,6 +2931,17 @@ mod tests {
         meta.universe[0].margin_table_id = Some(7);
         let feed = feed_with_book(book("ETH", &[("100", "5")], &[("101", "5")]), meta);
         let (sim, a) = funded_sim(&feed, "1000");
+        // The venue's default leverage caps at 20x: the account sets the 40x.
+        sim.set_leverage(
+            a,
+            "ETH",
+            crate::sim::account::LeverageSetting {
+                mode: crate::wire::LeverageType::Cross,
+                leverage: 40,
+            },
+            feed.meta().as_ref(),
+        )
+        .unwrap();
         // 2M ETH at $100 = $200M > the 40× tier's $150M bound (and inside the
         // 10× limit cap, so the tier rule is the one that fires).
         let mut huge = ioc(Side::Buy, "2000000");
@@ -2987,6 +3174,41 @@ mod tests {
         sim.approve_builder_fee(owner, builder, 0).unwrap();
         assert_eq!(sim.max_builder_fee(owner, builder).unwrap(), Some(0));
         assert_eq!(refusal(1), "Builder fee has not been approved.");
+    }
+
+    /// A builder-deployed market's fee follows its deployer's scale (HIP-3):
+    /// scale 1.0 doubles the base tier, a growth-mode market pays a tenth of
+    /// that, a scale under 1 adds to it, and the default dex's coin (no scale)
+    /// pays the base tier. Measured on real fills: xyz growth-mode coins cost
+    /// 0.2 of the base, vntl's 2.0.
+    #[test]
+    fn a_builder_dex_fee_follows_the_deployers_scale_and_growth_mode() {
+        let mut meta = meta_of(&[("a:X", 10), ("a:G", 10), ("a:LOW", 10), ("BASE", 10)]);
+        meta.universe[0].deployer_fee_scale = Some("1.0".into());
+        meta.universe[1].deployer_fee_scale = Some("1.0".into());
+        meta.universe[1].growth_mode = Some("enabled".into());
+        meta.universe[2].deployer_fee_scale = Some("0.5".into());
+        let m = Some(&meta);
+        assert_eq!(dex_fee_multiplier(m, "a:X"), dec("2"));
+        assert_eq!(dex_fee_multiplier(m, "a:G"), dec("0.2"));
+        assert_eq!(dex_fee_multiplier(m, "a:LOW"), dec("1.5"));
+        assert_eq!(dex_fee_multiplier(m, "BASE"), dec("1"));
+        assert_eq!(dex_fee_multiplier(None, "a:X"), dec("1"));
+    }
+
+    /// The taker fee on a growth-mode builder coin is the base fee times its
+    /// multiplier, on the fill and on the account's balance alike.
+    #[test]
+    fn a_take_on_a_growth_mode_builder_coin_pays_the_scaled_fee() {
+        let mut meta = meta_with("ETH", 10);
+        meta.universe[0].deployer_fee_scale = Some("1.0".into());
+        meta.universe[0].growth_mode = Some("enabled".into());
+        let feed = feed_with_book(book("ETH", &[("100", "9")], &[("101", "9")]), meta);
+        let (sim, a) = funded_sim(&feed, "1000");
+        sim.place(&feed, a, &ioc(Side::Buy, "1")).unwrap();
+        let fee = dec("101") * taker_fee() * dec("0.2");
+        assert_eq!(balance(&sim, a), dec("1000") - fee);
+        assert_eq!(sim.user_fills(a).unwrap().remove(0).fee, fee);
     }
 
     /// An immediate take with a builder charges `notional * f / 100_000` on

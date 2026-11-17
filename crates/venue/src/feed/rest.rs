@@ -1,15 +1,17 @@
 //! The REST lane of the market plane: typed `POST /info` calls gated by the
 //! rate budget meter.
 //!
-//! The poller refreshes the cache (`metaAndAssetCtxs`, one `l2Book` per
-//! configured market, `allMids`) every `poll_interval_ms`; a book or mids the WS
-//! client updated within one interval is skipped, so the REST lane is the gap
-//! reconciliation rather than a duplicate read. Coins outside the configured
-//! markets are read the same way once something wants them (an order, a held
-//! position or resting order, an `l2Book` read or subscription): a few of the
-//! wanted set per pass, round-robin, inside the shared request budget (see
-//! `MarketFeed::want_book`). The same client serves the passthrough reads
-//! (untouched accounts are the real venue's answers).
+//! The poller refreshes the cache (`metaAndAssetCtxs`, `allMids`, the books
+//! someone wants) every `poll_interval_ms`. The WS client is the primary
+//! source (a context stream for every live coin of every dex, a book stream
+//! for every wanted coin: see `feed::relay`); a book, context or mids the
+//! socket updated recently is skipped, so the REST lane is the gap
+//! reconciliation and the meta/registry/caps refresher rather than a
+//! duplicate read. A wanted coin (an order, a held position or resting order,
+//! an `l2Book` read or subscription) whose book the socket is not keeping
+//! fresh is read here: a few per pass, round-robin, inside the shared request
+//! budget (see `MarketFeed::want_book`). The same client serves the
+//! passthrough reads (untouched accounts are the real venue's answers).
 //!
 //! Failover is the shared [`EndpointPool::execute`]: admission, cooldown,
 //! bounded retry and the attempt budget live in the common spine. This module
@@ -240,11 +242,16 @@ impl Attempt for RawAttempt<'_> {
 /// listing, not per tick. Until they have landed, every pass retries.
 const SLOW_REFRESH_MS: u64 = 60_000;
 
-/// Builder dexes whose contexts one pass refreshes (round-robin across
-/// passes). Each costs one heavy `metaAndAssetCtxs {dex}` (+ a light cap
-/// read), so two per pass keeps ten dexes inside a ~25 s sweep at a 5 s pass
-/// while the default plane's own cadence is untouched.
+/// Builder dexes one pass visits (round-robin across passes). A dex whose
+/// contexts the socket keeps fresh costs only its light cap read; one the
+/// socket does not cover costs a heavy `metaAndAssetCtxs {dex}` too, so two
+/// per pass keeps ten dexes inside a ~25 s sweep at a 5 s pass while the
+/// default plane's own cadence is untouched.
 const BUILDER_DEXES_PER_PASS: usize = 2;
+
+/// A builder dex whose live coins' contexts are all younger than this is
+/// carried by the socket: its heavy REST read is skipped.
+const DEX_CTX_FRESH_MS: u64 = 15_000;
 
 /// Wanted books (an order, a position, an `l2Book` read) one pass refreshes,
 /// round-robin across passes: each is one `l2Book`, and the wanted set can
@@ -292,9 +299,10 @@ impl Poller {
     }
 
     /// One pass: the default dex's meta+ctxs, the slow registries (spot token
-    /// registry, dex registry), the configured books, allMids, the default
-    /// dex's caps, then a staggered slice of the builder dexes; failures are
-    /// logged and counted, never fatal (the WS lane may be carrying the data).
+    /// registry, dex registry), the wanted books the socket is not keeping
+    /// fresh, allMids, the default dex's caps, then a staggered slice of the
+    /// builder dexes; failures are logged and counted, never fatal (the WS
+    /// lane may be carrying the data).
     async fn pass(&self) {
         self.meta_and_ctxs().await;
         self.spot_meta().await;
@@ -408,7 +416,8 @@ impl Poller {
                 // slot lacking a ctx is skipped, never shifts the others.
                 for (index, asset) in meta.universe.iter().enumerate() {
                     if let Some(ctx) = ctxs.get(index) {
-                        self.feed.put_ctx(asset.name.clone(), ctx.clone(), now);
+                        self.feed
+                            .put_ctx_backfill(asset.name.clone(), ctx.clone(), now);
                     }
                 }
                 self.feed.put_meta(meta, now);
@@ -434,19 +443,25 @@ impl Poller {
         }
         for _ in 0..BUILDER_DEXES_PER_PASS.min(names.len()) {
             let name = &names[self.cursor.fetch_add(1, Ordering::Relaxed) % names.len()];
-            if !self.gated_keeping(crate::feed::budget::weight::HEAVY) {
-                return;
-            }
-            let req = InfoRequest::MetaAndAssetCtxs {
-                dex: Some(name.clone()),
-            };
-            match self.api.info::<MetaAndAssetCtxs>(&req).await {
-                Ok(MetaAndAssetCtxs(meta, ctxs)) => {
-                    self.feed.put_dex_ctxs(name, meta, ctxs, crate::now_ms());
+            // The socket carries this dex's contexts: no heavy read.
+            if !self
+                .feed
+                .dex_ctxs_fresh(name, crate::now_ms(), DEX_CTX_FRESH_MS)
+            {
+                if !self.gated_keeping(crate::feed::budget::weight::HEAVY) {
+                    return;
                 }
-                Err(e) => {
-                    self.rest_fault("metaAndAssetCtxs", &e);
-                    continue;
+                let req = InfoRequest::MetaAndAssetCtxs {
+                    dex: Some(name.clone()),
+                };
+                match self.api.info::<MetaAndAssetCtxs>(&req).await {
+                    Ok(MetaAndAssetCtxs(meta, ctxs)) => {
+                        self.feed.put_dex_ctxs(name, meta, ctxs, crate::now_ms());
+                    }
+                    Err(e) => {
+                        self.rest_fault("metaAndAssetCtxs", &e);
+                        continue;
+                    }
                 }
             }
             if !self.gated_keeping(crate::feed::budget::weight::LIGHT) {
@@ -465,18 +480,13 @@ impl Poller {
         }
     }
 
-    /// The books: every configured market, then a round-robin slice of the
-    /// wanted set (coins an order, a position, a resting order or an `l2Book`
-    /// read named; the optional reads keep the reserve free like the builder
-    /// dexes' do).
+    /// The wanted books (coins an order, a position, a resting order, an
+    /// `l2Book` read or a downstream subscription named) the socket is not
+    /// keeping fresh: a round-robin slice per pass. The reads keep the reserve
+    /// free like the builder dexes' do.
     async fn books(&self) {
         let now = crate::now_ms();
         let window = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
-        for coin in &self.feed.markets {
-            if !self.refresh_book(coin, now, window, false).await {
-                return;
-            }
-        }
         let wanted = self.feed.wanted_coins(now);
         if wanted.is_empty() {
             return;

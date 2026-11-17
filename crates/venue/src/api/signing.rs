@@ -206,8 +206,9 @@ fn user_signed_digest(spec: &UserSigned, action: &str) -> Result<B256, String> {
         .get("signatureChainId")
         .and_then(serde_json::Value::as_str)
         .ok_or("venue-sim: a user-signed action carries its `signatureChainId`")?;
+    // A chain id past 64 bits recovers some other address, as on the venue.
     let chain_id = u64::from_str_radix(chain.strip_prefix("0x").unwrap_or(chain), 16)
-        .map_err(|e| format!("venue-sim: `signatureChainId` {chain} is not hex: {e}"))?;
+        .map_err(|_| UNRECOVERABLE.to_string())?;
     let signature = spec
         .fields
         .iter()

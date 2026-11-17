@@ -155,7 +155,7 @@ fn world() -> (Arc<ApiState>, Address) {
 /// [`world`] with the venue's public API at `venue` (the pass-through target).
 #[allow(clippy::too_many_lines)] // one fixture world: dexes, funding, positions, resting orders, fills, funding hour
 fn world_on(venue: &str) -> (Arc<ApiState>, Address) {
-    let feed = Arc::new(MarketFeed::memory(vec!["ETH".to_string()]));
+    let feed = Arc::new(MarketFeed::memory());
     let now = crate::now_ms();
     feed.put_meta(crate::sim::meta_with_table("ETH", 10), now);
     feed.put_dex_meta("xyz", builder_meta("xyz:TSLA", 30, 0), now);
@@ -418,6 +418,77 @@ async fn info_responses_have_the_venues_shapes() {
         .all(Value::is_string));
 }
 
+/// Every decimal the venue prints carries a point and no trailing zero: a whole
+/// number is `"64891.0"` (never `"64891"`), a zero `"0.0"`, a fraction trimmed
+/// (`"0.1"`, never `"0.10"`). Measured on every real info answer and websocket
+/// channel (compressed frames included): none holds a bare integer string, so a
+/// client that compares or parses the text sees the same on the sim.
+fn decimal_text_problems(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            let numeric = !text.is_empty()
+                && text
+                    .trim_start_matches('-')
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.')
+                && text
+                    .trim_start_matches('-')
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
+            if numeric {
+                let trimmed = text.trim_end_matches('0');
+                if !text.contains('.')
+                    || (trimmed.ends_with('.') && !text.ends_with(".0"))
+                    || (text.ends_with('0') && !text.ends_with(".0"))
+                {
+                    out.push(format!("{path} = {text}"));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                decimal_text_problems(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                decimal_text_problems(v, &format!("{path}.{k}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn decimals_are_printed_the_venues_way() {
+    let (state, user) = world();
+    let bodies = [
+        serde_json::json!({"type": "clearinghouseState", "user": user}),
+        serde_json::json!({"type": "clearinghouseState", "user": user, "dex": "xyz"}),
+        serde_json::json!({"type": "spotClearinghouseState", "user": user}),
+        serde_json::json!({"type": "openOrders", "user": user}),
+        serde_json::json!({"type": "frontendOpenOrders", "user": user, "dex": "ALL_DEXS"}),
+        serde_json::json!({"type": "activeAssetData", "user": user, "coin": "ETH"}),
+        serde_json::json!({"type": "activeAssetData", "user": user, "coin": "xyz:TSLA"}),
+        serde_json::json!({"type": "l2Book", "coin": "ETH"}),
+        serde_json::json!({"type": "meta", "dex": "xyz"}),
+        serde_json::json!({"type": "metaAndAssetCtxs"}),
+        serde_json::json!({"type": "metaAndAssetCtxs", "dex": "xyz"}),
+        serde_json::json!({"type": "allMids", "dex": "ALL_DEXS"}),
+        serde_json::json!({"type": "marginTable", "id": 30}),
+        serde_json::json!({"type": "userFills", "user": user}),
+        serde_json::json!({"type": "userFunding", "user": user, "startTime": 0}),
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": 0}),
+    ];
+    let mut problems = Vec::new();
+    for body in bodies {
+        let name = body["type"].as_str().unwrap().to_string();
+        decimal_text_problems(&info_json(&state, body).await, &name, &mut problems);
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// The sim's own per-dex figures: a builder dex's clearinghouse holds its
 /// position and none of the others', an untouched dex is empty, the resting
 /// orders split by dex (`ALL_DEXS` lists them all, newest first), and a table
@@ -486,7 +557,7 @@ async fn the_per_dex_reads_hold_only_that_dexs_figures() {
     )
     .await;
     assert_eq!(data["coin"], "xyz:TSLA");
-    assert_eq!(data["markPx"], "101");
+    assert_eq!(data["markPx"], "101.0");
 }
 
 /// What the venue answers for an unlisted dex, for `ALL_DEXS` where the type
@@ -591,11 +662,10 @@ async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
         serde_json::json!({"type": "tokenDetails"}),
         serde_json::json!({"type": "vaultDetails"}),
         serde_json::json!({"type": "borrowLendReserveState"}),
-        // Account-specific types the sim does not model stay unrouted.
-        serde_json::json!({"type": "userRateLimit", "user": user}),
-        serde_json::json!({"type": "portfolio", "user": user}),
-        serde_json::json!({"type": "userFees", "user": user}),
-        serde_json::json!({"type": "historicalOrders", "user": user}),
+        // A type the venue does not know, and a ledger read without its user.
+        serde_json::json!({"type": "noSuchInfoType", "user": user}),
+        serde_json::json!({"type": "userFees"}),
+        serde_json::json!({"type": "userFillsByTime", "user": user}),
     ] {
         let (status, body) = info_raw(&state, request.clone()).await;
         assert_eq!(status, 422, "{request}");
@@ -604,6 +674,93 @@ async fn unmodelled_market_types_pass_through_and_unrouted_ones_are_422() {
             "Failed to deserialize the JSON body into the target type"
         );
     }
+}
+
+/// The account-scoped types the venue serves and the sim has no typed route
+/// for: a simulated account answers from its own ledger (`userFillsByTime`,
+/// `historicalOrders`) or like a fresh venue account; any other user is the
+/// venue's verbatim answer.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one table of account types
+async fn account_types_without_a_typed_route_answer_for_a_simulated_account() {
+    let venue = mock_venue().await;
+    let (state, user) = world_on(&venue);
+    // userFillsByTime: the account's fills from `startTime`, oldest first.
+    let all = info_json(
+        &state,
+        serde_json::json!({"type": "userFills", "user": user}),
+    )
+    .await;
+    let all = all.as_array().unwrap();
+    assert!(all.len() >= 2);
+    let by_time = info_json(
+        &state,
+        serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": 0}),
+    )
+    .await;
+    let by_time = by_time.as_array().unwrap();
+    assert_eq!(by_time.len(), all.len());
+    let times: Vec<u64> = by_time
+        .iter()
+        .map(|f| f["time"].as_u64().unwrap())
+        .collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "oldest first");
+    let after = times[times.len() - 1] + 1;
+    let none = info_json(
+        &state,
+        serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": after}),
+    )
+    .await;
+    assert_eq!(none, serde_json::json!([]));
+    // historicalOrders: the resting orders, as `open`, in the orderStatus row shape.
+    let history = info_json(
+        &state,
+        serde_json::json!({"type": "historicalOrders", "user": user}),
+    )
+    .await;
+    let rows = history.as_array().unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        for key in ["order", "status", "statusTimestamp"] {
+            assert!(row.get(key).is_some(), "{key}");
+        }
+        assert_eq!(row["order"]["tif"], "Gtc");
+    }
+    assert!(rows.iter().all(|r| r["status"] == "open"));
+    // A fresh account: the static answers, and the venue asked about a neutral account.
+    for (kind, expected) in [
+        ("userRole", serde_json::json!({"role": "user"})),
+        ("subAccounts", Value::Null),
+        ("isVip", serde_json::json!(false)),
+        ("userVaultEquities", serde_json::json!([])),
+        ("extraAgents", serde_json::json!([])),
+    ] {
+        let got = info_json(&state, serde_json::json!({"type": kind, "user": user})).await;
+        assert_eq!(got, expected, "{kind}");
+    }
+    let fees = info_json(
+        &state,
+        serde_json::json!({"type": "userFees", "user": user}),
+    )
+    .await;
+    assert_eq!(
+        fees["forwarded"]["user"],
+        "0x0000000000000000000000000000000000000001"
+    );
+    // Another user is the venue's, verbatim.
+    let stranger = "0x00000000000000000000000000000000000000bb";
+    let theirs = info_json(
+        &state,
+        serde_json::json!({"type": "userFees", "user": stranger}),
+    )
+    .await;
+    assert_eq!(theirs["forwarded"]["user"], stranger);
+    let market = info_json(
+        &state,
+        serde_json::json!({"type": "recentTrades", "coin": "BTC"}),
+    )
+    .await;
+    assert_eq!(market["forwarded"]["coin"], "BTC");
 }
 
 /// The venue's order of the two ledgers: fills newest first, funding oldest
@@ -915,6 +1072,61 @@ fn the_funding_stream_serves_flat_rows() {
     assert!(pushes(&mut live, &state, crate::now_ms()).is_empty());
 }
 
+/// `bbo` pushes the best bid and ask once, then only when one changes;
+/// `orderUpdates` and `userEvents` start quiet and report what happens after.
+#[test]
+fn bbo_order_updates_and_user_events_push_changes_only() {
+    let (state, user) = world();
+    let (_, first, mut bbo) = subscribe(&state, &serde_json::json!({"type": "bbo", "coin": "ETH"}));
+    assert_eq!(first[0]["channel"], "bbo");
+    assert_eq!(first[0]["data"]["coin"], "ETH");
+    assert_eq!(first[0]["data"]["bbo"].as_array().unwrap().len(), 2);
+    assert!(
+        pushes(&mut bbo, &state, crate::now_ms()).is_empty(),
+        "an unchanged book is silent"
+    );
+
+    let (_, first, mut updates) = subscribe(
+        &state,
+        &serde_json::json!({"type": "orderUpdates", "user": user}),
+    );
+    assert!(first.is_empty(), "the channel carries changes only");
+    let (_, first, mut events) = subscribe(
+        &state,
+        &serde_json::json!({"type": "userEvents", "user": user}),
+    );
+    assert!(first.is_empty(), "no snapshot on userEvents");
+
+    state
+        .sim
+        .order(
+            &state.feed,
+            user,
+            &Order {
+                coin: "ETH".into(),
+                is_buy: true,
+                size: "1".parse().unwrap(),
+                limit_px: None,
+                tif: Tif::Ioc,
+                reduce_only: false,
+                cloid: None,
+                trigger: None,
+            },
+        )
+        .unwrap();
+    let frames = pushes(&mut events, &state, crate::now_ms());
+    assert_eq!(frames.len(), 1);
+    let frame: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(frame["channel"], "user");
+    assert_eq!(frame["data"]["fills"].as_array().unwrap().len(), 1);
+    assert!(
+        pushes(&mut events, &state, crate::now_ms()).is_empty(),
+        "each fill is pushed once"
+    );
+    // An IOC that filled in full never rested: no order update.
+    assert!(pushes(&mut updates, &state, crate::now_ms()).is_empty());
+}
+
 /// The venue's quirks and errors on the subscriptions the dexes added,
 /// replayed from the capture: how many frames come back at all (a named
 /// dex's `allMids` is acked and then silent, an unlisted dex on
@@ -1102,4 +1314,151 @@ fn fast_asset_ctxs_is_one_map_over_every_dex() {
         .collect();
     keys.sort_unstable();
     assert_eq!(keys, ["ETH", "flx:TSLA", "xyz:TSLA"]);
+}
+
+/// The transfer ledger: every kind of row the sim writes has the shape of a
+/// real `userNonFundingLedgerUpdates` row (`send` and `spotTransfer` with their
+/// `fee`, `nativeTokenFee` and `feeToken`, `accountClassTransfer`), the window
+/// applies, an address the sim never held is the venue's own answer, and
+/// `preTransferCheck` has the real shape: `fee` is the activation the source
+/// still owes (Circle's first-outbound rule), `userExists` the destination's
+/// standing.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one script: four transfers, then every read of their rows
+async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
+    use crate::sim::fees::RowKind;
+    use crate::sim::transfer::{AssetSend, Wallet};
+    use crate::sim::{ClassTransfer, Direction, TokenRef};
+    let (state, user) = world();
+    let real = real();
+    let usdc = TokenRef {
+        index: 0,
+        coin: "USDC",
+    };
+    // `user` funds `other` (a new account), which then sends on (its first
+    // outbound transfer pays the activation) and moves money between its own
+    // wallets.
+    let (other, third) = (Address::repeat_byte(0xbb), Address::repeat_byte(0xcc));
+    state
+        .sim
+        .credit_spot(user, usdc, Decimal::from(100))
+        .unwrap();
+    let send = AssetSend {
+        from: user,
+        to: other,
+        token: usdc,
+        amount: Decimal::from(10),
+        source: Wallet::Spot,
+        destination: Wallet::Spot,
+        kind: RowKind::Send,
+    };
+    state.sim.send_asset(&send, &state.feed).unwrap();
+    let before = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": third, "source": other}),
+    )
+    .await;
+    state
+        .sim
+        .spot_send(
+            (other, third),
+            usdc,
+            Decimal::from(5),
+            (RowKind::SpotTransfer, &state.feed),
+        )
+        .unwrap();
+    state
+        .sim
+        .usd_class_transfer(
+            other,
+            &ClassTransfer {
+                token: usdc,
+                amount: Decimal::ONE,
+                direction: Direction::ToPerp,
+            },
+            &state.feed,
+        )
+        .unwrap();
+    state
+        .sim
+        .credit_evm_deposit(
+            Address::repeat_byte(0xdd),
+            usdc,
+            Decimal::from(3),
+            &state.feed,
+        )
+        .unwrap();
+
+    let rows = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": other, "startTime": 0}),
+    )
+    .await;
+    let rows = rows.as_array().unwrap();
+    let kinds: Vec<&str> = rows
+        .iter()
+        .map(|r| r["delta"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["send", "spotTransfer", "accountClassTransfer"]);
+    for row in rows {
+        let sample = real["info"]["userNonFundingLedgerUpdates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["delta"]["type"] == row["delta"]["type"])
+            .expect("a real sample of the kind");
+        same_shape(sample, row, "userNonFundingLedgerUpdates");
+    }
+    assert_eq!(rows[0]["delta"]["fee"], "0.0", "the receipt carries no fee");
+    assert_eq!(
+        rows[1]["delta"]["fee"], "1.0",
+        "the first outbound send does"
+    );
+    assert_eq!(rows[1]["delta"]["feeToken"], "USDC");
+    // The deposit's row, on the recipient's side, is a system-address transfer.
+    let deposit = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": Address::repeat_byte(0xdd)}),
+    )
+    .await;
+    assert_eq!(
+        deposit[0]["delta"]["user"],
+        "0x2000000000000000000000000000000000000000"
+    );
+    // The window: nothing after the last row.
+    let later = rows.last().unwrap()["time"].as_u64().unwrap() + 1;
+    let none = info_json(
+        &state,
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": other, "startTime": later}),
+    )
+    .await;
+    assert_eq!(none, serde_json::json!([]));
+
+    // preTransferCheck: `user` is the destination, `source` the sender.
+    // `other` owed the activation before its send, `user` never does.
+    assert_eq!(
+        before,
+        serde_json::json!({"isSanctioned": false, "userExists": false, "fee": "1.0", "userHasSentTx": false})
+    );
+    same_shape(
+        &real["info"]["preTransferCheck"],
+        &before,
+        "preTransferCheck",
+    );
+    let after = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": third, "source": other}),
+    )
+    .await;
+    assert_eq!(after["fee"], "0.0", "the debt was paid");
+    assert_eq!(after["userExists"], true);
+    let funded = info_json(
+        &state,
+        serde_json::json!({"type": "preTransferCheck", "user": Address::repeat_byte(0xee), "source": user}),
+    )
+    .await;
+    assert_eq!(
+        (&funded["userExists"], &funded["fee"]),
+        (&false.into(), &"0.0".into())
+    );
 }

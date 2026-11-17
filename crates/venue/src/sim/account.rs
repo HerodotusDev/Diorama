@@ -460,6 +460,11 @@ struct PositionTotals {
     cross_margin: Decimal,
     cross_maintenance: Decimal,
     isolated_margin: Decimal,
+    /// The isolated positions' own equity, `margin + unrealized pnl`: what the
+    /// venue serves as an isolated position's `marginUsed` and carves out of
+    /// the cross summary (the cross figure is the free cash alone: an isolated
+    /// position's pnl is its own).
+    isolated_equity: Decimal,
     /// The isolated positions' signed value (`Σ sign(szi)·positionValue`):
     /// the cross summary's raw balance subtracts the margins and adds this
     /// back (measured live).
@@ -473,7 +478,17 @@ impl PositionTotals {
             Direction::Short => -facts.value,
         };
         self.notional = add(self.notional, facts.value, "total notional")?;
-        self.margin = add(self.margin, p.margin_used, "total margin")?;
+        // An isolated position's `marginUsed` is its equity (margin plus
+        // unrealized pnl), measured live: `rawUsd + positionValue` of the row.
+        let served_margin = match p.leverage {
+            LeverageType::Cross => p.margin_used,
+            LeverageType::Isolated => add(
+                p.margin_used,
+                p.unrealized_pnl(facts.mark)?,
+                "isolated equity",
+            )?,
+        };
+        self.margin = add(self.margin, served_margin, "total margin")?;
         self.signed_value = add(self.signed_value, signed, "signed value")?;
         self.cost_basis = add(self.cost_basis, p.cost_basis()?, COST_BASIS)?;
         if p.leverage == LeverageType::Cross {
@@ -486,6 +501,7 @@ impl PositionTotals {
             )?;
         } else {
             self.isolated_margin = add(self.isolated_margin, p.margin_used, ISOLATED_MARGIN)?;
+            self.isolated_equity = add(self.isolated_equity, served_margin, ISOLATED_MARGIN)?;
             self.isolated_signed = add(self.isolated_signed, signed, "isolated signed value")?;
         }
         Ok(())
@@ -503,12 +519,11 @@ fn position_row(
     // A position with no margin reads ROE 0 (the ratio's absent-denominator
     // fallback; `ratio_or` is where a raw `/` is allowed).
     let roe = ratio_or(u_pnl, p.margin_used, Decimal::ZERO);
+    // The cross row's price needs the leg's equity and every other cross
+    // position's maintenance, which only the whole walk knows: `view` fills it
+    // once the totals are in (`fill_cross_liquidation_px`).
     let liquidation_px = match p.leverage {
-        LeverageType::Isolated => Some(liquidation_px(
-            p,
-            facts.mark,
-            maintenance_rate(coin, facts.value, meta)?,
-        )?),
+        LeverageType::Isolated => isolated_liquidation_px(coin, p, facts, meta)?,
         LeverageType::Cross => None,
     };
     Ok(AssetPosition {
@@ -521,15 +536,27 @@ fn position_row(
                 value: p.leverage_value,
                 // The isolated carve-out only: the venue omits it on a cross
                 // position.
-                raw_usd: (p.leverage == LeverageType::Isolated)
-                    .then(|| p.margin_used - facts.value),
+                // `marginUsed` less the position's signed value: a short's raw
+                // balance is positive (it holds the proceeds), measured live.
+                raw_usd: (p.leverage == LeverageType::Isolated).then(|| {
+                    let signed = match p.direction() {
+                        Direction::Long => facts.value,
+                        Direction::Short => -facts.value,
+                    };
+                    p.margin_used + u_pnl - signed
+                }),
             },
             liquidation_px,
-            margin_used: p.margin_used,
+            margin_used: match p.leverage {
+                LeverageType::Cross => p.margin_used,
+                LeverageType::Isolated => p.margin_used + u_pnl,
+            },
             // The live bound for a tracked coin; for a coin the meta does not
             // carry (a seeded position outside the markets) the position's own
             // leverage — a value we know, never a fabricated bound.
-            max_leverage: max_leverage(coin, meta).unwrap_or(p.leverage_value),
+            max_leverage: maintenance_tiers(coin, meta)
+                .map(|tiers| tier_at(&tiers, facts.value).max_leverage)
+                .unwrap_or(p.leverage_value),
             position_value: facts.value,
             return_on_equity: roe,
             szi: p.szi,
@@ -585,8 +612,8 @@ fn assemble(
         total_raw_usd: total_raw,
         total_margin_used: totals.margin,
     };
-    let cross_account_value = account_value - totals.isolated_margin;
-    let cross_raw = total_raw - totals.isolated_margin + totals.isolated_signed;
+    let cross_account_value = account_value - totals.isolated_equity;
+    let cross_raw = total_raw - totals.isolated_equity + totals.isolated_signed;
     let cross_margin_summary = MarginSummary {
         account_value: cross_account_value,
         total_ntl_pos: totals.cross_notional,
@@ -656,7 +683,56 @@ pub(crate) fn view(account: &Account, feed: &MarketFeed, dex: &str) -> Result<Ac
         rows.push(position_row(coin, p, &facts, meta)?);
         by_coin.insert(coin.clone(), facts);
     }
-    assemble(account, dex, &totals, rows, by_coin)
+    let mut v = assemble(account, dex, &totals, rows, by_coin)?;
+    fill_cross_liquidation_px(account, feed, dex, &mut v, meta)?;
+    Ok(v)
+}
+
+/// Fill the cross rows' `liquidationPx`: the price at which the dex's cross
+/// leg falls below its maintenance requirement, every *other* cross position
+/// held at the current mark (the venue's own displayed estimate). The equity is
+/// the one the waterfall tests ([`unified_equity`]), so the served price and
+/// the liquidation trigger are the same figure by construction.
+fn fill_cross_liquidation_px(
+    account: &Account,
+    feed: &MarketFeed,
+    dex: &str,
+    v: &mut AccountView,
+    meta: Option<&crate::wire::Meta>,
+) -> Result<()> {
+    if !v
+        .asset_positions
+        .iter()
+        .any(|row| row.position.leverage.kind == LeverageType::Cross)
+    {
+        return Ok(());
+    }
+    let equity = unified_equity(account, feed, dex, v)?;
+    let cross_maintenance = v.cross_maintenance_margin_used;
+    for row in &mut v.asset_positions {
+        if row.position.leverage.kind != LeverageType::Cross {
+            continue;
+        }
+        let coin = row.position.coin.as_str();
+        let (Some(p), Some(facts)) = (account.positions.get(coin), v.facts.get(coin)) else {
+            continue;
+        };
+        let tiers = maintenance_tiers(coin, meta)?;
+        let other = sub(
+            cross_maintenance,
+            facts.maintenance,
+            "other cross maintenance",
+        )?;
+        row.position.liquidation_px = solve_liquidation_px(&LiquidationLeg {
+            tiers: &tiers,
+            equity,
+            other_maintenance: other,
+            direction: p.direction(),
+            size: p.szi.abs(),
+            mark: facts.mark,
+        })?;
+    }
+    Ok(())
 }
 
 /// The served `clearinghouseState` of one dex (fresh `time` from the caller's
@@ -980,50 +1056,120 @@ pub(crate) fn perp_transfer_bound(
     })
 }
 
-/// The maintenance-margin rate for a notional: the margin tier's
-/// `1/(2·maxLeverage)` (maintenance = ½ initial). There is no honest rate
-/// without the live meta: a missing meta is warming, a missing asset (or a
-/// zero max leverage) is a named refusal. Returning zero would understate
-/// maintenance and let the liquidation check skip a real shortfall.
-pub(crate) fn maintenance_rate(
+/// One maintenance tier of an asset (docs, margin tiers): the rate is half the
+/// initial margin rate at the tier's max leverage, and the deduction keeps the
+/// requirement continuous across tier boundaries:
+/// `maintenance = notional·rate − deduction`, with
+/// `deduction(0) = 0` and `deduction(n) = deduction(n−1) + lower_bound(n)·(rate(n) − rate(n−1))`.
+/// Measured live: an account holding a notional above the first boundary served
+/// exactly the deducted figure, not the flat higher rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MaintenanceTier {
+    pub lower_bound: Decimal,
+    /// The tier's max leverage (the served position's `maxLeverage` at a
+    /// notional in this tier: measured live, a 24M position of a 10x asset
+    /// whose second tier is 5x serves 5).
+    pub max_leverage: u32,
+    pub rate: Decimal,
+    pub deduction: Decimal,
+}
+
+/// The asset's maintenance tiers, ascending by lower bound. There is no honest
+/// requirement without the live meta: a missing meta is warming, a missing
+/// asset (or a zero max leverage) is a named refusal. Returning zero would
+/// understate maintenance and let the liquidation check skip a real shortfall.
+pub(crate) fn maintenance_tiers(
     coin: &str,
-    notional: Decimal,
     meta: Option<&crate::wire::Meta>,
-) -> Result<Decimal> {
+) -> Result<Vec<MaintenanceTier>> {
     let meta = meta.ok_or(crate::error::Error::Warming)?;
     let asset = meta
         .asset(coin)
         .ok_or_else(|| crate::error::Error::NotFound {
             what: format!("asset `{coin}` in the live meta (maintenance rate)"),
         })?;
-    let max_leverage = meta
+    let mut leverages: Vec<(Decimal, u32)> = meta
         .margin_table(coin)
-        .and_then(|t| {
+        .map(|t| {
             t.margin_tiers
                 .iter()
-                .filter(|tier| tier.lower_bound <= notional)
-                .max_by_key(|tier| tier.lower_bound)
-                .map(|tier| tier.max_leverage)
+                .map(|tier| (tier.lower_bound, tier.max_leverage))
+                .collect()
         })
-        .unwrap_or(asset.max_leverage);
-    if max_leverage == 0 {
-        return Err(crate::error::Error::NotFound {
-            what: format!("a positive max leverage for `{coin}` in the live meta"),
+        .unwrap_or_default();
+    leverages.sort_by_key(|(lower_bound, _)| *lower_bound);
+    // A table that does not start at zero (or no table) leaves the bottom of
+    // the range to the asset's own max leverage.
+    if leverages
+        .first()
+        .is_none_or(|(lower_bound, _)| *lower_bound > Decimal::ZERO)
+    {
+        leverages.insert(0, (Decimal::ZERO, asset.max_leverage));
+    }
+    let mut tiers: Vec<MaintenanceTier> = Vec::with_capacity(leverages.len());
+    for (lower_bound, max_leverage) in leverages {
+        if max_leverage == 0 {
+            return Err(crate::error::Error::NotFound {
+                what: format!("a positive max leverage for `{coin}` in the live meta"),
+            });
+        }
+        let rate = Decimal::ONE / Decimal::from(2 * max_leverage);
+        let deduction = match tiers.last() {
+            None => Decimal::ZERO,
+            Some(prev) => add(
+                prev.deduction,
+                mul(
+                    lower_bound,
+                    sub(rate, prev.rate, "tier rate step")?,
+                    "tier deduction",
+                )?,
+                "tier deduction",
+            )?,
+        };
+        tiers.push(MaintenanceTier {
+            lower_bound,
+            max_leverage,
+            rate,
+            deduction,
         });
     }
-    Ok(Decimal::ONE / (Decimal::from(2 * max_leverage)))
+    Ok(tiers)
 }
 
+/// The tier a notional sits in (the last whose lower bound it reaches).
+fn tier_at(tiers: &[MaintenanceTier], notional: Decimal) -> MaintenanceTier {
+    tiers
+        .iter()
+        .rev()
+        .find(|tier| tier.lower_bound <= notional)
+        .or_else(|| tiers.first())
+        .copied()
+        .unwrap_or(MaintenanceTier {
+            lower_bound: Decimal::ZERO,
+            max_leverage: 1,
+            rate: Decimal::ZERO,
+            deduction: Decimal::ZERO,
+        })
+}
+
+/// The maintenance margin of a notional: `notional·rate − deduction` of its
+/// tier (continuous across tiers).
 pub(crate) fn maintenance_margin(
     coin: &str,
     notional: Decimal,
     meta: Option<&crate::wire::Meta>,
 ) -> Result<Decimal> {
-    mul(
-        notional,
-        maintenance_rate(coin, notional, meta)?,
+    maintenance_of(&maintenance_tiers(coin, meta)?, notional)
+}
+
+fn maintenance_of(tiers: &[MaintenanceTier], notional: Decimal) -> Result<Decimal> {
+    let tier = tier_at(tiers, notional);
+    Ok(sub(
+        mul(notional, tier.rate, "maintenance margin")?,
+        tier.deduction,
         "maintenance margin",
-    )
+    )?
+    .max(Decimal::ZERO))
 }
 
 /// Whether the asset is *strict isolated* (docs): its margin cannot be
@@ -1058,36 +1204,87 @@ pub(crate) fn isolated_only(coin: &str, meta: Option<&crate::wire::Meta>) -> boo
 }
 
 /// The coin's live max leverage — `None` when the live meta does not carry
-/// the coin (a seeded position outside the tracked markets: the feed is
+/// the coin (a seeded position in a coin no dex lists: the feed is
 /// warming). Callers pick their own bounded fallback; a fabricated default
 /// here would be a silent lie about a margin bound.
 pub(crate) fn max_leverage(coin: &str, meta: Option<&crate::wire::Meta>) -> Option<u32> {
     meta.and_then(|m| m.asset(coin)).map(|a| a.max_leverage)
 }
 
-/// The isolated liquidation price (exact formula):
-/// `price − side·margin_available/position_size/(1 − l·side)`,
-/// with `margin_available = margin − |size|·mark·maintenance_rate` — the
-/// maintenance margin is already owed, so it cannot also be available to
-/// absorb a loss. The docs' live isolated example (`2866.26936529`) is the
-/// regression pin: omitting the subtraction gives `2836.1`, a liquidation
-/// price that is too far away.
-pub(crate) fn liquidation_px(
-    p: &Position,
-    mark: Decimal,
-    maintenance_rate: Decimal,
-) -> Result<Decimal> {
-    if p.szi.is_zero() {
-        return Ok(mark);
+/// One margin leg's liquidation inputs for a single position: the leg's
+/// equity and the maintenance of everything *else* on the leg, both at the
+/// current marks. An isolated leg has no "else" (its own margin plus its own
+/// pnl against its own maintenance); a cross leg's others are the dex's other
+/// cross positions.
+pub(crate) struct LiquidationLeg<'a> {
+    pub tiers: &'a [MaintenanceTier],
+    pub equity: Decimal,
+    pub other_maintenance: Decimal,
+    pub direction: Direction,
+    pub size: Decimal,
+    pub mark: Decimal,
+}
+
+/// The liquidation price (docs): the price `p` of the position at which the
+/// leg's equity equals its maintenance requirement,
+/// `equity + side·size·(p − mark) = other + maintenance(size·p)`. With one
+/// flat rate `l` this is the docs' closed form
+/// `p = mark − side·(equity − maintenance)/size/(1 − l·side)`
+/// (the docs' live isolated example, `2866.26936529`, is the regression pin:
+/// the maintenance already owed cannot also absorb a loss). A margin-tiered
+/// asset uses the tier the position value has *at the liquidation price*: the
+/// requirement is piecewise linear and continuous, so the equation is solved
+/// per tier and the root whose own tier contains it is the answer (the
+/// function is strictly monotone, so there is exactly one).
+///
+/// `None` when the root is not a positive price: a long the equity covers all
+/// the way to zero never liquidates (the venue serves `null`).
+pub(crate) fn solve_liquidation_px(leg: &LiquidationLeg<'_>) -> Result<Option<Decimal>> {
+    let mut nearest: Option<(Decimal, Decimal)> = None;
+    for index in 0..leg.tiers.len() {
+        let root = tier_root(leg, index)?;
+        // The tier's range is `[lower, upper)`: a root at the upper bound
+        // belongs to the next tier (they agree there: continuity).
+        if root.miss.is_zero() && root.upper.is_none_or(|u| root.price < u) {
+            return Ok((root.price > Decimal::ZERO).then_some(root.price));
+        }
+        // Rounding at a tier boundary can leave the root a hair outside every
+        // tier: the nearest tier's root, clamped into it, is that boundary.
+        if nearest.is_none_or(|(best, _)| root.miss < best) {
+            nearest = Some((root.miss, root.clamped()));
+        }
     }
-    let side = match p.direction() {
+    Ok(nearest.and_then(|(_, price)| (price > Decimal::ZERO).then_some(price)))
+}
+
+/// One tier's root of the liquidation equation and how far it lies outside the
+/// tier's own price range `[lower, upper)` (zero when it is inside).
+struct TierRoot {
+    price: Decimal,
+    lower: Decimal,
+    upper: Option<Decimal>,
+    miss: Decimal,
+}
+
+impl TierRoot {
+    /// The root pulled into the tier's range.
+    fn clamped(&self) -> Decimal {
+        let price = self.price.max(self.lower);
+        self.upper.map_or(price, |u| price.min(u))
+    }
+}
+
+/// Solve `equity + side·size·(p − mark) = other + size·p·rate − deduction`
+/// for the tier at `index`.
+fn tier_root(leg: &LiquidationLeg<'_>, index: usize) -> Result<TierRoot> {
+    let tier = &leg.tiers[index];
+    let side = match leg.direction {
         Direction::Long => Decimal::ONE,
         Direction::Short => -Decimal::ONE,
     };
-    let position_size = p.szi.abs();
-    let denominator = sub(
-        Decimal::ONE,
-        mul(maintenance_rate, side, "liquidation denominator")?,
+    let denominator = mul(
+        leg.size,
+        sub(side, tier.rate, "liquidation denominator")?,
         "liquidation denominator",
     )?;
     if denominator.is_zero() {
@@ -1095,14 +1292,64 @@ pub(crate) fn liquidation_px(
             what: "liquidation denominator",
         });
     }
-    let maintenance = mul(
-        mul(position_size, mark, "liquidation maintenance notional")?,
-        maintenance_rate,
-        "liquidation maintenance",
+    let signed_notional = mul(
+        mul(side, leg.size, "liquidation signed size")?,
+        leg.mark,
+        "liquidation signed notional",
     )?;
-    let margin_available = sub(p.margin_used, maintenance, "liquidation margin available")?;
-    let distance = mul(side, margin_available, "liquidation margin")? / position_size / denominator;
-    sub(mark, distance, "liquidation price")
+    let numerator = sub(
+        add(
+            sub(
+                leg.other_maintenance,
+                tier.deduction,
+                "liquidation numerator",
+            )?,
+            signed_notional,
+            "liquidation numerator",
+        )?,
+        leg.equity,
+        "liquidation numerator",
+    )?;
+    let price = div(numerator, denominator, "liquidation price")?;
+    let lower = div(tier.lower_bound, leg.size, "liquidation tier bound")?;
+    let upper = match leg.tiers.get(index + 1) {
+        Some(next) => Some(div(next.lower_bound, leg.size, "liquidation tier bound")?),
+        None => None,
+    };
+    let below = (lower - price).max(Decimal::ZERO);
+    let above = upper.map_or(Decimal::ZERO, |u| (price - u).max(Decimal::ZERO));
+    Ok(TierRoot {
+        price,
+        lower,
+        upper,
+        miss: below + above,
+    })
+}
+
+/// An isolated position's liquidation price: its own margin plus its own pnl
+/// against its own maintenance (docs: "the only inputs ... are the isolated
+/// margin and the notional value of the isolated position").
+fn isolated_liquidation_px(
+    coin: &str,
+    p: &Position,
+    facts: &PositionFacts,
+    meta: Option<&crate::wire::Meta>,
+) -> Result<Option<Decimal>> {
+    // The leg's equity is the waterfall's (`Sim::check_isolated_legs`): the
+    // position's own margin plus its unrealized pnl at the mark.
+    let equity = add(
+        p.isolated_margin,
+        p.unrealized_pnl(facts.mark)?,
+        "isolated equity",
+    )?;
+    solve_liquidation_px(&LiquidationLeg {
+        tiers: &maintenance_tiers(coin, meta)?,
+        equity,
+        other_maintenance: Decimal::ZERO,
+        direction: p.direction(),
+        size: p.szi.abs(),
+        mark: facts.mark,
+    })
 }
 
 /// Apply one fill to the account (the matching lane's single mutation): the
@@ -1139,6 +1386,9 @@ pub(crate) struct FillFacts {
     pub size: Decimal,
     pub px: Decimal,
     pub leverage: u32,
+    /// The margin mode a new position opens in (the account's setting for the
+    /// coin, else the market's default); an existing position keeps its own.
+    pub mode: LeverageType,
     pub reduce: crate::sim::order::Reduce,
     /// The trading fee (venue base tier; charged on top of the fill — the
     /// plan's `closedPnl = fee + side·(mark−entry)·size`).
@@ -1165,6 +1415,7 @@ impl FillFacts {
             size: sz,
             px,
             leverage,
+            mode: LeverageType::Cross,
             reduce: crate::sim::order::Reduce::Only,
             fee: Decimal::ZERO,
             builder: None,
@@ -1174,6 +1425,7 @@ impl FillFacts {
 
 /// Apply one fill to the account; the effect (the size before, the realized
 /// PnL of the closed part, the direction) is what the ledger records.
+#[allow(clippy::too_many_lines)] // one ledger update: position, margin and realized pnl
 pub(crate) fn apply_fill(
     account: &mut Account,
     fill: &FillFacts,
@@ -1192,8 +1444,14 @@ pub(crate) fn apply_fill(
         .positions
         .entry(fill.coin.clone())
         .or_insert_with(|| fresh_position(fill));
+    let mut allocated = Decimal::ZERO;
     let (closed, realized) = if same_direction(old, signed) {
-        apply_increase(position, old, fill)?;
+        allocated = apply_increase(position, old, fill)?;
+        position.isolated_margin = add(
+            position.isolated_margin,
+            allocated,
+            "isolated margin allocation",
+        )?;
         (Decimal::ZERO, Decimal::ZERO)
     } else {
         let closed = old.abs().min(fill.size);
@@ -1204,6 +1462,14 @@ pub(crate) fn apply_fill(
     // The trading fee (the venue's base tier): charged on the fill's notional,
     // on both sides of a trade, in the dex's collateral token (USDC on the
     // default dex), so a closing fill pays it too.
+    if !allocated.is_zero() {
+        credit_ledger(
+            &mut account.perps,
+            &dex,
+            -allocated,
+            "isolated margin allocation",
+        )?;
+    }
     if !fill.fee.is_zero() {
         credit_ledger(&mut account.perps, &dex, -fill.fee, "trading fee")?;
     }
@@ -1289,7 +1555,7 @@ fn fresh_position(fill: &FillFacts) -> Position {
     Position {
         szi: Decimal::ZERO,
         entry_px: fill.px,
-        leverage: LeverageType::Cross,
+        leverage: fill.mode,
         leverage_value: fill.leverage.max(1),
         margin_used: Decimal::ZERO,
         isolated_margin: Decimal::ZERO,
@@ -1322,7 +1588,7 @@ fn settle_margin(position: &mut Position) -> Result<()> {
 
 /// An increase (or a fresh position): the entry becomes the size-weighted
 /// average of the old notional and the fill.
-fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Result<()> {
+fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Result<Decimal> {
     let signed = fill.size * fill.side.sign();
     let old_notional = mul(old.abs(), position.entry_px, "entry notional")?;
     let fill_notional = mul(fill.size, fill.px, FILL_NOTIONAL)?;
@@ -1333,7 +1599,16 @@ fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Re
         "entry price",
     )?;
     position.szi = new_szi;
-    Ok(())
+    // An isolated position funds its own margin: the increase's initial margin
+    // leaves the cross balance for the position (the venue's isolated open).
+    if position.leverage == LeverageType::Isolated {
+        return div(
+            fill_notional,
+            Decimal::from(position.leverage_value),
+            "isolated margin allocation",
+        );
+    }
+    Ok(Decimal::ZERO)
 }
 
 /// A reduction (or a flip): the closed part's realized PnL (returned for the
@@ -1632,17 +1907,17 @@ mod tests {
     /// let the liquidation check skip a shortfall.
     #[test]
     fn maintenance_requires_the_live_meta() {
-        let err = maintenance_rate("BTC", Decimal::from(100), None).unwrap_err();
+        let err = maintenance_tiers("BTC", None).unwrap_err();
         assert!(matches!(err, crate::error::Error::Warming), "{err}");
         let meta = meta_with("ETH", 10);
-        let err = maintenance_rate("BTC", Decimal::from(100), Some(&meta)).unwrap_err();
+        let err = maintenance_tiers("BTC", Some(&meta)).unwrap_err();
         assert!(matches!(err, crate::error::Error::NotFound { .. }), "{err}");
         let zero = meta_with("BTC", 0);
-        let err = maintenance_rate("BTC", Decimal::from(100), Some(&zero)).unwrap_err();
+        let err = maintenance_tiers("BTC", Some(&zero)).unwrap_err();
         assert!(matches!(err, crate::error::Error::NotFound { .. }), "{err}");
         let meta = meta_with("BTC", 10);
         assert_eq!(
-            maintenance_rate("BTC", Decimal::from(100), Some(&meta)).unwrap(),
+            maintenance_tiers("BTC", Some(&meta)).unwrap()[0].rate,
             Decimal::new(5, 2),
             "1 / (2 * 10x)"
         );
@@ -1652,18 +1927,21 @@ mod tests {
     /// answered with the mark (which would look like a valid liquidation).
     #[test]
     fn a_zero_liquidation_denominator_is_refused() {
-        let p = Position {
-            szi: Decimal::ONE,
-            entry_px: Decimal::from(100),
-            leverage: LeverageType::Isolated,
-            leverage_value: 1,
-            margin_used: Decimal::ONE,
-            isolated_margin: Decimal::ONE,
-            funding_all_time: Decimal::ZERO,
-            funding_since_open: Decimal::ZERO,
-            funding_since_change: Decimal::ZERO,
-        };
-        let err = liquidation_px(&p, Decimal::from(100), Decimal::ONE).unwrap_err();
+        let tiers = [MaintenanceTier {
+            lower_bound: Decimal::ZERO,
+            max_leverage: 1,
+            rate: Decimal::ONE,
+            deduction: Decimal::ZERO,
+        }];
+        let err = solve_liquidation_px(&LiquidationLeg {
+            tiers: &tiers,
+            equity: Decimal::ONE,
+            other_maintenance: Decimal::ZERO,
+            direction: Direction::Long,
+            size: Decimal::ONE,
+            mark: Decimal::from(100),
+        })
+        .unwrap_err();
         assert!(matches!(err, Error::DivideByZero { .. }), "{err}");
     }
 
@@ -1748,26 +2026,37 @@ mod tests {
     /// The isolated liquidation price follows the exact formula.
     #[test]
     fn isolated_liquidation_price_formula() {
-        let p = Position {
-            szi: Decimal::new(335, 4), // 0.0335
-            entry_px: Decimal::new(29863, 1),
-            leverage: LeverageType::Isolated,
-            leverage_value: 20,
-            margin_used: Decimal::new(4_967_826, 6),
-            isolated_margin: Decimal::ZERO,
-            funding_all_time: Decimal::ZERO,
-            funding_since_open: Decimal::ZERO,
-            funding_since_change: Decimal::ZERO,
-        };
+        let szi = Decimal::new(335, 4); // 0.0335
+        let margin = Decimal::new(4_967_826, 6);
         let mark = Decimal::new(29859, 1);
         let rate = Decimal::ONE / Decimal::from(2 * 50); // tier: 50x → l = 1/100
-        let liq = liquidation_px(&p, mark, rate).unwrap();
+        let tiers = [MaintenanceTier {
+            lower_bound: Decimal::ZERO,
+            max_leverage: 50,
+            rate,
+            deduction: Decimal::ZERO,
+        }];
+        let liq = solve_liquidation_px(&LiquidationLeg {
+            tiers: &tiers,
+            equity: margin,
+            other_maintenance: Decimal::ZERO,
+            direction: Direction::Long,
+            size: szi,
+            mark,
+        })
+        .unwrap()
+        .expect("a long with this margin liquidates");
         // Long: mark − (margin − |size|·mark·l)/size/(1 − l). The docs' live
         // example is 2866.26936529; the old formula (no maintenance
         // subtraction) gave 2836.1087743102668475802804161.
-        let maintenance = p.szi.abs() * mark * rate;
-        let expected = mark - (p.margin_used - maintenance) / p.szi / (Decimal::ONE - rate);
-        assert_eq!(liq, expected);
+        let maintenance = szi * mark * rate;
+        let expected = mark - (margin - maintenance) / szi / (Decimal::ONE - rate);
+        assert!(
+            (liq - expected).abs() < Decimal::new(1, 18),
+            "{liq} vs {expected}"
+        );
+        // The docs' figure, to the precision of their rounded inputs.
+        assert_eq!(liq.round_dp(3), Decimal::new(2_866_269, 3));
     }
 
     #[test]
@@ -1777,7 +2066,7 @@ mod tests {
         // servable (a zero would be a silent lie), so the WS lane skips the
         // push and retries on the next tick.
         use crate::feed::PriceOverride;
-        let feed = MarketFeed::memory(vec!["BTC".into()]);
+        let feed = MarketFeed::memory();
         feed.own_price(
             "BTC",
             PriceOverride {

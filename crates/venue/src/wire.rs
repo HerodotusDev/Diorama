@@ -11,8 +11,9 @@
 //! exact (`serde-with-str`), because the served identity
 //! `accountValue == totalRawUsd + Σ signed(positionValue)` is checked at
 //! 1e-6 by the venue client — f64 arithmetic would fail it at the edges.
-//! Fields the venue may null (`midPx` in thin books, `liquidationPx` on cross
-//! positions) are `Option`.
+//! Fields the venue may null (`midPx` in thin books, `liquidationPx` on a
+//! position that cannot be liquidated, e.g. a long its collateral covers all
+//! the way to zero) are `Option`.
 //!
 //! Every enum here is `#[non_exhaustive]`: this is the venue's vocabulary and
 //! it may grow, so a consumer outside this crate must carry a default arm. Our
@@ -33,13 +34,76 @@ pub(crate) mod decimal_nano {
     use rust_decimal::Decimal;
     use serde::Serializer;
 
-    /// The same text [`serialize`] writes, for payloads built as JSON values.
+    /// The venue's decimal text, for payloads built as JSON values: trailing
+    /// zeros trimmed and a whole number always carrying `.0` (measured on every
+    /// real info answer and websocket channel, compressed ones included: a
+    /// price is `"64891.0"`, a zero `"0.0"`, and never a bare `"64891"`).
     pub(crate) fn text(value: &Decimal) -> String {
-        value.round_dp(9).normalize().to_string()
+        whole_with_point(value.round_dp(9).normalize().to_string())
+    }
+
+    /// A whole number's `.0`: the venue prints every decimal with a point.
+    pub(crate) fn whole_with_point(text: String) -> String {
+        if text.contains('.') {
+            text
+        } else {
+            format!("{text}.0")
+        }
     }
 
     pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.round_dp(9).normalize().to_string())
+        serializer.serialize_str(&text(value))
+    }
+
+    /// An optional decimal (`null` when absent; pair with `skip_serializing_if`
+    /// where the key is omitted instead).
+    pub fn serialize_opt<S: Serializer>(
+        value: &Option<Decimal>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serialize(v, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// A pair of decimals (`maxTradeSzs`, `availableToTrade`).
+    pub fn serialize_pair<S: Serializer>(
+        value: &[Decimal; 2],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        for v in value {
+            seq.serialize_element(&text(v))?;
+        }
+        seq.end()
+    }
+
+    /// An optional pair (`impactPxs`).
+    pub fn serialize_opt_pair<S: Serializer>(
+        value: &Option<[Decimal; 2]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serialize_pair(v, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+/// `liquidationPx` on the wire: a computed price, which the venue prints with up
+/// to ten fractional digits (measured: `0.4927481777`, `21139.6026656483`),
+/// trailing zeros trimmed; `null` when there is none.
+fn liquidation_px_text<S: serde::Serializer>(
+    value: &Option<Decimal>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(v) => serializer.serialize_str(&decimal_nano::whole_with_point(
+            v.round_dp(10).normalize().to_string(),
+        )),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -191,6 +255,16 @@ pub(crate) enum InfoRequest {
         #[serde(rename = "endTime", default)]
         end_time: Option<u64>,
     },
+    /// The account's transfer ledger (`startTime` is optional on the real
+    /// venue: absent reads as the beginning).
+    #[serde(rename = "userNonFundingLedgerUpdates")]
+    UserNonFundingLedgerUpdates {
+        user: Address,
+        #[serde(rename = "startTime", default)]
+        start_time: u64,
+        #[serde(rename = "endTime", default)]
+        end_time: Option<u64>,
+    },
     #[serde(rename = "maxBuilderFee")]
     MaxBuilderFee { user: Address, builder: Address },
     #[serde(rename = "preTransferCheck")]
@@ -292,6 +366,7 @@ impl InfoRequest {
             InfoRequest::CandleSnapshot { .. } => "candleSnapshot",
             InfoRequest::UserFills { .. } => "userFills",
             InfoRequest::UserFunding { .. } => "userFunding",
+            InfoRequest::UserNonFundingLedgerUpdates { .. } => "userNonFundingLedgerUpdates",
             InfoRequest::MaxBuilderFee { .. } => "maxBuilderFee",
             InfoRequest::PreTransferCheck { .. } => "preTransferCheck",
             InfoRequest::FrontendOpenOrders { .. } => "frontendOpenOrders",
@@ -358,16 +433,19 @@ pub(crate) struct MarginSummary {
 
 /// One position row. `positionValue` is unsigned on the wire; the side comes
 /// from the sign of `szi` (the venue's exact rule). `liquidationPx` is present
-/// for isolated positions only.
+/// for cross and isolated positions alike (measured live on both).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Position {
     pub coin: String,
-    #[serde(default)]
+    #[serde(default, serialize_with = "decimal_nano::serialize_opt")]
     pub entry_px: Option<Decimal>,
     pub leverage: Leverage,
-    /// Served as `null` when the position has no liquidation price (the venue does).
-    #[serde(default)]
+    /// Served as `null` only when the position has no liquidation price: the
+    /// leg's equity covers the position all the way to a zero price (a long;
+    /// measured live, a short always has one). Cross and isolated positions
+    /// carry it alike. The venue prints up to ten fractional digits.
+    #[serde(default, serialize_with = "liquidation_px_text")]
     pub liquidation_px: Option<Decimal>,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub margin_used: Decimal,
@@ -396,7 +474,11 @@ pub(crate) struct Leverage {
     pub value: u32,
     /// `marginUsed − positionValue` (measured exact on the live sample). Only an
     /// isolated position carries it; the venue omits it on a cross one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub raw_usd: Option<Decimal>,
 }
 
@@ -625,15 +707,24 @@ pub(crate) struct AssetCtx {
     pub prev_day_px: Decimal,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub day_ntl_vlm: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub premium: Option<Decimal>,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub oracle_px: Decimal,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub mark_px: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub mid_px: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt_pair"
+    )]
     pub impact_pxs: Option<[Decimal; 2]>,
     #[serde(default)]
     #[serde(serialize_with = "decimal_nano::serialize")]
@@ -729,7 +820,10 @@ pub(crate) struct L2Book {
     pub coin: String,
     pub time: u64,
     pub levels: [Vec<Level>; 2],
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub spread: Option<Decimal>,
 }
 
@@ -749,7 +843,9 @@ pub(crate) struct ActiveAssetData {
     pub user: Address,
     pub coin: String,
     pub leverage: Leverage,
+    #[serde(serialize_with = "decimal_nano::serialize_pair")]
     pub max_trade_szs: [Decimal; 2],
+    #[serde(serialize_with = "decimal_nano::serialize_pair")]
     pub available_to_trade: [Decimal; 2],
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub mark_px: Decimal,
@@ -774,8 +870,19 @@ pub(crate) struct SpecialStatus {
 }
 
 /// `allMids`: a plain `{coin: px}` map (HIP-3 keys are `"#<id>"`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(crate) struct AllMids(pub BTreeMap<String, Decimal>);
+
+impl Serialize for AllMids {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (coin, px) in &self.0 {
+            map.serialize_entry(coin, &decimal_nano::text(px))?;
+        }
+        map.end()
+    }
+}
 
 /// `spotMeta`: the spot token registry (`token` indices the spot state keys
 /// by) + the pair universe.
@@ -1037,10 +1144,15 @@ mod tests {
             }
         ));
         let r: InfoRequest = serde_json::from_str(
-            r#"{"type":"userNonFundingLedgerUpdates","user":"0x0000000000000000000000000000000000000001"}"#,
+            r#"{"type":"userFees","user":"0x0000000000000000000000000000000000000001"}"#,
         )
         .unwrap();
         assert_eq!(r, InfoRequest::Unrouted);
+        let r: InfoRequest = serde_json::from_str(
+            r#"{"type":"userNonFundingLedgerUpdates","user":"0x0000000000000000000000000000000000000001"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.kind(), "userNonFundingLedgerUpdates");
         for (body, kind) in [
             (r#"{"type":"allPerpMetas"}"#, "allPerpMetas"),
             (
@@ -1327,7 +1439,7 @@ pub(crate) enum ExchangeAction {
     /// "token":..,"amount":..,"fromSubAccount":..}`: a token between two
     /// wallets (the spot wallet is dex `"spot"`, the default dex `""`).
     SendAsset {
-        destination: Address,
+        destination: String,
         source_dex: String,
         destination_dex: String,
         token: String,
@@ -1337,16 +1449,13 @@ pub(crate) enum ExchangeAction {
     },
     /// `{"type":"spotSend","destination":..,"token":"NAME:id","amount":..}`.
     SpotSend {
-        destination: Address,
+        destination: String,
         token: String,
         amount: String,
     },
     /// `{"type":"usdSend","destination":..,"amount":..}`: USDC between two
     /// accounts' default perp dexes.
-    UsdSend {
-        destination: Address,
-        amount: String,
-    },
+    UsdSend { destination: String, amount: String },
     /// `withdraw3`: bridges USDC out through Arbitrum (refused by name).
     Withdraw3,
     /// `{"type":"approveAgent","agentAddress":..,"agentName":..}`: the same

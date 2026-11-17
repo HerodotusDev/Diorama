@@ -7,7 +7,9 @@
 //! Protocol (`feed::ws`'s vocabulary, the client's own): the client subscribes
 //! with `{"method":"subscribe","subscription":{"type":…}}`, the server acks
 //! with a `subscriptionResponse` frame and pushes `{"channel":…,"data":…}` on
-//! each configured account-tick while the subscription is live; `{"method":"ping"}` answers
+//! each tick while the subscription is live (the market channels at the
+//! market push interval, about the venue's own cadence; the account channels
+//! at the account automaton's tick); `{"method":"ping"}` answers
 //! `{"channel":"pong"}`. An unsupported channel (or an unknown coin) is
 //! answered with the venue's `error` frame — never silence.
 //!
@@ -24,6 +26,7 @@ use super::candles::CandleSub;
 use super::ws_codec::{self, FastCtx};
 use super::ApiState;
 use crate::feed::dex::ALL_DEXS;
+use crate::feed::relay::Lease;
 use crate::sim::Sim;
 use crate::wire::{
     ActiveAssetData, AllMids, AssetCtx, ClearinghouseState, L2Book, MarginSummary,
@@ -124,6 +127,16 @@ pub(crate) enum Subscription {
     UserFundings { user: Address },
     #[serde(rename = "activeAssetData")]
     ActiveAssetData { user: Address, coin: String },
+    /// The best bid and ask of a coin's book, pushed when either changes.
+    #[serde(rename = "bbo")]
+    Bbo { coin: String },
+    /// The account's order status changes (`open`, `filled`, `canceled`, ...).
+    #[serde(rename = "orderUpdates")]
+    OrderUpdates { user: Address },
+    /// The account's fills and funding payments, one event object per frame
+    /// (pushed on channel `user`).
+    #[serde(rename = "userEvents")]
+    UserEvents { user: Address },
 }
 
 /// A `dex` field: absent is `None`, a string is `Some`, and an explicit
@@ -189,6 +202,13 @@ pub(crate) enum WsPush {
     UserFundings { data: serde_json::Value },
     #[serde(rename = "activeAssetData")]
     ActiveAssetData { data: ActiveAssetData },
+    #[serde(rename = "bbo")]
+    Bbo { data: serde_json::Value },
+    #[serde(rename = "orderUpdates")]
+    OrderUpdates { data: serde_json::Value },
+    /// The `userEvents` subscription's frames (the venue's channel is `user`).
+    #[serde(rename = "user")]
+    UserEvent { data: serde_json::Value },
     #[serde(rename = "subscriptionResponse")]
     SubscriptionResponse { data: SubscriptionAck },
     #[serde(rename = "pong")]
@@ -302,8 +322,13 @@ pub async fn ws(
 /// What a live subscription remembers between pushes: the previous state the
 /// next diff is computed against, or the relay it listens to.
 enum Mem {
-    /// A channel that pushes its whole state every tick.
+    /// A channel that pushes its whole state every tick (the account
+    /// channels).
     Whole,
+    /// A whole-state market channel: pushed on the first read and then only
+    /// when its content (a book's levels, not its stamp) differs from the last
+    /// frame sent.
+    Dedup(Option<String>),
     /// Nothing pushed yet on a diffing channel.
     Fresh,
     Fast(BTreeMap<String, FastCtx>),
@@ -314,32 +339,100 @@ enum Mem {
     Fills(Option<u64>),
     /// The newest funding `(time, coin)` already pushed.
     Fundings(Option<(u64, String)>),
+    /// The last best bid/ask pushed.
+    Bbo(Option<serde_json::Value>),
+    /// The orders already reported (`None` until primed).
+    Orders(Option<OrderMem>),
+    /// The newest fill id and funding `(time, coin)` already seen.
+    Events(Option<(u64, (u64, String))>),
+}
+
+/// The order ids an `orderUpdates` subscription has already reported.
+#[derive(Default)]
+struct OrderMem {
+    open: std::collections::BTreeSet<u64>,
+    done: std::collections::BTreeSet<u64>,
 }
 
 /// One live subscription and what it remembers.
 pub(crate) struct Live {
     sub: Subscription,
     mem: Mem,
+    /// The interest this subscription holds in its coin: the upstream socket
+    /// carries the coin's streams while it lives (released on unsubscribe or
+    /// disconnect, when the subscription is dropped).
+    _lease: Option<Lease>,
 }
 
-/// One connection: read requests, push the subscribed channels on the 1 Hz
-/// tick (the automaton's own cadence), and push a subscription's first frame
-/// right after its ack (the real venue does).
+/// Whether a subscription is a market-data channel (pushed at the market
+/// interval) rather than an account or candle channel (pushed at the account
+/// automaton's tick).
+fn is_market_channel(sub: &Subscription) -> bool {
+    matches!(
+        sub,
+        Subscription::AllMids { .. }
+            | Subscription::ActiveAssetCtx { .. }
+            | Subscription::L2Book { .. }
+            | Subscription::L2 { .. }
+            | Subscription::Bbo { .. }
+            | Subscription::FastAssetCtxs
+            | Subscription::Pac
+    )
+}
+
+/// The coin a subscription needs the upstream socket to carry, if any.
+fn coin_of(sub: &Subscription) -> Option<&str> {
+    match sub {
+        Subscription::ActiveAssetCtx { coin }
+        | Subscription::L2Book { coin, .. }
+        | Subscription::Bbo { coin }
+        | Subscription::ActiveAssetData { coin, .. } => Some(coin),
+        Subscription::L2 { c, .. } => Some(c),
+        _ => None,
+    }
+}
+
+/// One connection: read requests, push a subscription's first frame right
+/// after its ack (the real venue does), push the market channels when the feed
+/// changes (event driven, after a short coalescing window, only the content
+/// that differs from the last frame), and push the account channels on the
+/// account automaton's tick. The tick also re-evaluates the market channels
+/// (diff only), which catches the time-driven changes no write signals (an
+/// expired funding override); it sends nothing when nothing changed.
+#[allow(clippy::too_many_lines)] // one select loop: the arms are the session
 async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
     let mut subs: Vec<Live> = Vec::new();
     let mut tick = tokio::time::interval(state.push_interval);
+    let mut changes = state.feed.subscribe_changes();
+    // When the pending market flush is due: set by the first change of a
+    // burst, cleared by the flush that composes it.
+    let mut flush_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                // One clock read per tick: every channel in this tick serves
-                // the same instant (a scripted book is stamped with it).
-                let now = crate::now_ms();
-                for live in &mut subs {
-                    for frame in pushes(live, &state, now) {
-                        if socket.send(Message::Text(frame.into())).await.is_err() {
-                            return;
-                        }
-                    }
+                if !push_channels(&mut socket, &mut subs, &state, false).await
+                    || !push_channels(&mut socket, &mut subs, &state, true).await
+                {
+                    return;
+                }
+            }
+            signal = changes.changed() => {
+                if signal.is_err() {
+                    return;
+                }
+                if flush_at.is_none() {
+                    flush_at = Some(tokio::time::Instant::now() + state.market_coalesce);
+                }
+            }
+            () = async {
+                match flush_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                flush_at = None;
+                if !push_channels(&mut socket, &mut subs, &state, true).await {
+                    return;
                 }
             }
             msg = socket.recv() => {
@@ -368,6 +461,30 @@ async fn session(state: Arc<ApiState>, mut socket: WebSocket) {
             }
         }
     }
+}
+
+/// Push one tick's frames for the market channels (`market`) or for every
+/// other channel. One clock read per tick: every channel in it serves the
+/// same instant (a scripted book is stamped with it). `false` when the socket
+/// is gone.
+async fn push_channels(
+    socket: &mut WebSocket,
+    subs: &mut [Live],
+    state: &ApiState,
+    market: bool,
+) -> bool {
+    let now = crate::now_ms();
+    for live in subs
+        .iter_mut()
+        .filter(|live| is_market_channel(&live.sub) == market)
+    {
+        for frame in pushes(live, state, now) {
+            if socket.send(Message::Text(frame.into())).await.is_err() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The venue's answer to a request it cannot parse: the request text echoed.
@@ -408,9 +525,13 @@ pub(super) fn request_reply(text: &str, subs: &mut Vec<Live>, state: &ApiState) 
                 Err(Refusal::Named(reason)) => return WsPush::Error { data: reason },
                 Err(Refusal::Silent) => return WsPush::Silent,
             };
+            // The coin's streams stay on the upstream socket while this
+            // subscription lives (a coin no dex lists holds no lease).
+            let lease = coin_of(&subscription).and_then(|coin| state.feed.lease_coin(coin));
             subs.push(Live {
                 sub: subscription.clone(),
                 mem,
+                _lease: lease,
             });
             WsPush::SubscriptionResponse {
                 data: SubscriptionAck {
@@ -472,8 +593,9 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
             })
         };
     let has_book = |coin: &str| {
-        // A coin outside the configured markets that a dex lists gets its book
-        // on demand (and stays wanted while it is subscribed).
+        // Every coin a dex lists is a market: its book is the relayed live
+        // one (the subscription's lease keeps the stream up), fetched once
+        // from the venue only when none has landed yet.
         if feed.book(coin, crate::now_ms()).is_some() || feed.warm_book(coin) {
             Ok(())
         } else {
@@ -483,8 +605,14 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
         }
     };
     match sub {
-        Subscription::AllMids { .. } => Ok(Mem::Whole),
-        Subscription::ActiveAssetCtx { coin } if feed.mark(coin).is_some() => Ok(Mem::Whole),
+        Subscription::AllMids { .. } => Ok(Mem::Dedup(None)),
+        // A listed coin whose context has not landed yet is served as soon as
+        // it does (the push retries each tick); an unlisted coin is invalid.
+        Subscription::ActiveAssetCtx { coin }
+            if feed.mark(coin).is_some() || feed.meta_for_coin(coin).is_some() =>
+        {
+            Ok(Mem::Dedup(None))
+        }
         Subscription::ActiveAssetCtx { .. } => Err(Refusal::Invalid),
         Subscription::L2Book {
             coin,
@@ -494,7 +622,7 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
         } => {
             super::info::book_params_ok(*n_sig_figs, *mantissa).map_err(|_| Refusal::Invalid)?;
             has_book(coin)?;
-            Ok(Mem::Whole)
+            Ok(Mem::Dedup(None))
         }
         Subscription::L2 { c, s, m } => {
             super::info::book_params_ok(*s, *m).map_err(|_| Refusal::Invalid)?;
@@ -550,6 +678,18 @@ fn admit(sub: &Subscription, state: &ApiState) -> Result<Mem, Refusal> {
         Subscription::UserFundings { user } => {
             account_ok(user)?;
             Ok(Mem::Fundings(None))
+        }
+        Subscription::Bbo { coin } => {
+            has_book(coin)?;
+            Ok(Mem::Bbo(None))
+        }
+        Subscription::OrderUpdates { user } => {
+            account_ok(user)?;
+            Ok(Mem::Orders(None))
+        }
+        Subscription::UserEvents { user } => {
+            account_ok(user)?;
+            Ok(Mem::Events(None))
         }
     }
 }
@@ -630,8 +770,42 @@ pub(super) fn pushes(live: &mut Live, state: &ApiState, now_ms: u64) -> Vec<Stri
         (Subscription::UserFundings { user }, Mem::Fundings(cursor)) => {
             user_fundings_push(state, *user, cursor)
         }
+        (Subscription::Bbo { coin }, Mem::Bbo(last)) => bbo_push(state, coin, last, now_ms),
+        (Subscription::OrderUpdates { user }, Mem::Orders(seen)) => {
+            order_updates_push(state, *user, seen)
+        }
+        (Subscription::UserEvents { user }, Mem::Events(cursor)) => {
+            user_events_push(state, *user, cursor)
+        }
+        (sub, Mem::Dedup(last)) => {
+            let Some(frame) = push_frame(sub, state, now_ms) else {
+                return Vec::new();
+            };
+            let key = dedup_key(sub, &frame);
+            if last.as_deref() == Some(key.as_str()) {
+                return Vec::new();
+            }
+            *last = Some(key);
+            vec![frame]
+        }
         (sub, _) => push_frame(sub, state, now_ms).into_iter().collect(),
     }
+}
+
+/// What makes a whole-state market frame "the same" as the last one sent: the
+/// frame itself, except a book's stamp (a book whose levels did not change is
+/// not an update, whatever its time says).
+fn dedup_key(sub: &Subscription, frame: &str) -> String {
+    if !matches!(sub, Subscription::L2Book { .. }) {
+        return frame.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return frame.to_string();
+    };
+    if let Some(data) = value.get_mut("data").and_then(|d| d.as_object_mut()) {
+        data.remove("time");
+    }
+    value.to_string()
 }
 
 fn encode(push: &WsPush) -> Vec<String> {
@@ -883,6 +1057,137 @@ fn user_fundings_push(
     encode(&WsPush::UserFundings { data })
 }
 
+/// The `bbo` frame: the book's best bid and ask (`null` for an empty side),
+/// pushed on the first read and whenever either changes.
+fn bbo_push(
+    state: &ApiState,
+    coin: &str,
+    last: &mut Option<serde_json::Value>,
+    now_ms: u64,
+) -> Vec<String> {
+    let Some(book) = state.feed.book(coin, now_ms) else {
+        return Vec::new();
+    };
+    let side = |i: usize| {
+        book.levels[i]
+            .first()
+            .map_or(serde_json::Value::Null, |l| serde_json::json!(l))
+    };
+    let bbo = serde_json::json!([side(0), side(1)]);
+    if last.as_ref() == Some(&bbo) {
+        return Vec::new();
+    }
+    *last = Some(bbo.clone());
+    encode(&WsPush::Bbo {
+        data: serde_json::json!({ "coin": coin, "time": book.time, "bbo": bbo }),
+    })
+}
+
+/// One order as `orderUpdates` carries it (the venue's `WsBasicOrder`).
+fn ws_order(r: &crate::sim::order::RestingOrder, sz: &rust_decimal::Decimal) -> serde_json::Value {
+    let row = super::info::frontend_row(r);
+    let mut order = serde_json::json!({
+        "coin": row.coin,
+        "side": row.side,
+        "limitPx": row.limit_px,
+        "sz": super::info::dtext(sz),
+        "oid": row.oid,
+        "timestamp": row.timestamp,
+        "origSz": row.orig_sz,
+    });
+    if let Some(cloid) = r.cloid {
+        order["cloid"] = serde_json::Value::String(format!("{cloid:#x}"));
+    }
+    order
+}
+
+/// The `orderUpdates` frames: the account's orders whose status changed since
+/// the last tick (`open` when one starts resting; `filled`, `canceled` or
+/// `marginCanceled` when it ends). Nothing is pushed for what existed at
+/// subscribe time: the channel carries changes only.
+fn order_updates_push(state: &ApiState, user: Address, seen: &mut Option<OrderMem>) -> Vec<String> {
+    let Ok((resting, terminal)) = state.sim.order_history(user) else {
+        return Vec::new();
+    };
+    let prime = seen.is_none();
+    let mem = seen.get_or_insert_with(OrderMem::default);
+    let mut updates: Vec<(u64, serde_json::Value)> = Vec::new();
+    for r in &resting {
+        if mem.open.insert(r.oid) && !prime {
+            updates.push((
+                r.placed_ms,
+                serde_json::json!({
+                    "order": ws_order(r, &r.sz),
+                    "status": "open",
+                    "statusTimestamp": r.placed_ms,
+                }),
+            ));
+        }
+    }
+    for t in &terminal {
+        if mem.done.insert(t.order.oid) && !prime {
+            let sz = if matches!(t.status, crate::sim::order::TerminalStatus::Filled) {
+                rust_decimal::Decimal::ZERO
+            } else {
+                t.order.sz
+            };
+            updates.push((
+                t.status_ms,
+                serde_json::json!({
+                    "order": ws_order(&t.order, &sz),
+                    "status": super::info::terminal_status_label(t.status),
+                    "statusTimestamp": t.status_ms,
+                }),
+            ));
+        }
+    }
+    if updates.is_empty() {
+        return Vec::new();
+    }
+    updates.sort_by_key(|(time, _)| *time);
+    let rows: Vec<serde_json::Value> = updates.into_iter().map(|(_, row)| row).collect();
+    encode(&WsPush::OrderUpdates {
+        data: serde_json::Value::Array(rows),
+    })
+}
+
+/// The `userEvents` frames: `{"fills": [...]}` for new fills and one
+/// `{"funding": {...}}` per new funding payment. Nothing is pushed for what
+/// existed at subscribe time.
+fn user_events_push(
+    state: &ApiState,
+    user: Address,
+    cursor: &mut Option<(u64, (u64, String))>,
+) -> Vec<String> {
+    let fills = state.sim.user_fills(user).unwrap_or_default();
+    let fundings = state.sim.user_fundings(user, 0).unwrap_or_default();
+    let newest_fill = fills.last().map_or(0, |f| f.tid);
+    let newest_funding = fundings
+        .last()
+        .map_or((0, String::new()), |f| (f.time, f.coin.clone()));
+    let Some((last_fill, last_funding)) = cursor.clone() else {
+        *cursor = Some((newest_fill, newest_funding));
+        return Vec::new();
+    };
+    let mut frames = Vec::new();
+    let fresh: Vec<_> = fills.into_iter().filter(|f| f.tid > last_fill).collect();
+    if !fresh.is_empty() {
+        frames.extend(encode(&WsPush::UserEvent {
+            data: serde_json::json!({ "fills": fresh }),
+        }));
+    }
+    for f in fundings
+        .into_iter()
+        .filter(|f| (f.time, f.coin.as_str()) > (last_funding.0, last_funding.1.as_str()))
+    {
+        frames.extend(encode(&WsPush::UserEvent {
+            data: serde_json::json!({ "funding": f }),
+        }));
+    }
+    *cursor = Some((newest_fill.max(last_fill), newest_funding.max(last_funding)));
+    frames
+}
+
 /// The `spotState` channel's frame: the same balances `/info` serves, in the
 /// WS shape (which carries no `tokenToAvailableAfterMaintenance`).
 fn spot_state_push(user: Address, state: &ApiState) -> WsPush {
@@ -1084,7 +1389,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one frame-by-frame round-trip table: splitting it would hide the shape mapping
     fn pushes_round_trip_through_the_client_parser() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
@@ -1204,7 +1509,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one subscription-lifecycle table: splitting it would hide the ack/error ordering
     fn the_ws_acks_unsubscribes_and_answers_unserved_frames_with_an_error() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
         let state = api_state(feed.clone());
@@ -1334,7 +1639,7 @@ mod tests {
     /// consumption shows in the served size (the same read `/info` serves).
     #[test]
     fn l2_book_push_is_the_composed_book() {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_book(test_book("BTC", "100"), 1_000);
         let state = api_state(feed.clone());
         let sub = book_sub("BTC");
@@ -1419,7 +1724,7 @@ mod tests {
     /// fill from the server's pushes (mark from `activeAssetCtx`).
     #[tokio::test]
     async fn ws_client_fills_its_cache_from_the_server() {
-        let server_feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let server_feed = Arc::new(MarketFeed::memory());
         server_feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         let state = api_state(server_feed);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1430,7 +1735,9 @@ mod tests {
                 .unwrap();
         });
 
-        let client_feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let client_feed = Arc::new(MarketFeed::memory());
+        // The client subscribes the contexts of the coins its registry lists.
+        client_feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         let ws_pool = diorama_anvil::EndpointPool::new(
             &[format!("ws://{addr}/ws")],
             diorama_anvil::Scheme::Ws,
@@ -1439,7 +1746,7 @@ mod tests {
         .unwrap();
         let client = crate::feed::ws::WsClient::new(client_feed.clone(), ws_pool);
         let task = tokio::spawn(client.run());
-        // 20 s: the server pushes on a 1 Hz tick; the budget only has to
+        // 20 s: the server pushes on its market tick; the budget only has to
         // outlast a loaded parallel test run (the same flake class as the
         // bridge's deadlock guard).
         let filled = 'wait: {
@@ -1468,7 +1775,7 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
         feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
         feed.put_book(test_book("BTC", "100"), 1_000);
@@ -1542,6 +1849,299 @@ mod tests {
         server.abort();
     }
 
+    /// A subscription holds the upstream relay's interest in its coin until
+    /// it unsubscribes (or the connection drops): two subscriptions on one
+    /// coin refcount, and the grace starts after the last one leaves.
+    #[test]
+    fn a_subscription_holds_a_lease_on_its_coin_until_it_leaves() {
+        use crate::feed::relay::GRACE_MS;
+        let feed = Arc::new(MarketFeed::memory());
+        feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
+        feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
+        feed.put_book(test_book("BTC", "100"), 1_000);
+        let state = api_state(feed.clone());
+        let mut subs: Vec<Live> = Vec::new();
+        let book = r#"{"type":"l2Book","coin":"BTC"}"#;
+        let ctx = r#"{"type":"activeAssetCtx","coin":"BTC"}"#;
+        let say = |method: &str, sub: &str, subs: &mut Vec<Live>| {
+            request_reply(
+                &format!(r#"{{"method":"{method}","subscription":{sub}}}"#),
+                subs,
+                &state,
+            )
+        };
+        let far = crate::now_ms() + 100 * GRACE_MS;
+        assert!(!feed.relay.is_wanted("BTC", far));
+        say("subscribe", book, &mut subs);
+        say("subscribe", ctx, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far), "leased by two");
+        say("unsubscribe", book, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far), "one lease left");
+        say("unsubscribe", ctx, &mut subs);
+        assert!(
+            !feed.relay.is_wanted("BTC", far),
+            "released: only the grace"
+        );
+        assert!(feed.relay.is_wanted("BTC", crate::now_ms() + 1_000));
+
+        // A dropped connection drops its subscriptions, and their leases.
+        say("subscribe", book, &mut subs);
+        assert!(feed.relay.is_wanted("BTC", far));
+        drop(subs);
+        assert!(!feed.relay.is_wanted("BTC", far));
+
+        // A coin no dex lists holds no lease (the venue would close the
+        // upstream socket on it).
+        let mut subs: Vec<Live> = Vec::new();
+        let reply = say("subscribe", r#"{"type":"l2Book","coin":"NOPE"}"#, &mut subs);
+        assert!(matches!(reply, WsPush::Error { .. }));
+        assert!(!feed.relay.is_wanted("NOPE", crate::now_ms()));
+    }
+
+    type ClientSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Serve the router on a loopback port and connect `n` raw clients.
+    async fn serve_and_connect(
+        state: Arc<ApiState>,
+        n: usize,
+    ) -> (tokio::task::JoinHandle<()>, Vec<ClientSocket>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::super::info_router(state))
+                .await
+                .unwrap();
+        });
+        let mut sockets = Vec::new();
+        for _ in 0..n {
+            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            sockets.push(socket);
+        }
+        (server, sockets)
+    }
+
+    async fn subscribe_raw(socket: &mut ClientSocket, subscription: &str) {
+        use futures_util::SinkExt;
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                format!(r#"{{"method":"subscribe","subscription":{subscription}}}"#).into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Every frame that arrives within `window`, as (channel, arrival).
+    async fn frames_within(
+        socket: &mut ClientSocket,
+        window: Duration,
+    ) -> Vec<(String, tokio::time::Instant)> {
+        use futures_util::StreamExt;
+        let started = tokio::time::Instant::now();
+        let mut out = Vec::new();
+        while let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) =
+            tokio::time::timeout(window.saturating_sub(started.elapsed()), socket.next()).await
+        {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let channel = value["channel"].as_str().unwrap_or_default().to_string();
+            if channel != "subscriptionResponse" {
+                out.push((channel, tokio::time::Instant::now()));
+            }
+        }
+        out
+    }
+
+    fn count(frames: &[(String, tokio::time::Instant)], channel: &str) -> usize {
+        frames.iter().filter(|(c, _)| c == channel).count()
+    }
+
+    fn market_world() -> (Arc<ApiState>, Arc<MarketFeed>, Address) {
+        let feed = Arc::new(MarketFeed::memory());
+        feed.put_meta(crate::sim::meta_with("BTC", 10), 1);
+        feed.put_ctx("BTC".into(), test_ctx("100", "101"), 1);
+        feed.put_book(test_book("BTC", "100"), 1_000);
+        feed.put_mids([("BTC".to_string(), Decimal::from(100))].into(), 1_000);
+        let state = api_state(feed.clone());
+        assert_eq!(state.push_interval, Duration::from_secs(1));
+        let user = Address::repeat_byte(0xaa);
+        fund_perp(&state, &feed, user);
+        (state, feed, user)
+    }
+
+    /// The market channels send the first frame at once and then nothing while
+    /// nothing changes (the real venue pushes on change, not on a clock), and
+    /// the account channel keeps its 1 s tick.
+    #[tokio::test]
+    async fn an_unchanged_market_sends_nothing_and_the_account_tick_is_kept() {
+        let (state, feed, user) = market_world();
+        let (server, mut sockets) = serve_and_connect(state, 1).await;
+        let socket = &mut sockets[0];
+        for sub in [
+            r#"{"type":"l2Book","coin":"BTC"}"#.to_string(),
+            r#"{"type":"bbo","coin":"BTC"}"#.to_string(),
+            r#"{"type":"activeAssetCtx","coin":"BTC"}"#.to_string(),
+            r#"{"type":"allMids"}"#.to_string(),
+            r#"{"type":"l2Book","coin":"BTC","nSigFigs":4}"#.to_string(),
+            format!(r#"{{"type":"webData3","user":"{user}"}}"#),
+        ] {
+            subscribe_raw(socket, &sub).await;
+        }
+        let frames = frames_within(socket, Duration::from_millis(3_300)).await;
+        assert_eq!(
+            count(&frames, "l2Book"),
+            2,
+            "one first frame per book subscription"
+        );
+        assert_eq!(count(&frames, "bbo"), 1);
+        assert_eq!(count(&frames, "activeAssetCtx"), 1);
+        assert_eq!(count(&frames, "allMids"), 1);
+        let accounts = count(&frames, "webData3");
+        assert!(
+            (3..=5).contains(&accounts),
+            "the account channel keeps the 1 s tick: {accounts}"
+        );
+        // A relay confirmation (the venue's stream says the book is
+        // unchanged) and an identical rewrite of the book are not changes.
+        feed.confirm_books(["BTC"], crate::now_ms());
+        feed.put_book(test_book("BTC", "100"), crate::now_ms());
+        let frames = frames_within(socket, Duration::from_millis(400)).await;
+        assert_eq!(
+            count(&frames, "l2Book") + count(&frames, "bbo"),
+            0,
+            "{frames:?}"
+        );
+        socket.close(None).await.ok();
+        server.abort();
+    }
+
+    /// A change reaches the subscriber within a coalescing window, not a tick;
+    /// a burst of writes is one frame; every subscription on the coin (and on
+    /// other connections) gets it.
+    #[tokio::test]
+    async fn a_change_is_pushed_at_once_and_a_burst_is_one_frame() {
+        let (state, feed, _user) = market_world();
+        let (server, mut sockets) = serve_and_connect(state, 3).await;
+        for socket in &mut sockets {
+            for sub in [
+                r#"{"type":"l2Book","coin":"BTC"}"#,
+                r#"{"type":"bbo","coin":"BTC"}"#,
+                r#"{"type":"l2","c":"BTC"}"#,
+            ] {
+                subscribe_raw(socket, sub).await;
+            }
+        }
+        for socket in &mut sockets {
+            let first = frames_within(socket, Duration::from_millis(300)).await;
+            assert_eq!(count(&first, "l2Book"), 1);
+            assert_eq!(count(&first, "bbo"), 1);
+        }
+        // One change: a frame on every connection and every channel on the
+        // coin, well under the old 500 ms tick.
+        let put_at = tokio::time::Instant::now();
+        feed.put_book(test_book("BTC", "101"), crate::now_ms());
+        // Read every connection at once so each arrival is stamped when it
+        // lands, not when its turn comes.
+        let all = futures_util::future::join_all(
+            sockets
+                .iter_mut()
+                .map(|socket| frames_within(socket, Duration::from_millis(150))),
+        )
+        .await;
+        for frames in all {
+            for channel in ["l2Book", "bbo", "l2"] {
+                let at = frames
+                    .iter()
+                    .find(|(c, _)| c == channel)
+                    .unwrap_or_else(|| panic!("no {channel} frame after the change: {frames:?}"))
+                    .1;
+                assert!(
+                    at.duration_since(put_at) < Duration::from_millis(100),
+                    "{channel} took {:?}",
+                    at.duration_since(put_at)
+                );
+            }
+        }
+        // A burst of ten writes with no await between them: one frame each.
+        for step in 0..10u32 {
+            feed.put_book(test_book("BTC", &(102 + step).to_string()), crate::now_ms());
+        }
+        for socket in &mut sockets {
+            let frames = frames_within(socket, Duration::from_millis(400)).await;
+            assert_eq!(count(&frames, "l2Book"), 1, "{frames:?}");
+            assert_eq!(count(&frames, "bbo"), 1, "{frames:?}");
+        }
+        server.abort();
+    }
+
+    /// Each kind of feed write wakes the channel it changes: a ctx write, a
+    /// mids write, a scripted price (`crash`) and a scripted book.
+    #[tokio::test]
+    async fn every_kind_of_feed_write_wakes_its_channel() {
+        let (state, feed, _user) = market_world();
+        let (server, mut sockets) = serve_and_connect(state, 1).await;
+        let socket = &mut sockets[0];
+        for sub in [
+            r#"{"type":"activeAssetCtx","coin":"BTC"}"#,
+            r#"{"type":"allMids"}"#,
+            r#"{"type":"l2Book","coin":"BTC"}"#,
+        ] {
+            subscribe_raw(socket, sub).await;
+        }
+        frames_within(socket, Duration::from_millis(300)).await;
+
+        feed.put_ctx("BTC".into(), test_ctx("105", "106"), crate::now_ms());
+        let frames = frames_within(socket, Duration::from_millis(150)).await;
+        assert_eq!(count(&frames, "activeAssetCtx"), 1, "{frames:?}");
+
+        feed.put_mids(
+            [("BTC".to_string(), Decimal::from(105))].into(),
+            crate::now_ms(),
+        );
+        let frames = frames_within(socket, Duration::from_millis(150)).await;
+        assert_eq!(count(&frames, "allMids"), 1, "{frames:?}");
+
+        feed.own_price(
+            "BTC",
+            crate::feed::PriceOverride {
+                mark: Decimal::from(50),
+                oracle: Decimal::from(50),
+            },
+        )
+        .unwrap();
+        let frames = frames_within(socket, Duration::from_millis(150)).await;
+        assert_eq!(count(&frames, "activeAssetCtx"), 1, "{frames:?}");
+
+        feed.own_book(&test_book("BTC", "200")).unwrap();
+        let frames = frames_within(socket, Duration::from_millis(150)).await;
+        assert_eq!(count(&frames, "l2Book"), 1, "{frames:?}");
+        server.abort();
+    }
+
+    /// The subscription keeps the coin's upstream stream leased while it lives
+    /// and releases it when the connection goes (the event-driven push did not
+    /// change that).
+    #[tokio::test]
+    async fn the_lease_follows_the_subscription_with_event_driven_pushes() {
+        let (state, feed, _user) = market_world();
+        let (server, mut sockets) = serve_and_connect(state, 1).await;
+        subscribe_raw(&mut sockets[0], r#"{"type":"l2Book","coin":"BTC"}"#).await;
+        let frames = frames_within(&mut sockets[0], Duration::from_millis(300)).await;
+        assert_eq!(count(&frames, "l2Book"), 1);
+        let far = crate::now_ms() + 10 * crate::feed::relay::GRACE_MS;
+        assert!(feed.relay.is_wanted("BTC", far), "held by the lease");
+        sockets[0].close(None).await.ok();
+        drop(sockets);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !feed.relay.is_wanted("BTC", far),
+            "released with the connection"
+        );
+        server.abort();
+    }
+
     /// A venue with the default dex (`BTC`) and two builder dexes registered
     /// in the order xyz, flx (so the registry order is not the alphabetical
     /// one): `xyz` margins in USDC and lists `xyz:TSLA` and a coin with no
@@ -1549,7 +2149,7 @@ mod tests {
     /// and a resting order on xyz and a resting order on the default dex.
     #[allow(clippy::too_many_lines)] // one fixture world
     fn dex_world() -> (Arc<ApiState>, Address) {
-        let feed = Arc::new(MarketFeed::memory(vec!["BTC".into(), "xyz:TSLA".into()]));
+        let feed = Arc::new(MarketFeed::memory());
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("BTC", 10), now);
         feed.put_dex_meta(
@@ -1866,7 +2466,7 @@ mod tests {
             2,
             "xyz lists two coins"
         );
-        assert_eq!(dexs[2][1][0]["markPx"], "200");
+        assert_eq!(dexs[2][1][0]["markPx"], "200.0");
         assert_eq!(
             dexs[2][1][1],
             serde_json::json!({}),
@@ -1883,7 +2483,7 @@ mod tests {
         let next = decode(&frames[0]);
         assert_eq!(next.as_array().unwrap().len(), 3, "every dex is listed");
         assert_eq!(next[0][1], serde_json::json!([{}]));
-        assert_eq!(next[2][1][0]["markPx"], "201");
+        assert_eq!(next[2][1][0]["markPx"], "201.0");
 
         subscribe_to(
             &state,
@@ -1905,8 +2505,8 @@ mod tests {
             ["BTC", "flx:TSLA", "xyz:TSLA"],
             "no coin without a mark"
         );
-        assert_eq!(fast["xyz:TSLA"]["markPx"], "201");
-        assert_eq!(fast["flx:TSLA"]["midPx"], "300");
+        assert_eq!(fast["xyz:TSLA"]["markPx"], "201.0");
+        assert_eq!(fast["flx:TSLA"]["midPx"], "300.0");
     }
 
     /// `activeAssetCtx` of a builder coin is that coin's own context, found by
@@ -1932,6 +2532,6 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["data"]["coin"], "xyz:TSLA");
-        assert_eq!(value["data"]["ctx"]["openInterest"], "7");
+        assert_eq!(value["data"]["ctx"]["openInterest"], "7.0");
     }
 }

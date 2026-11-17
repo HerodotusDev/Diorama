@@ -46,26 +46,19 @@ use std::sync::Arc;
 /// `sendAsset`, `spotSend`, `usdSend`) and the account setup (`approveAgent`,
 /// `approveBuilderFee`, `userSetAbstraction`, `agentSetAbstraction`) are
 /// `user_actions.rs`; the user-signed ones must be signed by the account's own
-/// key. Orders on a coin outside the configured markets read its book on
-/// demand (`ensure_books`), and every asset id of a builder dex resolves to
+/// key. An order reads its coin's book first when none has landed yet
+/// (`ensure_books`), and every asset id of a builder dex resolves to
 /// that dex's coins and ledger.
 pub(crate) async fn exchange(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Response> {
     let req = match parse(&body) {
         Ok(req) => req,
         Err(response) => return Ok(*response),
     };
-    // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
-    // after which the action is rejected — the venue's own string is "Action
-    // already expired" (the FAQ's 15 s protection is the client-side default).
-    // The sim's clock is the scenario's, so a scripted time jump expires
-    // actions exactly as the venue's would.
-    if let Err(reason) = expired(&req, state.sim.clock(crate::now_ms())?) {
-        return Ok(err_envelope(reason));
-    }
     // Every action, the noop (docs: no side effects) included, goes through
     // the signature: the venue answers a zero signature on a noop with its
     // "Unable to recover signer.", and a noop consumes its nonce.
-    let owner = match acting_user(&state, &req, &body) {
+    let now = state.sim.clock(crate::now_ms())?;
+    let owner = match acting_user(&state, &req, &body, now) {
         Ok((_, owner)) => owner,
         Err(response) => return Ok(*response),
     };
@@ -103,11 +96,18 @@ fn parse(body: &[u8]) -> std::result::Result<ExchangeBody, Box<Response>> {
             _ => plain(StatusCode::BAD_REQUEST, NOT_JSON),
         })
     })?;
+    let shaped = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("action")
+                .map(|a| super::shape::conforms(a, req.user.is_none()))
+        })
+        .unwrap_or(true);
     let unsigned = req.user.is_none() && (req.signature.is_none() || req.nonce.is_none());
     let unknown_tag = matches!(req.action, ExchangeAction::Unmodeled)
         && !serde_json::from_slice::<ActionTag>(body)
             .is_ok_and(|t| crate::wire::KNOWN_ACTION_TAGS.contains(&t.action.r#type.as_str()));
-    if unsigned || unknown_tag {
+    if unsigned || unknown_tag || !shaped {
         return Err(Box::new(plain(
             StatusCode::UNPROCESSABLE_ENTITY,
             NOT_AN_ACTION,
@@ -119,8 +119,8 @@ fn parse(body: &[u8]) -> std::result::Result<ExchangeBody, Box<Response>> {
 /// The most books one request reads on demand (a batch spans few coins).
 const MAX_ENSURED_BOOKS: usize = 8;
 
-/// Orders walk the coin's book: read it once for a coin outside the
-/// configured markets (a builder dex's, say) before the action runs.
+/// Orders walk the coin's book: read it once when none has landed yet (and
+/// keep the coin's stream wanted) before the action runs.
 async fn ensure_books(state: &ApiState, action: &ExchangeAction) {
     let assets: Vec<u32> = match action {
         ExchangeAction::Order { orders, .. } => orders.iter().map(|o| o.a).collect(),
@@ -265,7 +265,16 @@ fn dispatch(state: &Arc<ApiState>, owner: Address, body: &Bytes, req: &ExchangeB
     }
 }
 
+/// A transfer's `destination` string as an address: the venue reads it as a
+/// free string and refuses a malformed one only after the signature held.
+fn destination_of(text: &str) -> std::result::Result<Address, String> {
+    text.parse::<Address>().map_err(|_| {
+        format!("venue-sim: the destination `{text}` is not an address (0x and 40 hex digits)")
+    })
+}
+
 /// The transfer and account-setup actions (`user_actions.rs`).
+#[allow(clippy::too_many_lines)] // one dispatch arm per user-signed action
 fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -> Response {
     match action {
         ExchangeAction::UsdClassTransfer { amount, to_perp } => {
@@ -278,27 +287,36 @@ fn user_action(state: &Arc<ApiState>, owner: Address, action: &ExchangeAction) -
             token,
             amount,
             from_sub_account,
-        } => user_actions::send_asset(
-            state,
-            owner,
-            &SendAsset {
-                destination: *destination,
-                source_dex,
-                destination_dex,
-                token,
-                amount,
-                from_sub_account,
-            },
-        ),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::send_asset(
+                state,
+                owner,
+                &SendAsset {
+                    destination,
+                    source_dex,
+                    destination_dex,
+                    token,
+                    amount,
+                    from_sub_account,
+                },
+            ),
+            Err(text) => err_envelope(text),
+        },
         ExchangeAction::SpotSend {
             destination,
             token,
             amount,
-        } => user_actions::spot_send(state, owner, *destination, (token, amount)),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::spot_send(state, owner, destination, (token, amount)),
+            Err(text) => err_envelope(text),
+        },
         ExchangeAction::UsdSend {
             destination,
             amount,
-        } => user_actions::usd_send(state, owner, *destination, amount),
+        } => match destination_of(destination) {
+            Ok(destination) => user_actions::usd_send(state, owner, destination, amount),
+            Err(text) => err_envelope(text),
+        },
         ExchangeAction::Withdraw3 => user_actions::withdraw3(),
         ExchangeAction::ApproveAgent {
             agent_address,
@@ -337,12 +355,28 @@ fn acting_user(
     state: &Arc<ApiState>,
     req: &ExchangeBody,
     body: &[u8],
+    now_ms: u64,
 ) -> std::result::Result<(Address, Address), Box<Response>> {
     let refuse = |reason: String| Box::new(err_envelope(reason));
+    // The venue checks, before it recovers the signer, that a user-signed
+    // action's own `nonce`/`time` is the request's nonce, and its network.
+    if req.user.is_none() {
+        if let Some(reason) = crate::api::shape::pre_signature_refusal(body) {
+            return Err(refuse(reason.to_string()));
+        }
+    }
     let (signer, account) = match req.user {
         Some(user) => (user, user),
         None => signed_account(state, body).map_err(refuse)?,
     };
+    // The docs' `expiresAfter` (the exchange page): a millisecond timestamp
+    // after which the action is rejected: the venue's own string is "Action
+    // already expired" (the FAQ's 15 s protection is the client-side default).
+    // It comes after the signature, as on the venue (a zero signature on an
+    // expired action still reads "Unable to recover signer."). The sim's
+    // clock is the scenario's, so a scripted time jump expires actions
+    // exactly as the venue's would.
+    expired(req, now_ms).map_err(refuse)?;
     if let Some(nonce) = req.nonce {
         if let Err(e) = state.sim.use_nonce(signer, nonce, crate::now_ms()) {
             return Err(refuse(e.to_string()));
@@ -766,8 +800,8 @@ fn fill_status(
     {
         Ok(placed) => match (placed.fill, placed.resting) {
             (Some(fill), _) => OrderStatus::Filled(FilledInfo {
-                total_sz: fill.total_sz.to_string(),
-                avg_px: fill.avg_px.to_string(),
+                total_sz: crate::wire::decimal_nano::text(&fill.total_sz),
+                avg_px: crate::wire::decimal_nano::text(&fill.avg_px),
                 oid: fill.oid,
             }),
             (None, Some(oid)) => OrderStatus::Resting(RestingInfo { oid }),
@@ -1029,7 +1063,7 @@ mod tests {
     /// sim with `OWNER` funded and `BUILDER` a simulated account.
     fn builder_state() -> Arc<ApiState> {
         use crate::wire::{L2Book, Level};
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_ctx("ETH".into(), crate::wire::test_ctx("101", "101"), now);
@@ -1138,7 +1172,7 @@ mod tests {
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
             out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
-            "2"
+            "2.0"
         );
         assert!(
             balance(&state, OWNER) < "1000".parse().unwrap(),
@@ -1270,7 +1304,7 @@ mod tests {
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
             out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
-            "2"
+            "2.0"
         );
         let taker =
             "202".parse::<rust_decimal::Decimal>().unwrap() * crate::sim::order::taker_fee();
@@ -1485,7 +1519,7 @@ mod tests {
     /// (`USDC`), and a mark and a one-level book on both.
     fn dex_state() -> Arc<ApiState> {
         use crate::wire::{L2Book, Level};
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string(), "xyz:TSLA".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);
@@ -1661,6 +1695,8 @@ mod tests {
             &format!(r#""destination":"{other:#x}","token":"{TOKEN}","amount":"25","time":{n}"#),
         );
         ok(&post(&state, signed(&me_key, &action, n)).await);
+        // `other` is new: credited in full, and the sender (funded by a
+        // helper) owes no activation.
         assert_eq!(
             (spot_usdc(&state, me), spot_usdc(&state, other)),
             (dec("705"), dec("25"))
@@ -1684,6 +1720,96 @@ mod tests {
         let out = post(&state, signed(&me_key, &action, n)).await;
         assert!(
             out["response"].as_str().unwrap().contains("unknown token"),
+            "{out}"
+        );
+    }
+
+    /// Over `/exchange`, an account created by an inbound transfer is credited
+    /// in full and pays the 1 USDC activation on its first outbound transfer:
+    /// refused by name when the balance cannot cover amount plus fee (nothing
+    /// moves), applied once it can, free the second time. A replayed nonce, a
+    /// sub-account source and a token's system address as destination are
+    /// refused.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one request/response script: splitting it would hide the order of the sends
+    async fn an_accounts_first_outbound_transfer_pays_the_activation_fee_once() {
+        use crate::sim::DealClass::Spot;
+        let state = dex_state();
+        let (me_key, me) = key(0x11);
+        let (other_key, other) = key(0x22);
+        fund(&state, me, Spot, None, "30");
+        let nonce = crate::now_ms();
+        let spot_send = |to: Address, amount: &str, n: u64| {
+            user_signed(
+                "spotSend",
+                &format!(
+                    r#""destination":"{to:#x}","token":"{TOKEN}","amount":"{amount}","time":{n}"#
+                ),
+            )
+        };
+
+        // `me` is funded by a helper: sending 10 to a new account costs it nothing extra.
+        let action = spot_send(other, "10", nonce);
+        let out = post(&state, signed(&me_key, &action, nonce)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        assert_eq!(
+            (spot_usdc(&state, me), spot_usdc(&state, other)),
+            (dec("20"), dec("10"))
+        );
+
+        // `other` owes the activation: 10 of its 10 is refused, 9 goes.
+        let n = nonce + 1;
+        let action = spot_send(me, "10", n);
+        let out = post(&state, signed(&other_key, &action, n)).await;
+        assert_eq!(out["status"], "err", "{out}");
+        assert!(
+            out["response"].as_str().unwrap().contains("activation fee"),
+            "{out}"
+        );
+        assert_eq!(spot_usdc(&state, other), dec("10"));
+        let n = nonce + 2;
+        let action = spot_send(me, "9", n);
+        let body = signed(&other_key, &action, n);
+        assert_eq!(post(&state, body.clone()).await["status"], "ok");
+        assert_eq!(
+            (spot_usdc(&state, other), spot_usdc(&state, me)),
+            (dec("0"), dec("29"))
+        );
+        // A replay of the signed body is refused.
+        assert_eq!(post(&state, body).await["status"], "err", "a replay");
+        assert_eq!(spot_usdc(&state, me), dec("29"));
+
+        // The Core to EVM leg is not an /exchange destination in the sim, for
+        // a token's system address or HYPE's.
+        for (i, system) in [
+            "0x2000000000000000000000000000000000000000",
+            "0x2222222222222222222222222222222222222222",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = nonce + 10 + i as u64;
+            let action = user_signed(
+                "spotSend",
+                &format!(r#""destination":"{system}","token":"{TOKEN}","amount":"1","time":{n}"#),
+            );
+            let out = post(&state, signed(&me_key, &action, n)).await;
+            assert!(
+                out["response"].as_str().unwrap().contains("system address"),
+                "{out}"
+            );
+        }
+        // A sub-account source is refused by name.
+        let n = nonce + 4;
+        let action = user_signed(
+            "sendAsset",
+            &format!(
+                r#""destination":"{other:#x}","sourceDex":"spot","destinationDex":"spot","token":"USDC","amount":"1","fromSubAccount":"{me:#x}","nonce":{n}"#
+            ),
+        );
+        let out = post(&state, signed(&me_key, &action, n)).await;
+        assert!(
+            out["response"].as_str().unwrap().contains("fromSubAccount"),
             "{out}"
         );
     }
@@ -1728,7 +1854,7 @@ mod tests {
             &format!(r#""destination":"{me:#x}","amount":"1","time":{nonce}"#),
         );
         let (own_key, _) = key(0x11);
-        let out = post(&state, signed(&own_key, &withdraw, nonce + 1)).await;
+        let out = post(&state, signed(&own_key, &withdraw, nonce)).await;
         assert_eq!(out["status"], "err");
         assert!(
             out["response"].as_str().unwrap().contains("withdraw3"),
@@ -1830,14 +1956,9 @@ mod tests {
             out["response"].as_str().unwrap().contains("signed it"),
             "{out}"
         );
-        let out = post(&state, send(&me_key, &set(me, "bogus"))).await;
-        assert!(
-            out["response"]
-                .as_str()
-                .unwrap()
-                .contains("unknown abstraction"),
-            "{out}"
-        );
+        // an abstraction the venue does not define is a 422, before the signature
+        let (status, _, _) = post_raw(&state, &send(&me_key, &set(me, "bogus"))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         // agentSetAbstraction (an L1 action: the agent signs it).
         let agent_sets = |code: &'static str| {
@@ -1921,7 +2042,7 @@ mod tests {
         )
         .await;
         assert_eq!(out["status"], "ok", "{out}");
-        assert_eq!(orders(&out)["filled"]["totalSz"], "1", "{out}");
+        assert_eq!(orders(&out)["filled"]["totalSz"], "1.0", "{out}");
         assert!(
             ledger(&state, who, "xyz") < dec("1000"),
             "the fee left xyz's ledger"
@@ -2060,15 +2181,15 @@ mod tests {
         format!(r#"{{"type":"order","orders":[{order}],"grouping":"na"}}"#)
     }
 
-    /// An order on a coin outside the configured markets reads its book on
-    /// demand before it fills: `xyz:TSLA` is not a market here, the mock
-    /// venue serves its `l2Book`, and the order fills against that book.
+    /// An order on a coin whose book has not landed reads it on demand
+    /// before it fills: the mock venue serves `xyz:TSLA`'s `l2Book`, and the
+    /// order fills against that book.
     #[tokio::test]
     async fn an_order_on_an_unconfigured_coin_reads_its_book_first() {
         use crate::sim::DealClass::Perp;
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let url = crate::feed::tests::l2_server(hits.clone()).await;
-        let feed = crate::feed::MarketFeed::memory(vec!["ETH".to_string()]);
+        let feed = crate::feed::MarketFeed::memory();
         let now = crate::now_ms();
         feed.put_meta(crate::sim::meta_with("ETH", 10), now);
         feed.put_dex_meta("xyz", crate::sim::meta_of(&[("xyz:TSLA", 10)]), now);
@@ -2102,7 +2223,7 @@ mod tests {
         .await;
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
-            out["response"]["data"]["statuses"][0]["filled"]["avgPx"], "200",
+            out["response"]["data"]["statuses"][0]["filled"]["avgPx"], "200.0",
             "{out}"
         );
         assert_eq!(

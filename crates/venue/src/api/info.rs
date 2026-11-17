@@ -86,7 +86,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
         // A type the sim does not serve is a type the real API does not know:
         // the same 422 (never a 200 with a bare string, which a typed client
         // would parse as data).
-        InfoRequest::Unrouted => Ok(deserialize_failure()),
+        InfoRequest::Unrouted => unrouted(&state, body).await,
         // ---- account-scoped: the sim's, or the venue's -------------------
         InfoRequest::ClearinghouseState { user, dex } => {
             clearinghouse(&state, body, user, dex).await
@@ -108,7 +108,7 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             coin,
             n_sig_figs,
             mantissa,
-        } => l2_book(&coin, n_sig_figs, mantissa, &state).await,
+        } => l2_book(&coin, (n_sig_figs, mantissa), &state, &body).await,
         InfoRequest::MarginTable { id } => margin_table(id, &state),
         InfoRequest::ExchangeStatus => Ok(exchange_status()),
         InfoRequest::SpotMeta => {
@@ -145,8 +145,13 @@ pub async fn info(State(state): State<Arc<ApiState>>, body: Bytes) -> Result<Res
             start_time,
             end_time,
         } => user_funding(&state, body, user, start_time, end_time).await,
+        InfoRequest::UserNonFundingLedgerUpdates {
+            user,
+            start_time,
+            end_time,
+        } => ledger_updates(&state, body, user, (start_time, end_time)).await,
         InfoRequest::MaxBuilderFee { user, builder } => max_fee(&state, body, user, builder).await,
-        InfoRequest::PreTransferCheck { user, .. } => pre_transfer_check(&state, body, user).await,
+        InfoRequest::PreTransferCheck { user, source } => pre_transfer_check(&state, user, source),
     }
 }
 
@@ -273,11 +278,147 @@ async fn user_funding(
     Ok(Json(rows).into_response())
 }
 
+/// `userNonFundingLedgerUpdates`: a simulated account's transfer rows
+/// (`spotTransfer`, `send`, `accountClassTransfer`, `accountActivationGas`),
+/// oldest first, each `{time, hash, delta}`; the venue's verbatim for an
+/// untouched account.
+async fn ledger_updates(
+    state: &ApiState,
+    body: Bytes,
+    user: Address,
+    window: (u64, Option<u64>),
+) -> Result<Response> {
+    match state.sim.ledger_updates(user, window) {
+        Some(rows) => Ok(Json(rows).into_response()),
+        None => pass_through(state, &body).await,
+    }
+}
+
 /// The hash the venue stamps on funding ledger rows (they have no transaction).
 const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The real API's answer to a request it cannot deserialize (an unknown
 /// `type`, a missing field): HTTP 422, plain text.
+/// The neutral address the venue is asked about for a simulated account's
+/// figures the sim holds no ledger for (fee tier, rate limit, referral): a
+/// fresh account with no volume, which is what a sim account is.
+const NEUTRAL_USER: &str = "0x0000000000000000000000000000000000000001";
+
+/// The types the sim has no typed route for. The venue serves them, so the
+/// sim must too (a 422 for a type the venue knows would read as the sim being
+/// broken): the venue's market-wide ones are forwarded; `userFillsByTime` and
+/// `historicalOrders` are the account's own ledgers; the rest of the
+/// account-scoped ones answer for a simulated account like a fresh venue
+/// account (empty lists, or the venue's own answer for a neutral account) and
+/// are forwarded for any other user. A type the venue does not know is its 422.
+#[allow(clippy::too_many_lines)] // one table of account-scoped info types
+async fn unrouted(state: &ApiState, body: Bytes) -> Result<Response> {
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(deserialize_failure());
+    };
+    let kind = request
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let user = request
+        .get("user")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|u| u.parse::<Address>().ok());
+    match (kind, user) {
+        ("recentTrades" | "validatorSummaries", _) => pass_through(state, &body).await,
+        ("userFillsByTime", Some(user)) => {
+            let Some(start) = request.get("startTime").and_then(serde_json::Value::as_u64) else {
+                return Ok(deserialize_failure());
+            };
+            let end = request.get("endTime").and_then(serde_json::Value::as_u64);
+            match state.sim.user_fills(user) {
+                Some(fills) => Ok(Json(
+                    fills
+                        .into_iter()
+                        .filter(|f| f.time >= start && end.is_none_or(|e| f.time <= e))
+                        .take(USER_FILLS_PAGE)
+                        .collect::<Vec<_>>(),
+                )
+                .into_response()),
+                None => pass_through(state, &body).await,
+            }
+        }
+        ("historicalOrders", Some(user)) => historical_orders(state, &body, user).await,
+        (
+            "userRole"
+            | "subAccounts"
+            | "userVaultEquities"
+            | "delegations"
+            | "twapHistory"
+            | "userTwapSliceFills"
+            | "extraAgents"
+            | "isVip"
+            | "userToMultiSigSigners"
+            | "userFees"
+            | "userRateLimit"
+            | "referral"
+            | "legalCheck"
+            | "delegatorSummary"
+            | "portfolio",
+            Some(user),
+        ) => fresh_account_read(state, &body, kind, user, &request).await,
+        _ => Ok(deserialize_failure()),
+    }
+}
+
+/// An account-scoped read the sim holds no ledger for: a simulated account is
+/// a fresh venue account.
+async fn fresh_account_read(
+    state: &ApiState,
+    body: &Bytes,
+    kind: &str,
+    user: Address,
+    request: &serde_json::Value,
+) -> Result<Response> {
+    if state.sim.account(user)?.is_none() {
+        return pass_through(state, body).await;
+    }
+    let fixed = match kind {
+        "userRole" => Some(serde_json::json!({"role": "user"})),
+        "subAccounts" | "userToMultiSigSigners" => Some(serde_json::Value::Null),
+        "isVip" => Some(serde_json::json!(false)),
+        "userVaultEquities" | "delegations" | "twapHistory" | "userTwapSliceFills"
+        | "extraAgents" => Some(serde_json::json!([])),
+        _ => None,
+    };
+    if let Some(answer) = fixed {
+        return Ok(Json(answer).into_response());
+    }
+    let mut neutral = request.clone();
+    neutral["user"] = serde_json::Value::String(NEUTRAL_USER.to_string());
+    pass_through(state, &Bytes::from(neutral.to_string())).await
+}
+
+/// `historicalOrders`: the account's open orders and its terminal history,
+/// newest first (by status time), at most a page.
+async fn historical_orders(state: &ApiState, body: &Bytes, user: Address) -> Result<Response> {
+    if state.sim.account(user)?.is_none() {
+        return pass_through(state, body).await;
+    }
+    let (resting, terminal) = state.sim.order_history(user)?;
+    let mut rows: Vec<StatusOrder> = resting
+        .iter()
+        .map(|r| StatusOrder {
+            order: status_inner(r, dtext(&r.sz)),
+            status: "open",
+            status_timestamp: r.placed_ms,
+        })
+        .chain(terminal.iter().map(|t| StatusOrder {
+            order: status_inner(&t.order, dtext(&t.order.sz)),
+            status: terminal_status_label(t.status),
+            status_timestamp: t.status_ms,
+        }))
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.status_timestamp));
+    rows.truncate(USER_FILLS_PAGE);
+    Ok(Json(rows).into_response())
+}
+
 fn deserialize_failure() -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -287,20 +428,29 @@ fn deserialize_failure() -> Response {
         .into_response()
 }
 
-/// `preTransferCheck`: the venue's answer for a simulated account (known to
-/// the venue, never sanctioned, no transfer fee), the venue's verbatim for an
-/// untouched one.
-async fn pre_transfer_check(state: &ApiState, body: Bytes, user: Address) -> Result<Response> {
-    simulated(state, &body, user, |_| {
-        Ok(Json(serde_json::json!({
-            "isSanctioned": false,
-            "userExists": true,
-            "fee": "0.0",
-            "userHasSentTx": true,
-        }))
-        .into_response())
-    })
-    .await
+/// `preTransferCheck`: `user` is the destination, `source` the sender. The
+/// shape is the real venue's. The sim answers from its own state: `userExists`
+/// is whether the destination exists on the sim, `userHasSentTx` whether it
+/// exists and has paid its activation (it made its first outbound transfer, or
+/// was funded by a seed or `deal`), and `fee` is the 1 USDC activation the
+/// *source* would pay on this transfer (Circle's rule: charged once, on an
+/// account's first outbound action) or `0.0`. The real venue answers
+/// `fee: "1.0"` for a destination it has never seen; the sim does not tie the
+/// fee to the destination.
+fn pre_transfer_check(state: &ApiState, user: Address, source: Address) -> Result<Response> {
+    let check = state.sim.pre_transfer(user, source)?;
+    let fee = if check.source_owes {
+        crate::sim::fees::ACTIVATION_FEE
+    } else {
+        rust_decimal::Decimal::ZERO
+    };
+    Ok(Json(serde_json::json!({
+        "isSanctioned": false,
+        "userExists": check.destination_exists,
+        "fee": crate::sim::fees::real_text(fee),
+        "userHasSentTx": check.destination_has_sent,
+    }))
+    .into_response())
 }
 
 /// `clearinghouseState`: the sim's one-dex clearinghouse for a touched
@@ -390,6 +540,11 @@ pub(crate) struct FrontendOpenOrder {
     pub cloid: Option<alloy_primitives::B128>,
 }
 
+/// A decimal in the venue's text (see [`crate::wire::decimal_nano::text`]).
+pub(crate) fn dtext(value: &rust_decimal::Decimal) -> String {
+    crate::wire::decimal_nano::text(value)
+}
+
 pub(crate) fn side_letter(side: crate::sim::order::Side) -> &'static str {
     match side {
         crate::sim::order::Side::Buy => "B",
@@ -452,12 +607,12 @@ async fn open_orders(
             .into_iter()
             .map(|r| OpenOrder {
                 coin: r.coin.clone(),
-                limit_px: r.px.to_string(),
+                limit_px: dtext(&r.px),
                 oid: r.oid,
                 side: side_letter(r.side),
-                sz: r.sz.to_string(),
+                sz: dtext(&r.sz),
                 timestamp: r.placed_ms,
-                orig_sz: r.orig_sz.to_string(),
+                orig_sz: dtext(&r.orig_sz),
                 cloid: r.cloid,
             })
             .collect();
@@ -553,18 +708,18 @@ pub(crate) fn frontend_row(r: &crate::sim::order::RestingOrder) -> FrontendOpenO
         coin: r.coin.clone(),
         is_position_tpsl: false,
         is_trigger: r.trigger.is_some(),
-        limit_px: r.px.to_string(),
+        limit_px: dtext(&r.px),
         oid: r.oid,
         order_type: order_type(r),
-        orig_sz: r.orig_sz.to_string(),
+        orig_sz: dtext(&r.orig_sz),
         reduce_only: matches!(r.reduce, crate::sim::order::Reduce::Only),
         side: side_letter(r.side),
-        sz: r.sz.to_string(),
+        sz: dtext(&r.sz),
         timestamp: r.placed_ms,
         trigger_condition: trigger_condition(r),
         trigger_px: r
             .trigger
-            .map(|t| t.trigger_px.to_string())
+            .map(|t| dtext(&t.trigger_px))
             .unwrap_or_else(|| "0.0".into()),
         children: Vec::new(),
         tif: if r.trigger.is_some() {
@@ -609,7 +764,7 @@ fn status_inner(r: &crate::sim::order::RestingOrder, sz: String) -> StatusOrderI
 }
 
 /// The terminal status label (the docs' orderStatus strings).
-fn terminal_status_label(status: crate::sim::order::TerminalStatus) -> &'static str {
+pub(crate) fn terminal_status_label(status: crate::sim::order::TerminalStatus) -> &'static str {
     match status {
         crate::sim::order::TerminalStatus::Filled => "filled",
         crate::sim::order::TerminalStatus::Canceled => "canceled",
@@ -630,20 +785,20 @@ async fn order_status(
     }
     let found = match oid {
         crate::wire::OidOrCloid::Oid(o) => match state.sim.resting_by_oid(user, o)? {
-            Some(r) => Some((status_inner(&r, r.sz.to_string()), "open", r.placed_ms)),
+            Some(r) => Some((status_inner(&r, dtext(&r.sz)), "open", r.placed_ms)),
             None => state.sim.terminal_by_oid(user, o)?.map(|t| {
                 (
-                    status_inner(&t.order, t.order.sz.to_string()),
+                    status_inner(&t.order, dtext(&t.order.sz)),
                     terminal_status_label(t.status),
                     t.status_ms,
                 )
             }),
         },
         crate::wire::OidOrCloid::Cloid(c) => match state.sim.resting_by_cloid(user, c)? {
-            Some(r) => Some((status_inner(&r, r.sz.to_string()), "open", r.placed_ms)),
+            Some(r) => Some((status_inner(&r, dtext(&r.sz)), "open", r.placed_ms)),
             None => state.sim.terminal_by_cloid(user, c)?.map(|t| {
                 (
-                    status_inner(&t.order, t.order.sz.to_string()),
+                    status_inner(&t.order, dtext(&t.order.sz)),
                     terminal_status_label(t.status),
                     t.status_ms,
                 )
@@ -790,33 +945,36 @@ fn open_interest_caps(dex: &Option<String>, state: &ApiState) -> Result<Response
     Ok(Json(caps).into_response())
 }
 
-/// `l2Book`: the cached or scripted book for one coin, aggregated per the
+/// `l2Book`: the cached, relayed or scripted book for one coin, aggregated per the
 /// request's parameters (docs: `nSigFigs ∈ {2,3,4,5}`, `mantissa ∈ {1,2,5}`
 /// only with `nSigFigs = 5`). A parameter outside the documented set is a
 /// named 400 — never silently ignored.
 async fn l2_book(
     coin: &str,
-    n_sig_figs: Option<u8>,
-    mantissa: Option<u8>,
+    (n_sig_figs, mantissa): (Option<u8>, Option<u8>),
     state: &ApiState,
+    body: &Bytes,
 ) -> Result<Response> {
     book_params_ok(n_sig_figs, mantissa)?;
-    let now = crate::now_ms();
-    // A configured market's book is the poller's; any other coin a dex lists
-    // (a builder dex's `xyz:TSLA`, a default-dex coin outside `markets`) gets
-    // its book on demand and stays wanted while it is asked for.
-    let configured = state.feed.markets.iter().any(|m| m == coin);
-    let book = if configured {
-        state.feed.book(coin, now)
-    } else {
-        state.feed.ensure_book(coin).await
-    };
+    // An aggregated book is the venue's own, built from its whole depth (twenty
+    // aggregated levels a side); the sim holds twenty raw levels, which would
+    // merge into one or two. A coin the scenario owns the book of is the sim's.
+    if n_sig_figs.is_some()
+        && state.feed.meta_for_coin(coin).is_some()
+        && !state.feed.scripted_book(coin)
+    {
+        return pass_through(state, body).await;
+    }
+    // Every coin a dex lists (default or builder) is a market: its book is
+    // the relayed live one (the read keeps the coin's stream wanted), fetched
+    // once from the venue only when none has landed yet.
+    let book = state.feed.ensure_book(coin).await;
     let Some(book) = book else {
         // The venue's own absence shape (measured live: `l2Book` for an
         // unknown coin answers HTTP 500 `null`, builder dexes included). A
         // coin the venue lists with no book yet is a different fault: the
         // plane is warming (503).
-        return if configured || state.feed.meta_for_coin(coin).is_some() {
+        return if state.feed.meta_for_coin(coin).is_some() {
             Err(Error::Warming)
         } else {
             Ok(unknown_dex())
@@ -858,7 +1016,14 @@ pub(crate) fn aggregate_book(
     let Some(n) = n_sig_figs else {
         return book;
     };
+    // The venue's aggregated books carry the raw book's spread (best ask less
+    // best bid, measured: `1.0` whatever the aggregation).
+    let spread = match (book.levels[0].first(), book.levels[1].first()) {
+        (Some(bid), Some(ask)) => Some(ask.px - bid.px),
+        _ => None,
+    };
     let mut out = book;
+    out.spread = spread;
     for side in 0..2usize {
         let mut merged: std::collections::BTreeMap<Decimal, (Decimal, u64)> =
             std::collections::BTreeMap::new();
@@ -1052,22 +1217,30 @@ pub(crate) fn active_asset_data(
     let mark = state.feed.mark(coin).ok_or_else(|| Error::NoMarket {
         coin: coin.to_string(),
     })?;
-    let leverage = account
-        .positions
-        .get(coin)
-        .map(|p| Leverage {
-            kind: p.leverage,
-            value: p.leverage_value,
-            raw_usd: None,
+    // The leverage the next order on the coin would use: the open position's
+    // own, else the account's last setting, else the venue's default (measured
+    // on real accounts with no position: cross at min(max, 20), isolated with
+    // `rawUsd: "0.0"` on an isolated-only market).
+    let meta = state.feed.meta_for_lookup(coin);
+    let setting = state.sim.leverage_setting_for(user, coin, meta.as_ref())?;
+    let raw_usd = (setting.mode == LeverageType::Isolated).then(|| {
+        // The row's figure: the isolated equity less the signed position value.
+        account.positions.get(coin).map_or(Decimal::ZERO, |p| {
+            let value = mark * p.szi.abs();
+            let signed = if p.szi.is_sign_negative() {
+                -value
+            } else {
+                value
+            };
+            let pnl = p.unrealized_pnl(mark).unwrap_or(Decimal::ZERO);
+            p.margin_used + pnl - signed
         })
-        // A no-position coin serves the venue's own default: the live sample
-        // measured `leverage: {type: "cross", value: 20}` for an account with
-        // no position (2026-10-23, §16.5's probe) — not a fabrication.
-        .unwrap_or(Leverage {
-            kind: LeverageType::Cross,
-            value: 20,
-            raw_usd: None,
-        });
+    });
+    let leverage = Leverage {
+        kind: setting.mode,
+        value: setting.leverage,
+        raw_usd,
+    };
     // `availableToTrade` is the free margin (value minus used minus the open
     // orders' reservations) — the same figure the placement check reads — not
     // `withdrawable`, which the docs' transfer rule bounds.
@@ -1129,8 +1302,11 @@ mod tests {
         assert_eq!(a.levels[0][0].sz, "3".parse().unwrap());
         assert_eq!(a.levels[0][0].n, 3);
         assert_eq!(a.levels[1][0].px, "110".parse().unwrap());
+        // The aggregated book carries the raw book's spread (106.0 - 100.4).
+        assert_eq!(a.spread, Some("5.6".parse().unwrap()));
         // No params: verbatim, both sides in their own order.
         let c = aggregate_book(book, None, 1);
+        assert_eq!(c.spread, None, "a raw book has no spread field");
         assert_eq!(c.levels[0].len(), 2);
         assert_eq!(c.levels[0][0].px, "100.4".parse().unwrap());
         // The documented parameter set, refused by name otherwise.
@@ -1151,10 +1327,9 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({
-                // The wire serializer trims trailing zeros (nano
-                // granularity), so the measured "0.0" is served as "0".
+                // The venue's own text: a whole number carries ".0".
                 "description": "",
-                "marginTiers": [{"lowerBound": "0", "maxLeverage": 1}]
+                "marginTiers": [{"lowerBound": "0.0", "maxLeverage": 1}]
             })
         );
     }
