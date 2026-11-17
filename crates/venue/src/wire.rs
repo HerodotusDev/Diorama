@@ -34,13 +34,61 @@ pub(crate) mod decimal_nano {
     use rust_decimal::Decimal;
     use serde::Serializer;
 
-    /// The same text [`serialize`] writes, for payloads built as JSON values.
+    /// The venue's decimal text, for payloads built as JSON values: trailing
+    /// zeros trimmed and a whole number always carrying `.0` (measured on every
+    /// real info answer and websocket channel, compressed ones included: a
+    /// price is `"64891.0"`, a zero `"0.0"`, and never a bare `"64891"`).
     pub(crate) fn text(value: &Decimal) -> String {
-        value.round_dp(9).normalize().to_string()
+        whole_with_point(value.round_dp(9).normalize().to_string())
+    }
+
+    /// A whole number's `.0`: the venue prints every decimal with a point.
+    pub(crate) fn whole_with_point(text: String) -> String {
+        if text.contains('.') {
+            text
+        } else {
+            format!("{text}.0")
+        }
     }
 
     pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.round_dp(9).normalize().to_string())
+        serializer.serialize_str(&text(value))
+    }
+
+    /// An optional decimal (`null` when absent; pair with `skip_serializing_if`
+    /// where the key is omitted instead).
+    pub fn serialize_opt<S: Serializer>(
+        value: &Option<Decimal>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serialize(v, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// A pair of decimals (`maxTradeSzs`, `availableToTrade`).
+    pub fn serialize_pair<S: Serializer>(
+        value: &[Decimal; 2],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        for v in value {
+            seq.serialize_element(&text(v))?;
+        }
+        seq.end()
+    }
+
+    /// An optional pair (`impactPxs`).
+    pub fn serialize_opt_pair<S: Serializer>(
+        value: &Option<[Decimal; 2]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serialize_pair(v, serializer),
+            None => serializer.serialize_none(),
+        }
     }
 }
 
@@ -52,7 +100,9 @@ fn liquidation_px_text<S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     match value {
-        Some(v) => serializer.serialize_str(&v.round_dp(10).normalize().to_string()),
+        Some(v) => serializer.serialize_str(&decimal_nano::whole_with_point(
+            v.round_dp(10).normalize().to_string(),
+        )),
         None => serializer.serialize_none(),
     }
 }
@@ -388,7 +438,7 @@ pub(crate) struct MarginSummary {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Position {
     pub coin: String,
-    #[serde(default)]
+    #[serde(default, serialize_with = "decimal_nano::serialize_opt")]
     pub entry_px: Option<Decimal>,
     pub leverage: Leverage,
     /// Served as `null` only when the position has no liquidation price: the
@@ -424,7 +474,11 @@ pub(crate) struct Leverage {
     pub value: u32,
     /// `marginUsed − positionValue` (measured exact on the live sample). Only an
     /// isolated position carries it; the venue omits it on a cross one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub raw_usd: Option<Decimal>,
 }
 
@@ -653,15 +707,24 @@ pub(crate) struct AssetCtx {
     pub prev_day_px: Decimal,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub day_ntl_vlm: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub premium: Option<Decimal>,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub oracle_px: Decimal,
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub mark_px: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub mid_px: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt_pair"
+    )]
     pub impact_pxs: Option<[Decimal; 2]>,
     #[serde(default)]
     #[serde(serialize_with = "decimal_nano::serialize")]
@@ -757,7 +820,10 @@ pub(crate) struct L2Book {
     pub coin: String,
     pub time: u64,
     pub levels: [Vec<Level>; 2],
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "decimal_nano::serialize_opt"
+    )]
     pub spread: Option<Decimal>,
 }
 
@@ -777,7 +843,9 @@ pub(crate) struct ActiveAssetData {
     pub user: Address,
     pub coin: String,
     pub leverage: Leverage,
+    #[serde(serialize_with = "decimal_nano::serialize_pair")]
     pub max_trade_szs: [Decimal; 2],
+    #[serde(serialize_with = "decimal_nano::serialize_pair")]
     pub available_to_trade: [Decimal; 2],
     #[serde(serialize_with = "decimal_nano::serialize")]
     pub mark_px: Decimal,
@@ -802,8 +870,19 @@ pub(crate) struct SpecialStatus {
 }
 
 /// `allMids`: a plain `{coin: px}` map (HIP-3 keys are `"#<id>"`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(crate) struct AllMids(pub BTreeMap<String, Decimal>);
+
+impl Serialize for AllMids {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (coin, px) in &self.0 {
+            map.serialize_entry(coin, &decimal_nano::text(px))?;
+        }
+        map.end()
+    }
+}
 
 /// `spotMeta`: the spot token registry (`token` indices the spot state keys
 /// by) + the pair universe.

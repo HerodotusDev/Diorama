@@ -331,7 +331,7 @@ mod tests {
         )]);
         let first: Value =
             serde_json::from_str(&inflate_b64(&fast_frame(None, &a).unwrap())).unwrap();
-        assert_eq!(first, json!({"BTC": {"markPx": "100", "midPx": "100.5"}}));
+        assert_eq!(first, json!({"BTC": {"markPx": "100.0", "midPx": "100.5"}}));
 
         let mut b = a.clone();
         b.get_mut("BTC").unwrap().mid = None;
@@ -398,7 +398,7 @@ mod tests {
         let v: Value =
             serde_json::from_str(&inflate_b64(&pac_frame(Some(&first), &next).unwrap())).unwrap();
         assert_eq!(v[0][1], json!([{}, {}]), "an unchanged dex keeps its slots");
-        assert_eq!(v[1][1][0], json!({"markPx": "301"}));
+        assert_eq!(v[1][1][0], json!({"markPx": "301.0"}));
         assert!(pac_frame(Some(&next), &next).is_none());
     }
 
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(diff["t"], 2);
         assert_eq!(
             diff["l"],
-            json!([[{"p": "98", "s": "4"}, {"p": "97", "s": "5"}], []])
+            json!([[{"p": "98.0", "s": "4.0"}, {"p": "97.0", "s": "5.0"}], []])
         );
         assert_eq!(diff["r"], json!([[1], []]), "index 1 (99) is gone");
         assert!(l2_diff(&next, &next).is_none());

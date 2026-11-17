@@ -420,6 +420,11 @@ pub(crate) struct FrontendOpenOrder {
     pub cloid: Option<alloy_primitives::B128>,
 }
 
+/// A decimal in the venue's text (see [`crate::wire::decimal_nano::text`]).
+pub(crate) fn dtext(value: &rust_decimal::Decimal) -> String {
+    crate::wire::decimal_nano::text(value)
+}
+
 pub(crate) fn side_letter(side: crate::sim::order::Side) -> &'static str {
     match side {
         crate::sim::order::Side::Buy => "B",
@@ -482,12 +487,12 @@ async fn open_orders(
             .into_iter()
             .map(|r| OpenOrder {
                 coin: r.coin.clone(),
-                limit_px: r.px.to_string(),
+                limit_px: dtext(&r.px),
                 oid: r.oid,
                 side: side_letter(r.side),
-                sz: r.sz.to_string(),
+                sz: dtext(&r.sz),
                 timestamp: r.placed_ms,
-                orig_sz: r.orig_sz.to_string(),
+                orig_sz: dtext(&r.orig_sz),
                 cloid: r.cloid,
             })
             .collect();
@@ -583,18 +588,18 @@ pub(crate) fn frontend_row(r: &crate::sim::order::RestingOrder) -> FrontendOpenO
         coin: r.coin.clone(),
         is_position_tpsl: false,
         is_trigger: r.trigger.is_some(),
-        limit_px: r.px.to_string(),
+        limit_px: dtext(&r.px),
         oid: r.oid,
         order_type: order_type(r),
-        orig_sz: r.orig_sz.to_string(),
+        orig_sz: dtext(&r.orig_sz),
         reduce_only: matches!(r.reduce, crate::sim::order::Reduce::Only),
         side: side_letter(r.side),
-        sz: r.sz.to_string(),
+        sz: dtext(&r.sz),
         timestamp: r.placed_ms,
         trigger_condition: trigger_condition(r),
         trigger_px: r
             .trigger
-            .map(|t| t.trigger_px.to_string())
+            .map(|t| dtext(&t.trigger_px))
             .unwrap_or_else(|| "0.0".into()),
         children: Vec::new(),
         tif: if r.trigger.is_some() {
@@ -660,20 +665,20 @@ async fn order_status(
     }
     let found = match oid {
         crate::wire::OidOrCloid::Oid(o) => match state.sim.resting_by_oid(user, o)? {
-            Some(r) => Some((status_inner(&r, r.sz.to_string()), "open", r.placed_ms)),
+            Some(r) => Some((status_inner(&r, dtext(&r.sz)), "open", r.placed_ms)),
             None => state.sim.terminal_by_oid(user, o)?.map(|t| {
                 (
-                    status_inner(&t.order, t.order.sz.to_string()),
+                    status_inner(&t.order, dtext(&t.order.sz)),
                     terminal_status_label(t.status),
                     t.status_ms,
                 )
             }),
         },
         crate::wire::OidOrCloid::Cloid(c) => match state.sim.resting_by_cloid(user, c)? {
-            Some(r) => Some((status_inner(&r, r.sz.to_string()), "open", r.placed_ms)),
+            Some(r) => Some((status_inner(&r, dtext(&r.sz)), "open", r.placed_ms)),
             None => state.sim.terminal_by_cloid(user, c)?.map(|t| {
                 (
-                    status_inner(&t.order, t.order.sz.to_string()),
+                    status_inner(&t.order, dtext(&t.order.sz)),
                     terminal_status_label(t.status),
                     t.status_ms,
                 )
@@ -1076,22 +1081,23 @@ pub(crate) fn active_asset_data(
     let mark = state.feed.mark(coin).ok_or_else(|| Error::NoMarket {
         coin: coin.to_string(),
     })?;
-    let leverage = account
-        .positions
-        .get(coin)
-        .map(|p| Leverage {
-            kind: p.leverage,
-            value: p.leverage_value,
-            raw_usd: None,
-        })
-        // A no-position coin serves the venue's own default: the live sample
-        // measured `leverage: {type: "cross", value: 20}` for an account with
-        // no position (2026-10-23, §16.5's probe) — not a fabrication.
-        .unwrap_or(Leverage {
-            kind: LeverageType::Cross,
-            value: 20,
-            raw_usd: None,
-        });
+    // The leverage the next order on the coin would use: the open position's
+    // own, else the account's last setting, else the venue's default (measured
+    // on real accounts with no position: cross at min(max, 20), isolated with
+    // `rawUsd: "0.0"` on an isolated-only market).
+    let meta = state.feed.meta_for_lookup(coin);
+    let setting = state.sim.leverage_setting_for(user, coin, meta.as_ref())?;
+    let raw_usd = (setting.mode == LeverageType::Isolated).then(|| {
+        account
+            .positions
+            .get(coin)
+            .map_or(Decimal::ZERO, |p| p.margin_used - mark * p.szi.abs())
+    });
+    let leverage = Leverage {
+        kind: setting.mode,
+        value: setting.leverage,
+        raw_usd,
+    };
     // `availableToTrade` is the free margin (value minus used minus the open
     // orders' reservations) — the same figure the placement check reads — not
     // `withdrawable`, which the docs' transfer rule bounds.
@@ -1175,10 +1181,9 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({
-                // The wire serializer trims trailing zeros (nano
-                // granularity), so the measured "0.0" is served as "0".
+                // The venue's own text: a whole number carries ".0".
                 "description": "",
-                "marginTiers": [{"lowerBound": "0", "maxLeverage": 1}]
+                "marginTiers": [{"lowerBound": "0.0", "maxLeverage": 1}]
             })
         );
     }

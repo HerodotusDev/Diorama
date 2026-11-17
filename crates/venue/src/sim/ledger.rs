@@ -668,10 +668,10 @@ mod tests {
             twap_id: None,
         };
         let v = serde_json::to_value(&fill).unwrap();
-        assert_eq!(v["px"], "64173");
+        assert_eq!(v["px"], "64173.0");
         assert_eq!(v["sz"], "0.5");
-        assert_eq!(v["startPosition"], "0");
-        assert_eq!(v["closedPnl"], "0");
+        assert_eq!(v["startPosition"], "0.0");
+        assert_eq!(v["closedPnl"], "0.0");
         assert_eq!(v["fee"], "0.144");
         assert_eq!(v["feeToken"], "USDC");
         assert!(v["twapId"].is_null());

@@ -698,6 +698,7 @@ fn vault_take_coin(
         size,
         px: feed.mark_or(coin, entry_px),
         leverage,
+        mode: crate::wire::LeverageType::Cross,
         reduce: crate::sim::order::Reduce::Any,
         fee: Decimal::ZERO,
         builder: None,

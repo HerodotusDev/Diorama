@@ -1360,6 +1360,9 @@ pub(crate) struct FillFacts {
     pub size: Decimal,
     pub px: Decimal,
     pub leverage: u32,
+    /// The margin mode a new position opens in (the account's setting for the
+    /// coin, else the market's default); an existing position keeps its own.
+    pub mode: LeverageType,
     pub reduce: crate::sim::order::Reduce,
     /// The trading fee (venue base tier; charged on top of the fill — the
     /// plan's `closedPnl = fee + side·(mark−entry)·size`).
@@ -1386,6 +1389,7 @@ impl FillFacts {
             size: sz,
             px,
             leverage,
+            mode: LeverageType::Cross,
             reduce: crate::sim::order::Reduce::Only,
             fee: Decimal::ZERO,
             builder: None,
@@ -1413,8 +1417,14 @@ pub(crate) fn apply_fill(
         .positions
         .entry(fill.coin.clone())
         .or_insert_with(|| fresh_position(fill));
+    let mut allocated = Decimal::ZERO;
     let (closed, realized) = if same_direction(old, signed) {
-        apply_increase(position, old, fill)?;
+        allocated = apply_increase(position, old, fill)?;
+        position.isolated_margin = add(
+            position.isolated_margin,
+            allocated,
+            "isolated margin allocation",
+        )?;
         (Decimal::ZERO, Decimal::ZERO)
     } else {
         let closed = old.abs().min(fill.size);
@@ -1425,6 +1435,14 @@ pub(crate) fn apply_fill(
     // The trading fee (the venue's base tier): charged on the fill's notional,
     // on both sides of a trade, in the dex's collateral token (USDC on the
     // default dex), so a closing fill pays it too.
+    if !allocated.is_zero() {
+        credit_ledger(
+            &mut account.perps,
+            &dex,
+            -allocated,
+            "isolated margin allocation",
+        )?;
+    }
     if !fill.fee.is_zero() {
         credit_ledger(&mut account.perps, &dex, -fill.fee, "trading fee")?;
     }
@@ -1510,7 +1528,7 @@ fn fresh_position(fill: &FillFacts) -> Position {
     Position {
         szi: Decimal::ZERO,
         entry_px: fill.px,
-        leverage: LeverageType::Cross,
+        leverage: fill.mode,
         leverage_value: fill.leverage.max(1),
         margin_used: Decimal::ZERO,
         isolated_margin: Decimal::ZERO,
@@ -1543,7 +1561,7 @@ fn settle_margin(position: &mut Position) -> Result<()> {
 
 /// An increase (or a fresh position): the entry becomes the size-weighted
 /// average of the old notional and the fill.
-fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Result<()> {
+fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Result<Decimal> {
     let signed = fill.size * fill.side.sign();
     let old_notional = mul(old.abs(), position.entry_px, "entry notional")?;
     let fill_notional = mul(fill.size, fill.px, FILL_NOTIONAL)?;
@@ -1554,7 +1572,16 @@ fn apply_increase(position: &mut Position, old: Decimal, fill: &FillFacts) -> Re
         "entry price",
     )?;
     position.szi = new_szi;
-    Ok(())
+    // An isolated position funds its own margin: the increase's initial margin
+    // leaves the cross balance for the position (the venue's isolated open).
+    if position.leverage == LeverageType::Isolated {
+        return div(
+            fill_notional,
+            Decimal::from(position.leverage_value),
+            "isolated margin allocation",
+        );
+    }
+    Ok(Decimal::ZERO)
 }
 
 /// A reduction (or a flip): the closed part's realized PnL (returned for the

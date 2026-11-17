@@ -2047,7 +2047,7 @@ mod tests {
             2,
             "xyz lists two coins"
         );
-        assert_eq!(dexs[2][1][0]["markPx"], "200");
+        assert_eq!(dexs[2][1][0]["markPx"], "200.0");
         assert_eq!(
             dexs[2][1][1],
             serde_json::json!({}),
@@ -2064,7 +2064,7 @@ mod tests {
         let next = decode(&frames[0]);
         assert_eq!(next.as_array().unwrap().len(), 3, "every dex is listed");
         assert_eq!(next[0][1], serde_json::json!([{}]));
-        assert_eq!(next[2][1][0]["markPx"], "201");
+        assert_eq!(next[2][1][0]["markPx"], "201.0");
 
         subscribe_to(
             &state,
@@ -2086,8 +2086,8 @@ mod tests {
             ["BTC", "flx:TSLA", "xyz:TSLA"],
             "no coin without a mark"
         );
-        assert_eq!(fast["xyz:TSLA"]["markPx"], "201");
-        assert_eq!(fast["flx:TSLA"]["midPx"], "300");
+        assert_eq!(fast["xyz:TSLA"]["markPx"], "201.0");
+        assert_eq!(fast["flx:TSLA"]["midPx"], "300.0");
     }
 
     /// `activeAssetCtx` of a builder coin is that coin's own context, found by
@@ -2113,6 +2113,6 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["data"]["coin"], "xyz:TSLA");
-        assert_eq!(value["data"]["ctx"]["openInterest"], "7");
+        assert_eq!(value["data"]["ctx"]["openInterest"], "7.0");
     }
 }

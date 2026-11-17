@@ -766,8 +766,8 @@ fn fill_status(
     {
         Ok(placed) => match (placed.fill, placed.resting) {
             (Some(fill), _) => OrderStatus::Filled(FilledInfo {
-                total_sz: fill.total_sz.to_string(),
-                avg_px: fill.avg_px.to_string(),
+                total_sz: crate::wire::decimal_nano::text(&fill.total_sz),
+                avg_px: crate::wire::decimal_nano::text(&fill.avg_px),
                 oid: fill.oid,
             }),
             (None, Some(oid)) => OrderStatus::Resting(RestingInfo { oid }),
@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
             out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
-            "2"
+            "2.0"
         );
         assert!(
             balance(&state, OWNER) < "1000".parse().unwrap(),
@@ -1270,7 +1270,7 @@ mod tests {
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
             out["response"]["data"]["statuses"][0]["filled"]["totalSz"],
-            "2"
+            "2.0"
         );
         let taker =
             "202".parse::<rust_decimal::Decimal>().unwrap() * crate::sim::order::taker_fee();
@@ -2013,7 +2013,7 @@ mod tests {
         )
         .await;
         assert_eq!(out["status"], "ok", "{out}");
-        assert_eq!(orders(&out)["filled"]["totalSz"], "1", "{out}");
+        assert_eq!(orders(&out)["filled"]["totalSz"], "1.0", "{out}");
         assert!(
             ledger(&state, who, "xyz") < dec("1000"),
             "the fee left xyz's ledger"
@@ -2194,7 +2194,7 @@ mod tests {
         .await;
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
-            out["response"]["data"]["statuses"][0]["filled"]["avgPx"], "200",
+            out["response"]["data"]["statuses"][0]["filled"]["avgPx"], "200.0",
             "{out}"
         );
         assert_eq!(

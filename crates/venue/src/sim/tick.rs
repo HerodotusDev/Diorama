@@ -304,16 +304,22 @@ impl Sim {
         feed: &MarketFeed,
     ) -> Result<()> {
         let meta = feed.meta_for_lookup(&r.coin);
-        let leverage = self.leverage_for(r.account, &r.coin, meta.as_ref())?;
+        let setting = self.leverage_setting_for(r.account, &r.coin, meta.as_ref())?;
         let notional = crate::sim::account::mul(take, r.px, "maker notional")?;
         let facts = crate::sim::account::FillFacts {
             coin: r.coin.clone(),
             side: r.side,
             size: take,
             px: r.px,
-            leverage,
+            leverage: setting.leverage,
+            mode: setting.mode,
             reduce: r.reduce,
-            fee: crate::sim::account::mul(notional, crate::sim::order::maker_fee(), "maker fee")?,
+            fee: crate::sim::account::mul(
+                notional,
+                crate::sim::order::maker_fee()
+                    * crate::sim::order::dex_fee_multiplier(meta.as_ref(), &r.coin),
+                "maker fee",
+            )?,
             builder: r.builder.map(|b| b.charge(notional)).transpose()?,
         };
         let effect = self.with_account_now(r.account, feed, |account| {

@@ -1310,12 +1310,17 @@ impl MarketFeed {
             return false;
         };
         let mut any = false;
-        for asset in info
-            .meta
-            .universe
-            .iter()
-            .filter(|a| !a.is_delisted.unwrap_or(false))
-        {
+        for asset in &info.meta.universe {
+            // A delisted coin streams nothing, so its (static) context only
+            // ever comes from the REST read: until one landed, the dex is not
+            // carried (`metaAndAssetCtxs` serves the whole universe, so a
+            // dex missing a delisted coin's row would stay unserved forever).
+            if asset.is_delisted.unwrap_or(false) {
+                if !c.ctxs.contains_key(&asset.name) {
+                    return false;
+                }
+                continue;
+            }
             any = true;
             if !c
                 .ctx_at
@@ -2063,6 +2068,30 @@ pub(crate) mod tests {
         assert!(feed.dex_ctxs_fresh("xyz", 12_000, 15_000));
         assert!(!feed.dex_ctxs_fresh("xyz", 40_000, 15_000));
         assert!(!feed.dex_ctxs_fresh("nope", 12_000, 15_000));
+    }
+
+    /// A dex with delisted coins is carried by the socket only once the REST
+    /// read has landed the delisted coins' static contexts (the socket never
+    /// streams them): otherwise `metaAndAssetCtxs {dex}` would stay a 503.
+    #[test]
+    fn a_dex_with_delisted_coins_needs_their_rest_context_once() {
+        let feed = MarketFeed::memory();
+        let mut meta = crate::sim::meta_of(&[("xyz:A", 10), ("xyz:OLD", 10)]);
+        meta.universe[1].is_delisted = Some(true);
+        feed.put_dex_meta("xyz", meta.clone(), 1);
+        feed.put_ctx("xyz:A".into(), test_ctx("5", "5"), 10_000);
+        assert!(
+            !feed.dex_ctxs_fresh("xyz", 12_000, 15_000),
+            "the delisted coin has no context yet: the REST read is still owed"
+        );
+        feed.put_dex_ctxs(
+            "xyz",
+            meta,
+            vec![test_ctx("5", "5"), test_ctx("2", "2")],
+            11_000,
+        );
+        assert!(feed.dex_ctxs_fresh("xyz", 12_000, 15_000));
+        assert!(feed.meta_and_ctxs_of("xyz").is_some_and(|m| m.1.len() == 2));
     }
 
     /// `allMids` for a dex takes the context's mid when the context is newer

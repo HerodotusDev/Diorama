@@ -418,6 +418,77 @@ async fn info_responses_have_the_venues_shapes() {
         .all(Value::is_string));
 }
 
+/// Every decimal the venue prints carries a point and no trailing zero: a whole
+/// number is `"64891.0"` (never `"64891"`), a zero `"0.0"`, a fraction trimmed
+/// (`"0.1"`, never `"0.10"`). Measured on every real info answer and websocket
+/// channel (compressed frames included): none holds a bare integer string, so a
+/// client that compares or parses the text sees the same on the sim.
+fn decimal_text_problems(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            let numeric = !text.is_empty()
+                && text
+                    .trim_start_matches('-')
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.')
+                && text
+                    .trim_start_matches('-')
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
+            if numeric {
+                let trimmed = text.trim_end_matches('0');
+                if !text.contains('.')
+                    || (trimmed.ends_with('.') && !text.ends_with(".0"))
+                    || (text.ends_with('0') && !text.ends_with(".0"))
+                {
+                    out.push(format!("{path} = {text}"));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                decimal_text_problems(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                decimal_text_problems(v, &format!("{path}.{k}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn decimals_are_printed_the_venues_way() {
+    let (state, user) = world();
+    let bodies = [
+        serde_json::json!({"type": "clearinghouseState", "user": user}),
+        serde_json::json!({"type": "clearinghouseState", "user": user, "dex": "xyz"}),
+        serde_json::json!({"type": "spotClearinghouseState", "user": user}),
+        serde_json::json!({"type": "openOrders", "user": user}),
+        serde_json::json!({"type": "frontendOpenOrders", "user": user, "dex": "ALL_DEXS"}),
+        serde_json::json!({"type": "activeAssetData", "user": user, "coin": "ETH"}),
+        serde_json::json!({"type": "activeAssetData", "user": user, "coin": "xyz:TSLA"}),
+        serde_json::json!({"type": "l2Book", "coin": "ETH"}),
+        serde_json::json!({"type": "meta", "dex": "xyz"}),
+        serde_json::json!({"type": "metaAndAssetCtxs"}),
+        serde_json::json!({"type": "metaAndAssetCtxs", "dex": "xyz"}),
+        serde_json::json!({"type": "allMids", "dex": "ALL_DEXS"}),
+        serde_json::json!({"type": "marginTable", "id": 30}),
+        serde_json::json!({"type": "userFills", "user": user}),
+        serde_json::json!({"type": "userFunding", "user": user, "startTime": 0}),
+        serde_json::json!({"type": "userNonFundingLedgerUpdates", "user": user, "startTime": 0}),
+    ];
+    let mut problems = Vec::new();
+    for body in bodies {
+        let name = body["type"].as_str().unwrap().to_string();
+        decimal_text_problems(&info_json(&state, body).await, &name, &mut problems);
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// The sim's own per-dex figures: a builder dex's clearinghouse holds its
 /// position and none of the others', an untouched dex is empty, the resting
 /// orders split by dex (`ALL_DEXS` lists them all, newest first), and a table
@@ -486,7 +557,7 @@ async fn the_per_dex_reads_hold_only_that_dexs_figures() {
     )
     .await;
     assert_eq!(data["coin"], "xyz:TSLA");
-    assert_eq!(data["markPx"], "101");
+    assert_eq!(data["markPx"], "101.0");
 }
 
 /// What the venue answers for an unlisted dex, for `ALL_DEXS` where the type
