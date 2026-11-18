@@ -1711,6 +1711,36 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A contract's CoreWriter `spotSend` is not subject to the refusal the
+    /// API-signed one gets on a unified account (measured on testnet,
+    /// 2026-11-18): it moves the funds.
+    #[tokio::test]
+    async fn corewriter_spot_send_works_from_a_unified_account() {
+        let (bridge, sim, tokens) = fee_bridge();
+        let me = Address::repeat_byte(0x0a);
+        let you = Address::repeat_byte(0x0b);
+        let usdc = TokenRef {
+            index: 0,
+            coin: "USDC",
+        };
+        sim.credit_spot(me, usdc, "20".parse().unwrap()).unwrap();
+        sim.credit_spot(you, usdc, "1".parse().unwrap()).unwrap();
+        sim.set_mode(
+            me,
+            crate::wire::UserAbstraction::UnifiedAccount,
+            &bridge.feed,
+        )
+        .unwrap();
+        let send = CoreAction::SpotSend {
+            destination: you,
+            token: 0,
+            wei: 5 * 100_000_000,
+        };
+        bridge.apply_action(me, send, &tokens).await.unwrap();
+        assert_eq!(usdc_of(&sim, me), "15".parse::<Decimal>().unwrap());
+        assert_eq!(usdc_of(&sim, you), "6".parse::<Decimal>().unwrap());
+    }
+
     /// CoreWriter's `spotSend` and `sendAsset` follow the same activation rule
     /// as the HTTP transfers (Circle): an account created by an inbound send is
     /// credited in full and pays 1 USDC on top of its first outbound send; a

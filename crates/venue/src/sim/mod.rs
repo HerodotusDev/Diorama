@@ -73,11 +73,13 @@ pub(crate) enum Applied {
     Refused,
 }
 
-/// The venue's refusal of a `usdClassTransfer` from a unified account (measured
-/// on testnet, 2026-11-18, for the perp→spot direction; the action is one for
-/// both).
-pub(crate) const UNIFIED_CLASS_TRANSFER_REFUSAL: &str =
-    "Action disabled when unified account is active";
+/// The venue's refusal of an action a unified account cannot take (measured on
+/// testnet, 2026-11-18): `usdClassTransfer` (perp→spot; the action is one for
+/// both directions) and the API-signed `spotSend`, whatever the token and the
+/// destination, a token's system address included. `sendAsset` is accepted, and
+/// so are a contract's CoreWriter `spotSend` (action 6) and `sendAsset`
+/// (action 13), which is how the margin agents recall.
+pub(crate) const UNIFIED_ACTION_REFUSAL: &str = "Action disabled when unified account is active";
 
 /// One USD-class transfer's inputs (CoreWriter action 7 applied): the token
 /// moved, the amount, and the direction. One struct keeps the applied
@@ -669,7 +671,7 @@ impl Sim {
     /// pool (the docs: "USDC unifies perps + spot"), so the venue disables the
     /// action in both directions. Measured on the live venue's testnet
     /// (2026-11-18): a perp→spot `usdClassTransfer` on a unified account is
-    /// rejected with [`UNIFIED_CLASS_TRANSFER_REFUSAL`]. Here that is a
+    /// rejected with [`UNIFIED_ACTION_REFUSAL`]. Here that is a
     /// `Refused` (never an `Err`, which would stall the bridge's block scan);
     /// the signed API names the venue's message.
     ///
@@ -686,7 +688,7 @@ impl Sim {
         let applied = self.with_account(address, |account| {
             if account.mode == crate::wire::UserAbstraction::UnifiedAccount {
                 tracing::warn!(account = %address, amount = %transfer.amount,
-                    "usd class transfer refused: {UNIFIED_CLASS_TRANSFER_REFUSAL}");
+                    "usd class transfer refused: {UNIFIED_ACTION_REFUSAL}");
                 return Ok(Applied::Refused);
             }
             stamp_funding_baseline(account, clock);

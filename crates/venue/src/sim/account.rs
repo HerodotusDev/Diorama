@@ -218,8 +218,9 @@ impl Account {
     /// balance both merge into spot, nothing is lost, and open positions and
     /// resting orders stay untouched (their margin then reads as spot `hold`).
     ///
-    /// A ledger whose collateral token is not USDC follows the same rule, which
-    /// is modeled, not measured (see [`unified_spot_available`]). A negative
+    /// A ledger whose collateral token is not USDC follows the same rule,
+    /// measured on testnet too (12.99818 USDH on the `flxn` dex became 12.99818
+    /// USDH on spot, nothing converted to USDC). A negative
     /// ledger (a perp view below its own cash) stays put: the unified equity
     /// pools it with spot anyway, and a debt must not turn a spot balance
     /// negative. A dex whose token the registry cannot name is left alone.
