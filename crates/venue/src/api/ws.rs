@@ -1280,7 +1280,7 @@ fn spot_state_of(state: &ApiState, user: Address) -> crate::error::Result<SpotCl
     Ok(match state.sim.account(user)? {
         Some(account) => {
             SpotClearinghouseState {
-                balances: crate::sim::account::spot_balances(&account),
+                balances: crate::sim::account::served_spot_balances(&account, &state.feed)?,
                 token_to_available_after_maintenance:
                     crate::sim::account::available_after_maintenance(&account, &state.feed)?,
             }

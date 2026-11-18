@@ -73,6 +73,12 @@ pub(crate) enum Applied {
     Refused,
 }
 
+/// The venue's refusal of a `usdClassTransfer` from a unified account (measured
+/// on testnet, 2026-11-18, for the perp→spot direction; the action is one for
+/// both).
+pub(crate) const UNIFIED_CLASS_TRANSFER_REFUSAL: &str =
+    "Action disabled when unified account is active";
+
 /// One USD-class transfer's inputs (CoreWriter action 7 applied): the token
 /// moved, the amount, and the direction. One struct keeps the applied
 /// signature inside the repo's five-argument scope.
@@ -659,20 +665,17 @@ impl Sim {
     /// USD class transfer (CoreWriter action 7): spot USDC ↔ perp wallet.
     /// `Refused` when the move exceeds the mode's bound.
     ///
-    /// The bound depends on the mode. A **standard** account has two ledgers:
-    /// the perp view's cash bounds the draw. A **unified** account's USDC is
-    /// ONE pool (the docs: "USDC unifies perps + spot"; the fold treats the
-    /// collateral spot side as part of the raw balance), so a perp→spot class
-    /// transfer re-splits the pool's views — the pool's cash and every served
-    /// figure (`accountValue`, `withdrawable`, the identity) are
-    /// view-invariant by construction — and the docs' transfer rule (the
-    /// margin floor: "transferring includes ... transfer to spot wallet")
-    /// bounds it. The perp view may go negative: the pool still holds the
-    /// value, exactly as the venue's cross ledger runs a negative balance
-    /// under water. The perp view's cash alone is not the unified bound — the
-    /// product's recall lands its note on the spot side, so the perp view
-    /// routinely holds a fraction of the pool, and a perp-cash bound would
-    /// refuse a withdrawal the venue's own rule allows.
+    /// A **unified** account cannot class-transfer at all: its USDC is one
+    /// pool (the docs: "USDC unifies perps + spot"), so the venue disables the
+    /// action in both directions. Measured on the live venue's testnet
+    /// (2026-11-18): a perp→spot `usdClassTransfer` on a unified account is
+    /// rejected with [`UNIFIED_CLASS_TRANSFER_REFUSAL`]. Here that is a
+    /// `Refused` (never an `Err`, which would stall the bridge's block scan);
+    /// the signed API names the venue's message.
+    ///
+    /// A **standard** account has two ledgers: the perp view's cash bounds the
+    /// draw (the docs' margin floor: "transferring includes ... transfer to
+    /// spot wallet").
     pub(crate) fn usd_class_transfer(
         &self,
         address: Address,
@@ -681,6 +684,11 @@ impl Sim {
     ) -> Result<Applied> {
         let clock = self.clock(crate::now_ms())?;
         let applied = self.with_account(address, |account| {
+            if account.mode == crate::wire::UserAbstraction::UnifiedAccount {
+                tracing::warn!(account = %address, amount = %transfer.amount,
+                    "usd class transfer refused: {UNIFIED_CLASS_TRANSFER_REFUSAL}");
+                return Ok(Applied::Refused);
+            }
             stamp_funding_baseline(account, clock);
             match transfer.direction {
                 Direction::ToPerp => {
@@ -708,7 +716,6 @@ impl Sim {
                             "usd class transfer refused: the amount exceeds what the default dex may send (the docs' transfer floor)");
                         return Ok(Applied::Refused);
                     }
-                    // The unified pool re-splits: the perp view may go negative.
                     account.credit_perp(DEFAULT_DEX, -transfer.amount, "usd class transfer")?;
                     account::credit_entry(account, transfer.token, transfer.amount, "usd class transfer")?;
                 }
@@ -807,15 +814,27 @@ impl Sim {
         }
     }
 
-    /// Set the account's abstraction mode (CoreWriter action 16). Portfolio
-    /// margin is refused by name (see `account::refuse_unmodeled_mode`).
+    /// Set the account's abstraction mode (CoreWriter action 16, and the signed
+    /// `userSetAbstraction` / `agentSetAbstraction`). Portfolio margin is
+    /// refused by name (see `account::refuse_unmodeled_mode`). Switching to
+    /// `unifiedAccount` merges the perp ledgers into spot first
+    /// ([`Account::fold_ledgers_into_spot`]); `feed` names each dex's
+    /// collateral token.
     pub(crate) fn set_mode(
         &self,
         address: Address,
         mode: crate::wire::UserAbstraction,
+        feed: &MarketFeed,
     ) -> Result<()> {
         account::refuse_unmodeled_mode(mode)?;
         self.mutate_account(address, |account| {
+            // The switch to unified is a one-way merge of the perp ledgers into
+            // spot (the venue's behavior); switching back splits nothing.
+            if mode == crate::wire::UserAbstraction::UnifiedAccount
+                && account.mode != crate::wire::UserAbstraction::UnifiedAccount
+            {
+                account.fold_ledgers_into_spot(feed)?;
+            }
             account.mode = mode;
             Ok(())
         })
@@ -1164,39 +1183,20 @@ pub(crate) fn meta_with_table(coin: &str, max_leverage: u32) -> crate::wire::Met
 mod tests {
     use super::*;
 
-    /// The unified account's USD-class transfer is bounded by the docs'
-    /// transfer rule (the margin floor — `withdrawable`), not by the perp
-    /// view's cash: the unified USDC is ONE pool and the class transfer
-    /// re-splits its **views**, so the whole account (`accountValue + spot`)
-    /// is unchanged by the move while the perp view and its `withdrawable`
-    /// both fall. This is the R5 recall shape (run 2026-10-31 11:40Z): the
-    /// note lands on the spot side, the perp view holds only the trading cash,
-    /// and the venue's own rule allows withdrawing up to `withdrawable` — the
-    /// old perp-cash bound refused a legal recall and stranded the recovery
-    /// sweep.
+    /// A unified account cannot class-transfer in either direction: its USDC is
+    /// one pool, and the venue disables the action ("Action disabled when
+    /// unified account is active", measured on testnet 2026-11-18). The sim
+    /// refuses and moves nothing; it is a `Refused`, never an `Err`, because an
+    /// error would stall the bridge's block scan on a CoreWriter action 7.
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn unified_class_transfer_is_bounded_by_the_transfer_rule_not_the_perp_view() {
+    fn a_unified_account_cannot_class_transfer() {
         let feed = feed_with(&[("HYPE", "87.87", "87.87")]);
-        let meta = meta_with_table("HYPE", 10);
-        // The account plane's maintenance reads the live meta; the fixture's
-        // feed carries it (a warming feed would fail closed by design).
-        feed.put_meta(meta.clone(), crate::now_ms());
         let sim = Sim::memory();
         let a = Address::repeat_byte(0xb0);
-        // The R5 fixture shape: a unified account short −0.08 HYPE @ 87.87
-        // (cross 10×, margin 0.1×positionValue), the note (7.865) on the spot
-        // side, the perp view funded by the deal (7.82 − 7.0296 = 0.7904).
-        let seed: AccountSeed = serde_json::from_str(
-            r#"{"userAbstraction": "unifiedAccount",
-                "marginSummary": {"accountValue": "-7.0296", "totalNtlPos": "7.0296", "totalRawUsd": "0", "totalMarginUsed": "0.70296"},
-                "assetPositions": [{"type": "oneWay", "position": {"coin": "HYPE", "entryPx": "87.87",
-                    "leverage": {"type": "cross", "value": 10}, "marginUsed": "0.70296", "maxLeverage": 10,
-                    "positionValue": "7.0296", "returnOnEquity": "0", "szi": "-0.08", "unrealizedPnl": "0",
-                    "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"}}}]}"#,
-        )
-        .unwrap();
-        sim.set_account(a, seed).unwrap();
+        let usdc = TokenRef {
+            index: account::COLLATERAL_TOKEN,
+            coin: "USDC",
+        };
         sim.deal(
             &feed,
             &Deal {
@@ -1204,103 +1204,44 @@ mod tests {
                 class: DealClass::Perp,
                 coin: None,
                 dex: None,
-                amount: "7.82".parse().unwrap(),
+                amount: "10".parse().unwrap(),
             },
         )
         .unwrap();
-        sim.credit_spot(
-            a,
-            TokenRef {
-                index: account::COLLATERAL_TOKEN,
-                coin: "USDC",
-            },
-            "7.865".parse().unwrap(),
-        )
-        .unwrap();
-
-        let acct = sim
-            .account(a)
-            .unwrap()
-            .expect("the seed registers the account");
-        let before = account::clearinghouse(&acct, &feed, "", 1).unwrap();
-        // The perp view: raw 7.82 (deal 7.82 − the short's cost basis),
-        // accountValue 0.7904 (raw − 7.0296 positionValue). The 7.865 note is
-        // a separate spot ledger; the whole account is 8.6554.
-        assert_eq!(
-            before.margin_summary.account_value,
-            "0.7904".parse::<Decimal>().unwrap()
-        );
-        assert_eq!(
-            before.margin_summary.total_raw_usd,
-            "7.82".parse::<Decimal>().unwrap()
-        );
-        let spot_before = acct
-            .spot
-            .get(&account::COLLATERAL_TOKEN)
-            .expect("the note is on spot")
-            .total;
-        assert_eq!(
-            before.margin_summary.account_value + spot_before,
-            "8.6554".parse::<Decimal>().unwrap(),
-            "the whole account is the perp view plus spot"
-        );
-        let withdrawable = before.withdrawable;
-        let transfer = |amount: Decimal| ClassTransfer {
-            token: TokenRef {
-                index: account::COLLATERAL_TOKEN,
-                coin: "USDC",
-            },
-            amount,
-            direction: Direction::ToSpot,
-        };
-
-        // The recall's clamped figure (the venue's own withdrawable) moves —
-        // the perp view goes negative while the pool's cash is unchanged.
-        let applied = sim
-            .usd_class_transfer(a, &transfer(withdrawable), &feed)
+        sim.credit_spot(a, usdc, "5".parse().unwrap()).unwrap();
+        sim.set_mode(a, crate::wire::UserAbstraction::UnifiedAccount, &feed)
             .unwrap();
-        assert!(
-            matches!(applied, Applied::Applied),
-            "the venue's own rule allows the move"
-        );
-        let acct = sim.account(a).unwrap().unwrap();
-        let after = account::clearinghouse(&acct, &feed, "", 1).unwrap();
-        let spot_after = acct
-            .spot
-            .get(&account::COLLATERAL_TOKEN)
-            .expect("the note is on spot")
-            .total;
+        // The switch merged the perp cash into spot: 15 on one balance.
+        let before = sim.account(a).unwrap().unwrap();
+        assert_eq!(before.spot[&0].total, Decimal::from(15));
+
+        for direction in [Direction::ToSpot, Direction::ToPerp] {
+            let applied = sim
+                .usd_class_transfer(
+                    a,
+                    &ClassTransfer {
+                        token: usdc,
+                        amount: Decimal::ONE,
+                        direction,
+                    },
+                    &feed,
+                )
+                .unwrap();
+            assert!(
+                matches!(applied, Applied::Refused),
+                "{direction:?} is disabled on a unified account"
+            );
+        }
         assert_eq!(
-            after.margin_summary.account_value + spot_after,
-            before.margin_summary.account_value + spot_before,
-            "the whole account is view-invariant"
-        );
-        assert_eq!(
-            after.margin_summary.account_value,
-            before.margin_summary.account_value - withdrawable,
-            "the perp view fell by the moved amount"
-        );
-        assert_eq!(
-            after.withdrawable,
-            Decimal::ZERO,
-            "the floor consumed the perp view"
-        );
-        assert_eq!(
-            spot_after,
-            spot_before + withdrawable,
-            "the spot view rose by the moved amount"
+            sim.account(a).unwrap().unwrap(),
+            before,
+            "a refused transfer moves nothing"
         );
         assert!(
-            account::identity_holds(&after),
-            "the identity survives the re-split"
+            sim.ledger_updates(a, (0, None))
+                .is_none_or(|rows| rows.is_empty()),
+            "and writes no ledger row"
         );
-
-        // More than the rule allows is refused — the venue never pays out
-        // past its transfer floor.
-        let refused = sim
-            .usd_class_transfer(a, &transfer(withdrawable + Decimal::ONE), &feed)
-            .unwrap();
-        assert!(matches!(refused, Applied::Refused));
     }
 
     /// A *standard* account keeps its two ledgers: the perp side's cash bounds
@@ -1840,7 +1781,8 @@ mod tests {
     fn portfolio_margin_is_refused_by_name() {
         let sim = Sim::memory();
         let a = Address::repeat_byte(0xaa);
-        let refused = sim.set_mode(a, crate::wire::UserAbstraction::PortfolioMargin);
+        let feed = MarketFeed::memory();
+        let refused = sim.set_mode(a, crate::wire::UserAbstraction::PortfolioMargin, &feed);
         assert!(refused.is_err(), "portfolio margin is not modeled");
         assert!(refused
             .unwrap_err()
@@ -1851,7 +1793,7 @@ mod tests {
             None,
             "nothing entered the state"
         );
-        sim.set_mode(a, crate::wire::UserAbstraction::UnifiedAccount)
+        sim.set_mode(a, crate::wire::UserAbstraction::UnifiedAccount, &feed)
             .unwrap();
         assert_eq!(
             sim.account(a).unwrap().unwrap().mode,

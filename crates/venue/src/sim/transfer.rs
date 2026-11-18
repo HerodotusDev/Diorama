@@ -858,7 +858,8 @@ mod tests {
         let feed = feed();
         let sim = Sim::memory();
         let me = Address::repeat_byte(0xa1);
-        sim.set_mode(me, UserAbstraction::UnifiedAccount).unwrap();
+        sim.set_mode(me, UserAbstraction::UnifiedAccount, &feed)
+            .unwrap();
         spot(&sim, me, USDC, "100");
         // A 1 ETH long at 100 (10x): maintenance 5 on the default dex.
         let order = Order {

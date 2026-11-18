@@ -109,6 +109,39 @@ fn scaled_i64(amount: Decimal, decimals: u32) -> Option<i64> {
         .to_i64()
 }
 
+/// The spot-balance answers: each token's `total` and `hold` in core wei. The
+/// `hold` is what the venue serves: resting orders plus a unified account's
+/// position margin ([`account::served_hold`]). A figure that does not compute
+/// or overflows is left out.
+fn spot_balance_answers(
+    user: Address,
+    account: &Account,
+    feed: &MarketFeed,
+    tokens: &[TokenInfo],
+) -> Vec<Answer> {
+    let mut out = Vec::new();
+    for (index, entry) in &account.spot {
+        let Some(token) = system::by_index(tokens, *index) else {
+            continue;
+        };
+        let Ok(served) = account::served_hold(account, feed, entry, *index) else {
+            continue;
+        };
+        let (Some(total), Some(hold)) = (
+            scaled_u64(entry.total, token.wei_decimals),
+            scaled_u64(served, token.wei_decimals),
+        ) else {
+            continue;
+        };
+        out.push(Answer::new(
+            SPOT_BALANCE,
+            (user, u64::from(*index)).abi_encode_params(),
+            (total, hold, 0u64).abi_encode_params(),
+        ));
+    }
+    out
+}
+
 /// Every answer the sim's account `user` has: its spot balances, the default
 /// dex's `withdrawable`, each dex's margin summary and its existence. A figure
 /// the sim cannot compute (a missing mark) or that overflows is left out, so
@@ -124,22 +157,7 @@ pub(crate) fn answers_of(
         (user,).abi_encode_params(),
         true.abi_encode(),
     )];
-    for (index, entry) in &account.spot {
-        let Some(token) = system::by_index(tokens, *index) else {
-            continue;
-        };
-        let (Some(total), Some(hold)) = (
-            scaled_u64(entry.total, token.wei_decimals),
-            scaled_u64(entry.hold, token.wei_decimals),
-        ) else {
-            continue;
-        };
-        out.push(Answer::new(
-            SPOT_BALANCE,
-            (user, u64::from(*index)).abi_encode_params(),
-            (total, hold, 0u64).abi_encode_params(),
-        ));
-    }
+    out.extend(spot_balance_answers(user, account, feed, tokens));
     let mut dex = 0u32;
     while let Some(name) = feed.dex_name_at(dex) {
         if let Ok(view) = account::view(account, feed, &name) {

@@ -211,6 +211,45 @@ impl Account {
         credit_ledger(&mut self.perps, dex, amount, what)
     }
 
+    /// What the venue does when an account is switched to `unifiedAccount`: every
+    /// perp ledger's cash moves into the spot balance of the token its dex
+    /// margins against, so the account holds one balance. Measured on the live
+    /// venue's testnet (2026-11-18): perp-class USDC and a USDC HIP-3 dex's
+    /// balance both merge into spot, nothing is lost, and open positions and
+    /// resting orders stay untouched (their margin then reads as spot `hold`).
+    ///
+    /// A ledger whose collateral token is not USDC follows the same rule, which
+    /// is modeled, not measured (see [`unified_spot_available`]). A negative
+    /// ledger (a perp view below its own cash) stays put: the unified equity
+    /// pools it with spot anyway, and a debt must not turn a spot balance
+    /// negative. A dex whose token the registry cannot name is left alone.
+    pub(crate) fn fold_ledgers_into_spot(&mut self, feed: &MarketFeed) -> Result<()> {
+        let funded: Vec<String> = self
+            .perps
+            .iter()
+            .filter(|(_, ledger)| ledger.balance > Decimal::ZERO)
+            .map(|(dex, _)| dex.clone())
+            .collect();
+        for dex in funded {
+            let token = feed.collateral_token_of(&dex);
+            let Some(coin) = feed.token_name(token) else {
+                continue;
+            };
+            let amount = self.perp_balance(&dex);
+            credit_entry(
+                self,
+                crate::sim::TokenRef {
+                    index: token,
+                    coin: &coin,
+                },
+                amount,
+                "unified switch: perp ledger into spot",
+            )?;
+            *self.perp_balance_mut(&dex) = Decimal::ZERO;
+        }
+        Ok(())
+    }
+
     /// The dexes the account holds a non-flat position in, sorted (`""`
     /// first). The waterfall walks these: a balance alone carries no risk.
     pub(crate) fn position_dexs(&self) -> Vec<String> {
@@ -798,7 +837,43 @@ pub(crate) fn identity_holds(state: &ClearinghouseState) -> bool {
         .unwrap_or(false)
 }
 
-/// The served spot balances (USDC token 0 sorts first, like the venue's).
+/// The spot `hold` the venue serves for `token`: what a resting spot order
+/// holds, plus (unified) the margin the account's positions hold on every dex
+/// margining against the token. Measured on the live venue's testnet
+/// (2026-11-18): an open position's margin shows as `hold` on the spot balance,
+/// so `total - hold` is the free spot figure the margin agents read. Serving
+/// only: the stored `hold` stays the resting orders' (the margin is derived
+/// from the positions each read, so a seed round trip never stores it).
+pub(crate) fn served_hold(
+    account: &Account,
+    feed: &MarketFeed,
+    entry: &SpotEntry,
+    token: u32,
+) -> Result<Decimal> {
+    add(
+        entry.hold,
+        unified_hold(account, feed, token)?,
+        "served spot hold",
+    )
+}
+
+/// The spot balances as `/info` and the websocket serve them: each row's `hold`
+/// is [`served_hold`]. The control plane and the seed read [`spot_balances`],
+/// the stored state.
+pub(crate) fn served_spot_balances(
+    account: &Account,
+    feed: &MarketFeed,
+) -> Result<Vec<SpotBalance>> {
+    let mut rows = spot_balances(account);
+    for row in &mut rows {
+        if let Some(entry) = account.spot.get(&row.token) {
+            row.hold = served_hold(account, feed, entry, row.token)?;
+        }
+    }
+    Ok(rows)
+}
+
+/// The stored spot balances (USDC token 0 sorts first, like the venue's).
 pub(crate) fn spot_balances(account: &Account) -> Vec<SpotBalance> {
     let mut rows: Vec<SpotBalance> = account
         .spot
@@ -945,7 +1020,6 @@ fn unified_spot_available(account: &Account, feed: &MarketFeed, dex: &str) -> Re
 /// `hold` rises with margin used). The served spot rows may read it per token;
 /// the order lane does not (it nets margin itself, see
 /// [`available_margin`]).
-#[allow(dead_code)] // the REST/WS serving layer adopts it with the multi-dex serving phase
 pub(crate) fn unified_hold(account: &Account, feed: &MarketFeed, token: u32) -> Result<Decimal> {
     if account.mode != UserAbstraction::UnifiedAccount {
         return Ok(Decimal::ZERO);

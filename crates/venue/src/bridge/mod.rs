@@ -872,7 +872,7 @@ impl Bridge {
                 return;
             }
         };
-        match self.sim.set_mode(user, mode) {
+        match self.sim.set_mode(user, mode, &self.feed) {
             Ok(()) => tracing::info!(account = %user, ?mode, "bridge: abstraction set"),
             Err(e) => {
                 self.metrics.inc_refusals();
