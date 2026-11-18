@@ -478,7 +478,7 @@ async fn spot_state(state: &ApiState, body: Bytes, user: Address) -> Result<Resp
     // Pure observation; the 1 Hz tick owns accrual and liquidation.
     simulated(state, &body, user, |account| {
         Ok(Json(crate::wire::SpotClearinghouseState {
-            balances: account::spot_balances(account),
+            balances: account::served_spot_balances(account, &state.feed)?,
             token_to_available_after_maintenance: account::available_after_maintenance(
                 account,
                 &state.feed,

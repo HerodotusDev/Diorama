@@ -2003,6 +2003,41 @@ mod tests {
         assert_eq!(ledger(&state, who, ""), dec("40"));
     }
 
+    /// The venue disables `usdClassTransfer` on a unified account (one USDC
+    /// pool); the signed API answers its own message, in both directions, and
+    /// moves nothing.
+    #[tokio::test]
+    async fn a_unified_account_gets_the_venues_class_transfer_refusal() {
+        use crate::sim::DealClass::Spot;
+        let state = dex_state();
+        let who: Address = OWNER.parse().unwrap();
+        fund(&state, who, Spot, None, "100");
+        state
+            .sim
+            .set_mode(
+                who,
+                crate::wire::UserAbstraction::UnifiedAccount,
+                &state.feed,
+            )
+            .unwrap();
+        for to_perp in ["true", "false"] {
+            let out = act(
+                &state,
+                &format!(r#"{{"type":"usdClassTransfer","amount":"40","toPerp":{to_perp}}}"#),
+            )
+            .await;
+            assert_eq!(out["status"], "err", "{out}");
+            assert!(
+                out["response"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Action disabled when unified account is active"),
+                "{out}"
+            );
+        }
+        assert_eq!(ledger(&state, who, ""), dec("0"), "nothing moved");
+    }
+
     const TSLA: u32 = 110_000;
 
     fn order_json(asset: u32, buy: bool, px: &str, tif: &str, cloid: Option<&str>) -> String {

@@ -375,7 +375,7 @@ fn a_unified_spot_pool_keeps_the_maintenance_of_every_dex_sharing_the_token() {
     let feed = feed();
     let unified = Sim::memory();
     unified
-        .set_mode(ME, UserAbstraction::UnifiedAccount)
+        .set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
         .unwrap();
     spot(&unified, ME, USDC, "100");
     unified.order(&feed, ME, &buy("ETH", "1")).unwrap();
@@ -1072,7 +1072,8 @@ fn hype_deposits_come_from_the_hype_system_address_and_unified_bounds_apply() {
         deltas(&sim, YOU)[0]["user"],
         "0x2222222222222222222222222222222222222222"
     );
-    sim.set_mode(ME, UserAbstraction::UnifiedAccount).unwrap();
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
     spot(&sim, ME, USDC, "100");
     spot(&sim, ME, HYPE, "1");
     sim.order(&feed, ME, &buy("ETH", "1")).unwrap();
@@ -1117,4 +1118,193 @@ fn the_ledger_serves_class_transfers_in_the_requested_window() {
         0
     );
     assert!(sim.ledger_updates(NEWCOMER, (0, None)).is_none());
+}
+
+/// The switch to `unifiedAccount` merges the perp ledgers into spot, as the live
+/// venue's testnet did (2026-11-18): perp-class USDC and a USDC HIP-3 dex's
+/// balance both land in the one spot balance, and the ledgers read zero. The
+/// signed API and CoreWriter paths share `set_mode`, so one door covers both.
+#[test]
+fn the_unified_switch_merges_the_perp_ledgers_into_spot() {
+    let feed = feed();
+    let sim = Sim::memory();
+    spot(&sim, ME, USDC, "5");
+    deal_perp(&sim, &feed, ME, None, "100");
+    deal_perp(&sim, &feed, ME, Some("xyz"), "40");
+    assert_eq!(account(&sim, ME).mode, UserAbstraction::Default);
+
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+
+    assert_eq!(account(&sim, ME).mode, UserAbstraction::UnifiedAccount);
+    assert_eq!(
+        spot_of(&sim, ME, USDC),
+        dec("145"),
+        "5 + 100 + 40, nothing lost"
+    );
+    assert_eq!(perp_of(&sim, ME, ""), Decimal::ZERO);
+    assert_eq!(perp_of(&sim, ME, "xyz"), Decimal::ZERO);
+}
+
+/// A dex whose collateral is not USDC merges into the spot balance of its own
+/// token (the modeled rule, see `unified_spot_available`), never into USDC.
+#[test]
+fn a_non_usdc_dex_merges_into_its_own_token() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, Some("flx"), "30");
+    deal_perp(&sim, &feed, ME, None, "10");
+
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+
+    assert_eq!(spot_of(&sim, ME, USDH), dec("30"));
+    assert_eq!(spot_of(&sim, ME, USDC), dec("10"));
+    assert_eq!(perp_of(&sim, ME, "flx"), Decimal::ZERO);
+}
+
+/// An open position survives the switch and the account's free margin does not
+/// move: the cash left the perp ledger, the unified spot pool carries it, and the
+/// position's margin is deducted from it (the venue shows that margin as `hold`).
+#[test]
+fn an_open_position_keeps_its_free_margin_across_the_switch() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, None, "100");
+    sim.order(&feed, ME, &buy("ETH", "1")).unwrap();
+
+    let free = |sim: &Sim| {
+        let a = account(sim, ME);
+        let v = super::account::view(&a, &feed, "").unwrap();
+        super::account::available_margin(&a, &feed, "", &v).unwrap()
+    };
+    let before = free(&sim);
+    let size_before = account(&sim, ME).positions["ETH"].szi;
+
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+
+    assert_eq!(account(&sim, ME).positions["ETH"].szi, size_before);
+    assert_eq!(free(&sim), before, "the pooled margin reads the same");
+    assert!(spot_of(&sim, ME, USDC) > Decimal::ZERO);
+}
+
+/// A negative ledger stays on the perp side (a debt must not turn the spot
+/// balance negative), and a second switch to unified merges nothing again: cash
+/// a unified account later puts on a ledger is its own.
+#[test]
+fn only_the_first_switch_merges_and_a_debt_stays() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, None, "-3");
+    deal_perp(&sim, &feed, ME, Some("xyz"), "7");
+
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+    assert_eq!(perp_of(&sim, ME, ""), dec("-3"), "a debt is not merged");
+    assert_eq!(spot_of(&sim, ME, USDC), dec("7"));
+
+    deal_perp(&sim, &feed, ME, Some("xyz"), "2");
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+    assert_eq!(
+        perp_of(&sim, ME, "xyz"),
+        dec("2"),
+        "already unified: no merge"
+    );
+    assert_eq!(spot_of(&sim, ME, USDC), dec("7"));
+
+    // Switching away splits nothing.
+    sim.set_mode(ME, UserAbstraction::Disabled, &feed).unwrap();
+    assert_eq!(spot_of(&sim, ME, USDC), dec("7"));
+}
+
+/// A unified account's open position holds its margin on the spot balance, as
+/// the live venue serves it (testnet, 2026-11-18): the served `hold` is the
+/// margin, so `total - hold` is the free spot figure. A standard account's
+/// spot carries no such hold, and the stored state stays the resting orders'
+/// (the seed and control read it back).
+#[test]
+fn a_unified_position_margin_is_served_as_spot_hold() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, None, "100");
+    sim.order(&feed, ME, &buy("ETH", "1")).unwrap();
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+
+    let acct = account(&sim, ME);
+    let margin = acct.positions["ETH"].margin_used;
+    assert!(margin > Decimal::ZERO);
+    let served = super::account::served_spot_balances(&acct, &feed).unwrap();
+    let usdc = served.iter().find(|b| b.token == 0).unwrap();
+    assert_eq!(
+        usdc.hold, margin,
+        "the position's margin is the served hold"
+    );
+    assert_eq!(usdc.total, acct.spot[&0].total);
+    assert_eq!(
+        super::account::spot_balances(&acct)
+            .iter()
+            .find(|b| b.token == 0)
+            .unwrap()
+            .hold,
+        Decimal::ZERO,
+        "the stored hold is untouched"
+    );
+}
+
+/// The L1 spot-balance precompile answers the same `hold` (core wei), so the
+/// margin agents' `freeSpotBalance()` (`total - hold`) matches the venue.
+#[test]
+fn the_spot_balance_precompile_carries_the_unified_margin_hold() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, None, "100");
+    sim.order(&feed, ME, &buy("ETH", "1")).unwrap();
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+    let acct = account(&sim, ME);
+    let margin = acct.positions["ETH"].margin_used;
+    assert!(margin > Decimal::ZERO);
+    let tokens = [crate::bridge::system::TokenInfo {
+        index: 0,
+        name: "USDC".into(),
+        wei_decimals: 8,
+        evm: None,
+    }];
+    let answers = crate::bridge::precompiles::answers_of(ME, &acct, &feed, &tokens);
+    let balance = answers
+        .iter()
+        .find(|a| a.target == crate::bridge::precompiles::SPOT_BALANCE)
+        .expect("a spot balance answer");
+    let word = |i: usize| {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&balance.returned[i * 32 + 24..i * 32 + 32]);
+        u64::from_be_bytes(bytes)
+    };
+    let wei =
+        |amount: Decimal| u64::try_from((amount * Decimal::from(100_000_000u64)).trunc()).unwrap();
+    assert_eq!(word(0), wei(acct.spot[&0].total));
+    assert_eq!(
+        word(1),
+        wei(margin),
+        "the precompile's hold carries the margin"
+    );
+}
+
+/// A standard account's spot serves no margin hold.
+#[test]
+fn a_standard_account_serves_no_margin_hold() {
+    let feed = feed();
+    let standard = Sim::memory();
+    deal_perp(&standard, &feed, YOU, None, "100");
+    standard.order(&feed, YOU, &buy("ETH", "1")).unwrap();
+    spot(&standard, YOU, USDC, "5");
+    let acct = account(&standard, YOU);
+    let served = super::account::served_spot_balances(&acct, &feed).unwrap();
+    assert_eq!(
+        served.iter().find(|b| b.token == 0).unwrap().hold,
+        Decimal::ZERO
+    );
 }

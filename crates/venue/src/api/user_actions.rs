@@ -10,7 +10,7 @@ use super::exchange::{default_ok, err_envelope};
 use super::ApiState;
 use crate::sim::fees::RowKind;
 use crate::sim::transfer::{AssetSend, Wallet};
-use crate::sim::{Applied, ClassTransfer, Direction, TokenRef};
+use crate::sim::{Applied, ClassTransfer, Direction, TokenRef, UNIFIED_CLASS_TRANSFER_REFUSAL};
 use crate::wire::UserAbstraction;
 use alloy_primitives::Address;
 use axum::response::Response;
@@ -54,6 +54,15 @@ pub(super) fn usd_class_transfer(
         } else {
             Direction::ToSpot
         };
+        // The venue disables the action on a unified account (one USDC pool).
+        if state
+            .sim
+            .account(account)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|a| a.mode == UserAbstraction::UnifiedAccount)
+        {
+            return Err(UNIFIED_CLASS_TRANSFER_REFUSAL.to_string());
+        }
         let applied = state
             .sim
             .usd_class_transfer(
@@ -250,7 +259,12 @@ pub(super) fn approve_builder_fee(
 
 /// Set the account's mode; portfolio margin is refused by the sim.
 fn set_mode(state: &ApiState, account: Address, mode: UserAbstraction) -> Response {
-    answer(state.sim.set_mode(account, mode).map_err(|e| e.to_string()))
+    answer(
+        state
+            .sim
+            .set_mode(account, mode, &state.feed)
+            .map_err(|e| e.to_string()),
+    )
 }
 
 /// `userSetAbstraction`: the signer sets its own account's mode.
