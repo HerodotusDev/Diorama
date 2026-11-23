@@ -1320,9 +1320,10 @@ fn fast_asset_ctxs_is_one_map_over_every_dex() {
 /// real `userNonFundingLedgerUpdates` row (`send` and `spotTransfer` with their
 /// `fee`, `nativeTokenFee` and `feeToken`, `accountClassTransfer`), the window
 /// applies, an address the sim never held is the venue's own answer, and
-/// `preTransferCheck` has the real shape: `fee` is the activation the source
-/// still owes (Circle's first-outbound rule), `userExists` the destination's
-/// standing.
+/// `preTransferCheck` has the real shape: `fee` is the activation the transfer
+/// would pay (1 USDC for a destination the venue has never seen, or while the
+/// source still owes its deposit-created account's activation), `userExists`
+/// the destination's standing.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one script: four transfers, then every read of their rows
 async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
@@ -1335,9 +1336,9 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
         index: 0,
         coin: "USDC",
     };
-    // `user` funds `other` (a new account), which then sends on (its first
-    // outbound transfer pays the activation) and moves money between its own
-    // wallets.
+    // `user` funds `other` (a new account, so `user` pays the activation),
+    // which then sends on to another new account (paying it again) and moves
+    // money between its own wallets.
     let (other, third) = (Address::repeat_byte(0xbb), Address::repeat_byte(0xcc));
     state
         .sim
@@ -1409,10 +1410,13 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
             .expect("a real sample of the kind");
         same_shape(sample, row, "userNonFundingLedgerUpdates");
     }
-    assert_eq!(rows[0]["delta"]["fee"], "0.0", "the receipt carries no fee");
+    assert_eq!(
+        rows[0]["delta"]["fee"], "1.0",
+        "the sender paid for the new account"
+    );
     assert_eq!(
         rows[1]["delta"]["fee"], "1.0",
-        "the first outbound send does"
+        "a send to another new account does too"
     );
     assert_eq!(rows[1]["delta"]["feeToken"], "USDC");
     // The deposit's row, on the recipient's side, is a system-address transfer.
@@ -1435,7 +1439,7 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
     assert_eq!(none, serde_json::json!([]));
 
     // preTransferCheck: `user` is the destination, `source` the sender.
-    // `other` owed the activation before its send, `user` never does.
+    // `third` did not exist before `other` sent to it.
     assert_eq!(
         before,
         serde_json::json!({"isSanctioned": false, "userExists": false, "fee": "1.0", "userHasSentTx": false})
@@ -1450,7 +1454,7 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
         serde_json::json!({"type": "preTransferCheck", "user": third, "source": other}),
     )
     .await;
-    assert_eq!(after["fee"], "0.0", "the debt was paid");
+    assert_eq!(after["fee"], "0.0", "`third` exists now");
     assert_eq!(after["userExists"], true);
     let funded = info_json(
         &state,
@@ -1459,6 +1463,7 @@ async fn the_transfer_ledger_and_the_activation_check_have_the_venues_shapes() {
     .await;
     assert_eq!(
         (&funded["userExists"], &funded["fee"]),
-        (&false.into(), &"0.0".into())
+        (&false.into(), &"1.0".into()),
+        "a never-seen destination costs the sender 1 USDC"
     );
 }

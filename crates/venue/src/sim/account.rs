@@ -775,6 +775,36 @@ fn fill_cross_liquidation_px(
     Ok(())
 }
 
+/// What the venue serves for one dex: [`view`], and for a unified account the
+/// cross margin its positions hold on that dex added to the perp ledger's cash.
+/// Measured on testnet (2026-11-23, a 5x BTC long of 11.65897 notional): the
+/// summary read `accountValue` 2.333162 (the 2.331794 margin plus 0.001368 of
+/// PnL), `totalRawUsd` -9.325808 and `withdrawable` 0.001368 (the value above
+/// the transfer floor), where the position's margin had been moved from spot
+/// onto the perp ledger and spot served it as `hold`. The internal checks
+/// (order margin, liquidation) keep the plain [`view`]: they add the spot
+/// collateral themselves, so the margin is not counted twice. A resting
+/// order's margin on a unified account is served the same way on the venue and
+/// is not modeled here.
+pub(crate) fn served_view(account: &Account, feed: &MarketFeed, dex: &str) -> Result<AccountView> {
+    let mut v = view(account, feed, dex)?;
+    if account.mode != UserAbstraction::UnifiedAccount {
+        return Ok(v);
+    }
+    let margin = v.cross_margin_summary.total_margin_used;
+    if margin.is_zero() {
+        return Ok(v);
+    }
+    for summary in [&mut v.margin_summary, &mut v.cross_margin_summary] {
+        summary.account_value = add(summary.account_value, margin, "unified perp margin")?;
+        summary.total_raw_usd = add(summary.total_raw_usd, margin, "unified perp margin")?;
+    }
+    let floor = transfer_floor_of(v.cross_margin_summary.total_ntl_pos, margin)?;
+    v.withdrawable =
+        sub(v.cross_margin_summary.account_value, floor, "withdrawable")?.max(Decimal::ZERO);
+    Ok(v)
+}
+
 /// The served `clearinghouseState` of one dex (fresh `time` from the caller's
 /// wall clock).
 pub(crate) fn clearinghouse(
@@ -783,7 +813,7 @@ pub(crate) fn clearinghouse(
     dex: &str,
     time_ms: u64,
 ) -> Result<ClearinghouseState> {
-    let v = view(account, feed, dex)?;
+    let v = served_view(account, feed, dex)?;
     // The account's figures are a simulation when either a mark behind them is
     // scenario-owned **or** the account's balances were written by the control
     // plane. The old derivation read only the marks, so a balance patch on a

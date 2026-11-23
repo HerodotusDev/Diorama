@@ -11,7 +11,8 @@
 //!
 //! The reads served (units are the precompiles' own):
 //! - `0x0801` `spotBalance(user, token)`: `(total, hold, entryNtl)` in the
-//!   token's Core wei; `entryNtl` is not modeled (0);
+//!   token's Core wei; a unified account's `total` is net of its hold, which
+//!   reads zero; `entryNtl` is not modeled (0);
 //! - `0x0803` `withdrawable(user)`: the default perp dex's served `withdrawable`,
 //!   perp-class USD (1e6);
 //! - `0x080f` `accountMarginSummary(dex, user)`: `(accountValue, marginUsed,
@@ -25,6 +26,7 @@
 use super::system::{self, TokenInfo};
 use crate::feed::MarketFeed;
 use crate::sim::account::{self, Account};
+use crate::wire::UserAbstraction;
 use alloy_primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::SolValue;
 use rust_decimal::prelude::ToPrimitive;
@@ -110,9 +112,14 @@ fn scaled_i64(amount: Decimal, decimals: u32) -> Option<i64> {
 }
 
 /// The spot-balance answers: each token's `total` and `hold` in core wei. The
-/// `hold` is what the venue serves: resting orders plus a unified account's
-/// position margin ([`account::served_hold`]). A figure that does not compute
-/// or overflows is left out.
+/// hold is what the venue serves: resting orders plus a unified account's
+/// position margin ([`account::served_hold`]). A standard account's precompile
+/// answers `(total, hold)` as `/info` does. A unified account's answers the
+/// total already net of that hold and a hold of zero (measured on testnet,
+/// 2026-11-23, with a resting order and with an open position: `/info` served
+/// total 3.885024 / hold 2.788509 while the precompile read 1.096515 / 0), so
+/// `total - hold` is the same free figure either way. A figure that does not
+/// compute or overflows is left out.
 fn spot_balance_answers(
     user: Address,
     account: &Account,
@@ -127,9 +134,17 @@ fn spot_balance_answers(
         let Ok(served) = account::served_hold(account, feed, entry, *index) else {
             continue;
         };
+        let (total, hold) = if account.mode == UserAbstraction::UnifiedAccount {
+            let Ok(net) = account::sub(entry.total, served, "unified spot net of hold") else {
+                continue;
+            };
+            (net, Decimal::ZERO)
+        } else {
+            (entry.total, served)
+        };
         let (Some(total), Some(hold)) = (
-            scaled_u64(entry.total, token.wei_decimals),
-            scaled_u64(served, token.wei_decimals),
+            scaled_u64(total.max(Decimal::ZERO), token.wei_decimals),
+            scaled_u64(hold, token.wei_decimals),
         ) else {
             continue;
         };
@@ -160,7 +175,7 @@ pub(crate) fn answers_of(
     out.extend(spot_balance_answers(user, account, feed, tokens));
     let mut dex = 0u32;
     while let Some(name) = feed.dex_name_at(dex) {
-        if let Ok(view) = account::view(account, feed, &name) {
+        if let Ok(view) = account::served_view(account, feed, &name) {
             let summary = &view.margin_summary;
             if let (Some(value), Some(used), Some(ntl), Some(raw)) = (
                 scaled_i64(summary.account_value, PERP_USD_DECIMALS),
