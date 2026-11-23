@@ -433,13 +433,14 @@ fn deserialize_failure() -> Response {
 /// is whether the destination exists on the sim, `userHasSentTx` whether it
 /// exists and has paid its activation (it made its first outbound transfer, or
 /// was funded by a seed or `deal`), and `fee` is the 1 USDC activation the
-/// *source* would pay on this transfer (Circle's rule: charged once, on an
-/// account's first outbound action) or `0.0`. The real venue answers
-/// `fee: "1.0"` for a destination it has never seen; the sim does not tie the
-/// fee to the destination.
+/// *source* would pay on this transfer or `0.0`: `1.0` for a destination the
+/// sim has never seen (the real venue's answer, read on mainnet and testnet
+/// 2026-11-23) and for a source that still owes the activation of its
+/// deposit-created account (Circle's rule: charged once, on its first outbound
+/// action).
 fn pre_transfer_check(state: &ApiState, user: Address, source: Address) -> Result<Response> {
     let check = state.sim.pre_transfer(user, source)?;
-    let fee = if check.source_owes {
+    let fee = if check.fee_due {
         crate::sim::fees::ACTIVATION_FEE
     } else {
         rust_decimal::Decimal::ZERO

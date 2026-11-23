@@ -17,10 +17,10 @@
 //! the maintenance its positions hold on every dex margining against the token
 //! (and never what a resting spot order holds).
 //!
-//! Fees ([`super::fees`]): an account's first outbound transfer to another
-//! account pays the 1 USDC activation fee on top of the amount (Circle's rule;
-//! the debt is set when the account first receives funds), and a Core to EVM
-//! transfer costs the HyperEVM gas.
+//! Fees ([`super::fees`]): a send to an account that does not exist yet pays
+//! the 1 USDC activation fee on top of the amount (the sender activates it),
+//! the first outbound transfer of a deposit-created account pays it too
+//! (Circle's rule), and a Core to EVM transfer costs the HyperEVM gas.
 use super::account::{self, Account};
 use super::fees::{self, Paid, RowKind, TransferRow, ACTIVATION_FEE, QUOTE_TOKEN};
 use super::{stamp_funding_baseline, Applied, Sim, SimState, TokenRef};
@@ -255,7 +255,6 @@ fn apply_send(
     clock: u64,
 ) -> Result<()> {
     let due = state.activation_due(send.from, send.to);
-    let new_recipient = send.from != send.to && !state.exists(send.to);
     let source = state
         .accounts
         .get(&send.from)
@@ -275,7 +274,7 @@ fn apply_send(
     if let Some(to) = state.accounts.get_mut(&send.to) {
         stamp_funding_baseline(to, clock);
     }
-    state.settle_activation((send.from, send.to), new_recipient);
+    state.settle_activation((send.from, send.to));
     let paid = Paid {
         fee: due,
         fee_token: if due > Decimal::ZERO {

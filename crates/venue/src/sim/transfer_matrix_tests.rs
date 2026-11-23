@@ -341,6 +341,8 @@ fn what_a_spot_hold_covers_cannot_be_sent() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "100");
+    // YOU exists already, so the send pays no activation fee.
+    spot(&sim, YOU, USDC, "1");
     sim.with_account(ME, |a| {
         a.spot.get_mut(&0).unwrap().hold = dec("30");
         Ok(())
@@ -354,7 +356,7 @@ fn what_a_spot_hold_covers_cannot_be_sent() {
         (Wallet::Spot, Wallet::Spot),
     ));
     assert!(reason.contains("may send now (70)"), "{reason}");
-    // The free 70 goes whole: ME owes no activation.
+    // The free 70 goes whole: YOU exists, so ME pays no activation.
     send(
         &sim,
         &feed,
@@ -436,32 +438,17 @@ fn degenerate_sends_are_refused() {
 
 // ---- the activation fee --------------------------------------------------------
 
-/// Circle's rule: an account created by an inbound transfer is credited in
-/// full and pays the 1 USDC activation on its first outbound transfer, on top
-/// of the amount; the second is free. The destination's own newness never
-/// matters (the funded sender pays nothing to send to a brand new address).
+/// Circle's rule, measured on a mainnet margin agent's ledger (2026-11-23): an
+/// account a deposit created is credited in full and pays the 1 USDC activation
+/// on its first outbound transfer, on top of the amount; the second is free.
 #[test]
 #[allow(clippy::too_many_lines)] // one script: the sends in order, then the rows they wrote
-fn an_account_pays_its_activation_on_its_first_outbound_transfer() {
+fn a_deposit_created_account_pays_its_activation_on_its_first_outbound_transfer() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "100");
-    assert!(!exists(&sim, YOU));
-    // ME was funded by a helper: it owes nothing, and YOU being new costs it nothing.
-    send(
-        &sim,
-        &feed,
-        (ME, YOU),
-        (USDC, "10"),
-        (Wallet::Spot, Wallet::Spot),
-    )
-    .unwrap();
-    assert_eq!(
-        (spot_of(&sim, ME, USDC), spot_of(&sim, YOU, USDC)),
-        (dec("90"), dec("10")),
-        "the inbound amount is credited in full"
-    );
-    assert!(exists(&sim, YOU));
+    sim.credit_evm_deposit(YOU, USDC, dec("10"), &feed).unwrap();
+    assert_eq!(spot_of(&sim, YOU, USDC), dec("10"), "credited in full");
     assert!(owes(&sim, YOU) && !owes(&sim, ME));
     // YOU's first outbound transfer (to an existing account) pays 1 on top.
     send(
@@ -474,7 +461,7 @@ fn an_account_pays_its_activation_on_its_first_outbound_transfer() {
     .unwrap();
     assert_eq!(
         (spot_of(&sim, YOU, USDC), spot_of(&sim, ME, USDC)),
-        (dec("5"), dec("94"))
+        (dec("5"), dec("104"))
     );
     assert!(!owes(&sim, YOU), "the debt is paid once");
     send(
@@ -487,7 +474,7 @@ fn an_account_pays_its_activation_on_its_first_outbound_transfer() {
     .unwrap();
     assert_eq!(spot_of(&sim, YOU, USDC), dec("4"), "the second one is free");
     let rows = deltas(&sim, YOU);
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 3, "the deposit row and the two sends");
     let paid: Vec<_> = rows
         .iter()
         .map(|r| (r["fee"].clone(), r["feeToken"].clone()))
@@ -503,10 +490,89 @@ fn an_account_pays_its_activation_on_its_first_outbound_transfer() {
     assert_eq!(rows[1]["nativeTokenFee"], "0.0");
     assert_eq!(rows[1]["amount"], "4.0");
     assert_eq!(
-        deltas(&sim, ME)[1],
+        deltas(&sim, ME)[0],
         rows[1],
         "both parties see the same row"
     );
+}
+
+/// An account another account's transfer created is credited in full and owes
+/// nothing: the *sender* paid the 1 USDC for the destination being new
+/// (testnet, 2026-11-23, and mainnet's `preTransferCheck`: `fee: "1.0"` for a
+/// never-seen address). The new account's own first outbound transfer is free,
+/// and a later send to it costs the sender nothing.
+#[test]
+#[allow(clippy::too_many_lines)] // one script: the sends in order, then the rows they wrote
+fn the_sender_pays_the_activation_for_a_destination_that_does_not_exist() {
+    let feed = feed();
+    let sim = Sim::memory();
+    spot(&sim, ME, USDC, "100");
+    assert!(!exists(&sim, YOU));
+    send(
+        &sim,
+        &feed,
+        (ME, YOU),
+        (USDC, "10"),
+        (Wallet::Spot, Wallet::Spot),
+    )
+    .unwrap();
+    assert_eq!(
+        (spot_of(&sim, ME, USDC), spot_of(&sim, YOU, USDC)),
+        (dec("89"), dec("10")),
+        "10 and the 1 USDC fee left ME, the recipient got the full amount"
+    );
+    assert!(exists(&sim, YOU));
+    assert!(!owes(&sim, YOU) && !owes(&sim, ME));
+    // YOU's first outbound transfer is free.
+    send(
+        &sim,
+        &feed,
+        (YOU, ME),
+        (USDC, "4"),
+        (Wallet::Spot, Wallet::Spot),
+    )
+    .unwrap();
+    assert_eq!(
+        (spot_of(&sim, YOU, USDC), spot_of(&sim, ME, USDC)),
+        (dec("6"), dec("93"))
+    );
+    // So is a second send to YOU, who exists now.
+    send(
+        &sim,
+        &feed,
+        (ME, YOU),
+        (USDC, "3"),
+        (Wallet::Spot, Wallet::Spot),
+    )
+    .unwrap();
+    assert_eq!(spot_of(&sim, ME, USDC), dec("90"));
+    let paid: Vec<_> = deltas(&sim, ME)
+        .iter()
+        .map(|r| (r["fee"].clone(), r["feeToken"].clone()))
+        .collect();
+    assert_eq!(
+        paid,
+        [
+            ("1.0".into(), "USDC".into()),
+            ("0.0".into(), "".into()),
+            ("0.0".into(), "".into())
+        ]
+    );
+    // The fee is charged once when the sender also owes its own activation.
+    let owing = Sim::memory();
+    owing
+        .credit_evm_deposit(ME, USDC, dec("10"), &feed)
+        .unwrap();
+    send(
+        &owing,
+        &feed,
+        (ME, YOU),
+        (USDC, "5"),
+        (Wallet::Spot, Wallet::Spot),
+    )
+    .unwrap();
+    assert_eq!(spot_of(&owing, ME, USDC), dec("4"), "5 and a single 1 USDC");
+    assert!(!owes(&owing, ME));
 }
 
 /// The first outbound transfer needs the amount plus the fee: 10 from an
@@ -518,14 +584,7 @@ fn the_first_outbound_transfer_needs_the_amount_plus_the_fee() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "10");
-    send(
-        &sim,
-        &feed,
-        (ME, YOU),
-        (USDC, "10"),
-        (Wallet::Spot, Wallet::Spot),
-    )
-    .unwrap();
+    sim.credit_evm_deposit(YOU, USDC, dec("10"), &feed).unwrap();
     let reason = refusal(send(
         &sim,
         &feed,
@@ -578,17 +637,10 @@ fn spot_send_and_usd_send_pay_the_owed_activation() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "100");
-    // YOU is created by a spot receipt, NEWCOMER by a default-dex one.
-    sim.spot_send((ME, YOU), USDC, dec("10"), (RowKind::SpotTransfer, &feed))
+    // YOU is created by a spot deposit, NEWCOMER by a default-dex one.
+    sim.credit_evm_deposit(YOU, USDC, dec("10"), &feed).unwrap();
+    sim.credit_evm_deposit_to((NEWCOMER, &perp("")), USDC, dec("10"), &feed)
         .unwrap();
-    send(
-        &sim,
-        &feed,
-        (ME, NEWCOMER),
-        (USDC, "10"),
-        (Wallet::Spot, perp("")),
-    )
-    .unwrap();
     assert!(owes(&sim, YOU) && owes(&sim, NEWCOMER));
     assert_eq!(
         sim.spot_send((YOU, ME), USDC, dec("3"), (RowKind::SpotTransfer, &feed))
@@ -630,7 +682,7 @@ fn spot_send_and_usd_send_pay_the_owed_activation() {
     );
 }
 
-/// The fee is 1 USDC whatever is sent: an account created by a PURR receipt
+/// The fee is 1 USDC whatever is sent: an account created by a PURR deposit
 /// takes the fee from its spot USDC on its first outbound PURR send, and is
 /// refused (nothing moves, the debt stays) while it has none.
 #[test]
@@ -638,21 +690,8 @@ fn spot_send_and_usd_send_pay_the_owed_activation() {
 fn a_non_usdc_first_send_pays_the_fee_from_spot_usdc() {
     let feed = feed();
     let sim = Sim::memory();
-    spot(&sim, ME, PURR, "50");
     spot(&sim, ME, USDC, "10");
-    send(
-        &sim,
-        &feed,
-        (ME, YOU),
-        (PURR, "20"),
-        (Wallet::Spot, Wallet::Spot),
-    )
-    .unwrap();
-    assert_eq!(
-        spot_of(&sim, ME, USDC),
-        dec("10"),
-        "the sender paid nothing"
-    );
+    sim.credit_evm_deposit(YOU, PURR, dec("20"), &feed).unwrap();
     let reason = refusal(send(
         &sim,
         &feed,
@@ -701,14 +740,7 @@ fn an_own_transfer_neither_pays_nor_clears_the_activation() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "20");
-    send(
-        &sim,
-        &feed,
-        (ME, YOU),
-        (USDC, "10"),
-        (Wallet::Spot, Wallet::Spot),
-    )
-    .unwrap();
+    sim.credit_evm_deposit(YOU, USDC, dec("10"), &feed).unwrap();
     send(
         &sim,
         &feed,
@@ -732,9 +764,10 @@ fn an_own_transfer_neither_pays_nor_clears_the_activation() {
     assert!(!owes(&sim, YOU));
 }
 
-/// An inbound transfer into a builder dex's ledger creates the account too.
+/// An inbound transfer into a builder dex's ledger creates the account too,
+/// and the sender pays for it.
 #[test]
-fn an_inbound_send_into_a_builder_dex_creates_the_account_and_its_debt() {
+fn an_inbound_send_into_a_builder_dex_creates_the_account_and_the_sender_pays() {
     let feed = feed();
     let sim = Sim::memory();
     spot(&sim, ME, USDC, "20");
@@ -748,10 +781,11 @@ fn an_inbound_send_into_a_builder_dex_creates_the_account_and_its_debt() {
     .unwrap();
     assert_eq!(
         (spot_of(&sim, ME, USDC), perp_of(&sim, YOU, "xyz")),
-        (dec("10"), dec("10"))
+        (dec("9"), dec("10")),
+        "10 and the 1 USDC fee left ME"
     );
     assert_eq!(deltas(&sim, YOU)[0]["destinationDex"], "xyz");
-    assert!(exists(&sim, YOU) && owes(&sim, YOU));
+    assert!(exists(&sim, YOU) && !owes(&sim, YOU));
 }
 
 /// Accounts that were funded by a helper (`deal`, a seed) or by a send while
@@ -790,6 +824,7 @@ fn helpers_and_later_receipts_never_create_the_debt() {
 fn a_saved_state_owes_nothing() {
     let sim = Sim::memory();
     spot(&sim, YOU, USDC, "1");
+    spot(&sim, ME, USDC, "1");
     let state = sim.with_state(|s| Ok(s.clone())).unwrap();
     let mut json = serde_json::to_value(&state).unwrap();
     for key in [
@@ -804,12 +839,17 @@ fn a_saved_state_owes_nothing() {
     assert!(old.activated.is_empty(), "the field defaults empty");
     old.migrate();
     assert!(old.activated.contains(&YOU));
-    assert!(old.exists(YOU) && !old.exists(NEWCOMER));
+    assert!(old.exists(YOU) && old.exists(ME) && !old.exists(NEWCOMER));
     assert_eq!(old.activation_due(YOU, ME), Decimal::ZERO);
     assert!(old.activation_owed.is_empty());
     old.activation_owed.insert(NEWCOMER);
     assert_eq!(old.activation_due(NEWCOMER, ME), ACTIVATION_FEE);
     assert_eq!(old.activation_due(NEWCOMER, NEWCOMER), Decimal::ZERO);
+    assert_eq!(
+        old.activation_due(YOU, NEWCOMER),
+        ACTIVATION_FEE,
+        "a destination that does not exist costs the sender"
+    );
     let again: SimState = serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
     assert_eq!(again, old);
 }
@@ -1026,11 +1066,11 @@ fn the_precompile_answers_follow_the_sims_core_state() {
     assert_eq!(spot_call.calldata, (ME, 0u64).abi_encode_params());
 }
 
-/// The debt follows the account, not the destination: a deposited account's
-/// first send to a brand new address pays the 1 USDC once, the new address
-/// owes its own, and the second send from the first account is free.
+/// A deposited account's first send to a brand new address pays the 1 USDC
+/// once (its own debt and the new destination are one fee, not two), the new
+/// address owes nothing, and the second send from the first account is free.
 #[test]
-fn the_debt_moves_with_the_account_not_the_destination() {
+fn a_deposited_accounts_first_send_to_a_new_address_pays_the_fee_once() {
     let feed = feed();
     let sim = Sim::memory();
     sim.credit_evm_deposit(ME, USDC, dec("10"), &feed).unwrap();
@@ -1044,7 +1084,7 @@ fn the_debt_moves_with_the_account_not_the_destination() {
     .unwrap();
     assert_eq!(spot_of(&sim, ME, USDC), dec("4"), "5 and the 1 USDC fee");
     assert_eq!(deltas(&sim, ME)[1]["fee"], "1.0");
-    assert!(!owes(&sim, ME) && owes(&sim, YOU));
+    assert!(!owes(&sim, ME) && !owes(&sim, YOU));
     send(
         &sim,
         &feed,
@@ -1254,10 +1294,68 @@ fn a_unified_position_margin_is_served_as_spot_hold() {
     );
 }
 
-/// The L1 spot-balance precompile answers the same `hold` (core wei), so the
-/// margin agents' `freeSpotBalance()` (`total - hold`) matches the venue.
+/// The unified account's served perp summary carries the margin its position
+/// holds: the venue moves it from spot onto the perp ledger (testnet,
+/// 2026-11-23: `accountValue` 2.333162 = 2.331794 margin + 0.001368 PnL,
+/// `withdrawable` 0.001368 = the value above the transfer floor). The checks
+/// that add the spot collateral themselves keep the plain view.
 #[test]
-fn the_spot_balance_precompile_carries_the_unified_margin_hold() {
+fn a_unified_position_margin_is_served_on_the_perp_summary() {
+    let feed = feed();
+    let sim = Sim::memory();
+    deal_perp(&sim, &feed, ME, None, "100");
+    sim.order(&feed, ME, &buy("ETH", "1")).unwrap();
+    sim.set_mode(ME, UserAbstraction::UnifiedAccount, &feed)
+        .unwrap();
+    let acct = account(&sim, ME);
+    let margin = acct.positions["ETH"].margin_used;
+    assert!(margin > Decimal::ZERO);
+
+    let plain = super::account::view(&acct, &feed, "").unwrap();
+    let served = super::account::served_view(&acct, &feed, "").unwrap();
+    assert_eq!(
+        served.margin_summary.account_value,
+        plain.margin_summary.account_value + margin
+    );
+    assert_eq!(
+        served.margin_summary.total_raw_usd,
+        plain.margin_summary.total_raw_usd + margin
+    );
+    assert_eq!(
+        served.margin_summary.total_margin_used, plain.margin_summary.total_margin_used,
+        "the margin used is the same figure"
+    );
+    let floor = super::account::transfer_floor_of(
+        served.cross_margin_summary.total_ntl_pos,
+        served.cross_margin_summary.total_margin_used,
+    )
+    .unwrap();
+    assert_eq!(
+        served.withdrawable,
+        (served.cross_margin_summary.account_value - floor).max(Decimal::ZERO)
+    );
+    let state = super::account::clearinghouse(&acct, &feed, "", 0).unwrap();
+    assert!(super::account::identity_holds(&state), "the identity holds");
+
+    // A standard account serves the plain view.
+    sim.set_mode(ME, UserAbstraction::Disabled, &feed).unwrap();
+    let acct = account(&sim, ME);
+    assert_eq!(
+        super::account::served_view(&acct, &feed, "")
+            .unwrap()
+            .margin_summary,
+        super::account::view(&acct, &feed, "")
+            .unwrap()
+            .margin_summary
+    );
+}
+
+/// The L1 spot-balance precompile of a unified account answers its `total` net
+/// of the margin hold and a `hold` of zero (testnet, 2026-11-23: `/info` served
+/// 3.885024 / 2.788509, the precompile 1.096515 / 0), so the margin agents'
+/// `freeSpotBalance()` (`total - hold`) matches the venue.
+#[test]
+fn the_spot_balance_precompile_nets_the_unified_margin_hold_into_total() {
     let feed = feed();
     let sim = Sim::memory();
     deal_perp(&sim, &feed, ME, None, "100");
@@ -1285,12 +1383,12 @@ fn the_spot_balance_precompile_carries_the_unified_margin_hold() {
     };
     let wei =
         |amount: Decimal| u64::try_from((amount * Decimal::from(100_000_000u64)).trunc()).unwrap();
-    assert_eq!(word(0), wei(acct.spot[&0].total));
     assert_eq!(
-        word(1),
-        wei(margin),
-        "the precompile's hold carries the margin"
+        word(0),
+        wei(acct.spot[&0].total - margin),
+        "the total is net of the margin"
     );
+    assert_eq!(word(1), 0, "the hold reads zero");
 }
 
 /// A standard account's spot serves no margin hold.

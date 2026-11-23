@@ -3,21 +3,28 @@
 //! Researched rules (the docs, Circle's CCTP guide, and the real
 //! `userNonFundingLedgerUpdates` rows read on 2026-11-17):
 //!
-//! * **Activation fee** (Circle, <https://developers.circle.com/cctp/cctp-on-hypercore>):
-//!   "New HyperCore accounts are subject to a one-time 1 USDC activation fee,
-//!   managed entirely by the Hyperliquid protocol." When an account is first
-//!   funded "the full deposit amount is credited to their tradable balance.
-//!   The 1 USDC activation fee is earmarked at the account level and charged
-//!   on the user's first outbound action", such as a withdrawal or a
-//!   `SendAsset` transfer; "the first outbound action requires a balance of at
-//!   least 1 USDC" or it fails, and later actions "are not subject to it". The
-//!   Hyperliquid page ("Activation gas fee") words it as a fee on "the first
-//!   transaction which has the new account as destination address"; the owner
-//!   tested the real venue and follows Circle, so the sim does: the debt is
-//!   set on the account when it first receives funds (a deposit or any
-//!   inbound transfer; [`SimState::activation_owed`]), the destination's own
-//!   newness never matters, and the first outbound transfer pays 1 USDC on top
-//!   of the amount (row: `fee: "1.0"`, `feeToken: "USDC"`).
+//! * **Activation fee**, two rules by how the account came to exist:
+//!   - **Created by a deposit** (Circle,
+//!     <https://developers.circle.com/cctp/cctp-on-hypercore>): "the full
+//!     deposit amount is credited to their tradable balance. The 1 USDC
+//!     activation fee is earmarked at the account level and charged on the
+//!     user's first outbound action", such as a withdrawal or a `SendAsset`
+//!     transfer; "the first outbound action requires a balance of at least 1
+//!     USDC" or it fails, and later actions "are not subject to it". Measured
+//!     on mainnet (a margin agent's ledger, 2026-11-23): a 0.6 USDC deposit
+//!     was credited in full (`fee: "0.0"`), the account's own wallet moves
+//!     cost nothing, and its first bridge to EVM carried `fee: "1.001866"`
+//!     (1 USDC plus the gas), the later ones the gas alone. The debt is set on
+//!     the account when a deposit creates it ([`SimState::activation_owed`]).
+//!   - **Created by a transfer from another account**: the *sender* pays the 1
+//!     USDC when the destination does not exist yet (Hyperliquid's "the first
+//!     transaction which has the new account as destination address"). Measured
+//!     on testnet (2026-11-23, throwaway accounts and a contract making the
+//!     agent's CoreWriter calls) and read from mainnet's `preTransferCheck`
+//!     (`fee: "1.0"` for a never-seen address): the recipient is credited in
+//!     full, owes nothing, and its own first outbound transfer is free.
+//!
+//!   The row carries `fee: "1.0"`, `feeToken: "USDC"` (plus any gas) either way.
 //! * **Core to EVM gas.** "A transfer from HyperCore to HyperEVM costs 200k
 //!   gas at the base gas price of the next HyperEVM block." The real rows show
 //!   it as `nativeTokenFee` (HYPE, `0.00002` = 200k gas at 0.1 gwei) when the
@@ -110,10 +117,11 @@ impl SimState {
     }
 
     /// The activation fee a send from `from` to `to` pays now: 1 USDC when
-    /// `from` still owes its account's activation. Where the funds go does not
-    /// matter; a move to oneself is not an outbound transfer.
+    /// `from` still owes the activation of a deposit-created account, or when
+    /// `to` does not exist yet (the sender activates it); once, not twice. A
+    /// move to oneself is not an outbound transfer.
     pub(crate) fn activation_due(&self, from: Address, to: Address) -> Decimal {
-        if from != to && self.activation_owed.contains(&from) {
+        if from != to && (self.activation_owed.contains(&from) || !self.exists(to)) {
             ACTIVATION_FEE
         } else {
             Decimal::ZERO
@@ -121,18 +129,11 @@ impl SimState {
     }
 
     /// Book a send's two sides: the sender's debt, when it was charged, is
-    /// paid; a recipient that did not exist before (`new_recipient`) now owes
-    /// its own; both addresses exist from now on.
-    pub(crate) fn settle_activation(
-        &mut self,
-        (from, to): (Address, Address),
-        new_recipient: bool,
-    ) {
+    /// paid, and a recipient this send created owes nothing (the sender paid
+    /// for it); both addresses exist from now on.
+    pub(crate) fn settle_activation(&mut self, (from, to): (Address, Address)) {
         if from != to {
             self.activation_owed.remove(&from);
-            if new_recipient {
-                self.activation_owed.insert(to);
-            }
         }
         self.activated.insert(to);
         self.activated.insert(from);
@@ -250,11 +251,12 @@ pub(crate) fn rows_of(
 }
 
 /// What `preTransferCheck` reads: the destination's standing and whether the
-/// source still owes its activation.
+/// transfer would pay the activation fee (the destination does not exist, or
+/// the source still owes its deposit-created account's activation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreTransfer {
     pub destination_exists: bool,
-    pub source_owes: bool,
+    pub fee_due: bool,
     pub destination_has_sent: bool,
 }
 
@@ -270,7 +272,7 @@ impl super::Sim {
             let exists = state.exists(destination);
             Ok(PreTransfer {
                 destination_exists: exists,
-                source_owes: state.activation_owed.contains(&source),
+                fee_due: state.activation_due(source, destination) > Decimal::ZERO,
                 destination_has_sent: exists && !state.activation_owed.contains(&destination),
             })
         })

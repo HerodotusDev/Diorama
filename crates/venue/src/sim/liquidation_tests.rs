@@ -650,10 +650,14 @@ fn a_unified_account_liquidates_against_its_spot_collateral() {
     rig.fund_unified(a, "150");
     rig.open(a, "ETH", (true, "10", 10));
     let state = rig.served(a, "");
+    // The served perp summary carries the margin the position holds (moved from
+    // spot, as on the venue), not the whole spot collateral.
     assert!(
-        state.margin_summary.account_value < Decimal::ONE,
-        "the perp view alone holds no collateral: {}",
-        state.margin_summary.account_value
+        (state.margin_summary.account_value - state.margin_summary.total_margin_used).abs()
+            < dec("5"),
+        "the perp view holds the position's margin: {} vs {}",
+        state.margin_summary.account_value,
+        state.margin_summary.total_margin_used
     );
     let liq = rig
         .liq(a, "ETH")

@@ -1695,11 +1695,11 @@ mod tests {
             &format!(r#""destination":"{other:#x}","token":"{TOKEN}","amount":"25","time":{n}"#),
         );
         ok(&post(&state, signed(&me_key, &action, n)).await);
-        // `other` is new: credited in full, and the sender (funded by a
-        // helper) owes no activation.
+        // `other` is new: credited in full, and the sender pays the 1 USDC
+        // activation for it.
         assert_eq!(
             (spot_usdc(&state, me), spot_usdc(&state, other)),
-            (dec("705"), dec("25"))
+            (dec("704"), dec("25"))
         );
         let n = nonce + 7;
         let action = user_signed(
@@ -1724,8 +1724,8 @@ mod tests {
         );
     }
 
-    /// Over `/exchange`, an account created by an inbound transfer is credited
-    /// in full and pays the 1 USDC activation on its first outbound transfer:
+    /// Over `/exchange`, an account a deposit created is credited in full and
+    /// pays the 1 USDC activation on its first outbound transfer:
     /// refused by name when the balance cannot cover amount plus fee (nothing
     /// moves), applied once it can, free the second time. A replayed nonce, a
     /// sub-account source and a token's system address as destination are
@@ -1748,13 +1748,14 @@ mod tests {
             )
         };
 
-        // `me` is funded by a helper: sending 10 to a new account costs it nothing extra.
-        let action = spot_send(other, "10", nonce);
-        let out = post(&state, signed(&me_key, &action, nonce)).await;
-        assert_eq!(out["status"], "ok", "{out}");
+        // `other` is created by a deposit and owes the activation.
+        state
+            .sim
+            .credit_evm_deposit(other, crate::sim::fees::QUOTE_TOKEN, dec("10"), &state.feed)
+            .unwrap();
         assert_eq!(
             (spot_usdc(&state, me), spot_usdc(&state, other)),
-            (dec("20"), dec("10"))
+            (dec("30"), dec("10"))
         );
 
         // `other` owes the activation: 10 of its 10 is refused, 9 goes.
@@ -1773,11 +1774,11 @@ mod tests {
         assert_eq!(post(&state, body.clone()).await["status"], "ok");
         assert_eq!(
             (spot_usdc(&state, other), spot_usdc(&state, me)),
-            (dec("0"), dec("29"))
+            (dec("0"), dec("39"))
         );
         // A replay of the signed body is refused.
         assert_eq!(post(&state, body).await["status"], "err", "a replay");
-        assert_eq!(spot_usdc(&state, me), dec("29"));
+        assert_eq!(spot_usdc(&state, me), dec("39"));
 
         // The Core to EVM leg is not an /exchange destination in the sim, for
         // a token's system address or HYPE's.
@@ -1800,7 +1801,7 @@ mod tests {
             );
         }
         // A sub-account source is refused by name.
-        let n = nonce + 4;
+        let n = nonce + 12;
         let action = user_signed(
             "sendAsset",
             &format!(
@@ -2086,7 +2087,8 @@ mod tests {
         assert_eq!(out["status"], "ok", "{out}");
         assert_eq!(
             (spot_usdc(&state, who), spot_usdc(&state, other)),
-            (dec("90"), dec("10"))
+            (dec("89"), dec("10")),
+            "the sender paid the 1 USDC activation of the new account"
         );
     }
 

@@ -1742,10 +1742,10 @@ mod tests {
     }
 
     /// CoreWriter's `spotSend` and `sendAsset` follow the same activation rule
-    /// as the HTTP transfers (Circle): an account created by an inbound send is
-    /// credited in full and pays 1 USDC on top of its first outbound send; a
-    /// send its balance cannot cover with the fee is refused (counted) and
-    /// moves nothing; the second send is free.
+    /// as the HTTP transfers (Circle): an account a deposit created is credited
+    /// in full and pays 1 USDC on top of its first outbound send; a send its
+    /// balance cannot cover with the fee is refused (counted) and moves
+    /// nothing; the second send is free.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one request script: splitting it would hide the order of the sends
     async fn corewriter_sends_pay_the_activation_on_the_accounts_first_outbound_send() {
@@ -1765,19 +1765,16 @@ mod tests {
         };
         let both = |a, b| (usdc_of(&sim, a), usdc_of(&sim, b));
         let dec = |t: &str| t.parse::<Decimal>().unwrap();
-        // The funded sender pays nothing to reach a new account; the account
-        // is credited in full.
-        bridge
-            .apply_action(me, spot_send(new, wei(10)), &tokens)
-            .await
+        // A deposit creates the account, credited in full.
+        sim.credit_evm_deposit(new, usdc, dec("10"), &bridge.feed)
             .unwrap();
-        assert_eq!(both(me, new), (dec("10"), dec("10")));
+        assert_eq!(both(me, new), (dec("20"), dec("10")));
         // The new account's first outbound send: 10 of its 10 is refused.
         bridge
             .apply_action(new, spot_send(me, wei(10)), &tokens)
             .await
             .unwrap();
-        assert_eq!(both(me, new), (dec("10"), dec("10")));
+        assert_eq!(both(me, new), (dec("20"), dec("10")));
         assert!(bridge
             .metrics
             .render()
@@ -1787,7 +1784,7 @@ mod tests {
             .apply_action(new, spot_send(me, wei(4)), &tokens)
             .await
             .unwrap();
-        assert_eq!(both(me, new), (dec("14"), dec("5")));
+        assert_eq!(both(me, new), (dec("24"), dec("5")));
         let send_asset = CoreAction::SendAsset {
             destination: me,
             sub_account: Address::ZERO,
@@ -1797,7 +1794,7 @@ mod tests {
             wei: wei(4),
         };
         bridge.apply_action(new, send_asset, &tokens).await.unwrap();
-        assert_eq!(both(me, new), (dec("18"), dec("1")));
+        assert_eq!(both(me, new), (dec("28"), dec("1")));
     }
 
     /// A `spotSend` and a `sendAsset` to a system address are the Core to EVM
