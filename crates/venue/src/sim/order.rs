@@ -14,7 +14,9 @@
 //! the depth is the served book's (the live book minus what the devnet
 //! already consumed, so a second order sees the first one's impact).
 use super::ledger::{FillLiquidation, FillRecord, LiquidationMethod, Liquidity};
-use super::validate::{validate_order, validate_trigger_side};
+use super::validate::{
+    reduce_only_under_minimum, validate_order, validate_trigger_side, MIN_NOTIONAL_REFUSAL,
+};
 use super::Sim;
 use crate::error::{Error, Result};
 use crate::feed::dex::dex_of_coin;
@@ -692,6 +694,10 @@ impl Sim {
             tracing::warn!(coin = %req.coin, "order refused: open-order limit");
             return Err(Error::bad_request(reason));
         }
+        if let Some(reason) = self.reduce_only_minimum_refusal(feed, address, req)? {
+            tracing::warn!(coin = %req.coin, "order refused: under the minimum value");
+            return Err(Error::bad_request(reason));
+        }
         if let Some(reason) = self.oi_cap_refusal(feed, address, req)? {
             tracing::warn!(coin = %req.coin, "order refused: open interest cap");
             return Err(Error::bad_request(reason));
@@ -701,6 +707,26 @@ impl Sim {
             return Err(Error::bad_request(reason));
         }
         Ok(())
+    }
+
+    /// The $10 minimum for a reduce-only order: it escapes the minimum only
+    /// when it closes the whole position (measured on testnet), so a reduce-only
+    /// order under $10 that would leave part of the position open is refused.
+    /// With no position to close the reduce-only guard answers instead.
+    fn reduce_only_minimum_refusal(
+        &self,
+        feed: &MarketFeed,
+        address: Address,
+        req: &Order,
+    ) -> Result<Option<&'static str>> {
+        if !reduce_only_under_minimum(feed, req)? {
+            return Ok(None);
+        }
+        let position = self
+            .account(address)?
+            .and_then(|a| a.positions.get(&req.coin).map(|p| p.szi.abs()))
+            .unwrap_or(Decimal::ZERO);
+        Ok((req.size < position).then_some(MIN_NOTIONAL_REFUSAL))
     }
 
     /// The match-time re-margin: the maker's *current* available
@@ -958,6 +984,11 @@ impl Sim {
     /// fee; each maker's account is settled at their own price with the maker
     /// fee (no opening probe: the venue reserves margin at placement).
     pub(crate) fn order(&self, feed: &MarketFeed, address: Address, req: &Order) -> Result<Fill> {
+        // The control route enters here, not through `place`: it gets the same
+        // reduce-only minimum gate.
+        if let Some(reason) = self.reduce_only_minimum_refusal(feed, address, req)? {
+            return Err(Error::bad_request(reason));
+        }
         self.order_with_builder(
             feed,
             Placer {
@@ -2281,15 +2312,55 @@ mod tests {
         o.limit_px = Some("12345.6".parse().unwrap());
         let err = sim.order(&feed, a, &o).unwrap_err();
         assert!(format!("{err}").contains("significant"), "{err}");
-        // 1 × 5 = 5 < the $10 minimum.
-        let mut o = ioc(Side::Buy, "1");
-        o.limit_px = Some("5".parse().unwrap());
+        // 0.05 at the $100 mark = 5 < the $10 minimum.
+        let err = sim.order(&feed, a, &ioc(Side::Buy, "0.05")).unwrap_err();
+        assert!(format!("{err}").contains("minimum"), "{err}");
+        // The minimum is the size at the mark, not at the order's own limit: a
+        // limit above the mark does not lift 0.099 × 100 = 9.9 over $10
+        // (measured on testnet).
+        let mut o = ioc(Side::Buy, "0.099");
+        o.limit_px = Some("101".parse().unwrap());
         let err = sim.order(&feed, a, &o).unwrap_err();
         assert!(format!("{err}").contains("minimum"), "{err}");
-        // 0.1 × 101 = 10.1 ≥ the minimum: valid.
+        // 0.1 at the mark = 10 ≥ the minimum: valid.
         let mut o = ioc(Side::Buy, "0.1");
         o.limit_px = Some("101".parse().unwrap());
         assert!(sim.order(&feed, a, &o).is_ok(), "a valid order fills");
+    }
+
+    /// A reduce-only order is exempt from the $10 minimum only when it closes
+    /// the whole position (measured on testnet, 2026-11-24: a reduce-only sell
+    /// of $5 against a $10.2 position was refused, a $10.04 one filled, and the
+    /// close of the $0.17 left over filled).
+    #[test]
+    fn a_reduce_only_order_under_the_minimum_must_close_the_position() {
+        let feed = feed_with_book(
+            book("ETH", &[("100", "5")], &[("101", "5")]),
+            meta_with("ETH", 4),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        sim.place(&feed, a, &ioc(Side::Buy, "0.11")).unwrap();
+        // $5 of a $11 position leaves $6 open: refused by the minimum.
+        let err = sim
+            .place(&feed, a, &reduce(Side::Sell, "0.05"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("minimum value of $10"), "{err}");
+        let err = sim
+            .order(&feed, a, &reduce(Side::Sell, "0.05"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("minimum value of $10"), "{err}");
+        // $10 is at the minimum: allowed, and it leaves 0.01 ETH ($1).
+        sim.place(&feed, a, &reduce(Side::Sell, "0.1")).unwrap();
+        // Half of the $1 left is under the minimum and does not close it.
+        let err = sim
+            .place(&feed, a, &reduce(Side::Sell, "0.005"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("minimum value of $10"), "{err}");
+        // The whole $1 is a close: exempt.
+        sim.place(&feed, a, &reduce(Side::Sell, "0.01")).unwrap();
+        // A plain order of the same $1 is not.
+        let err = sim.place(&feed, a, &ioc(Side::Sell, "0.01")).unwrap_err();
+        assert!(format!("{err}").contains("minimum value of $10"), "{err}");
     }
 
     /// Every refusal is by name: resting orders, reduce-only that would not
