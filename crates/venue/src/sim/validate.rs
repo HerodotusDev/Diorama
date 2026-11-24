@@ -198,21 +198,57 @@ pub(crate) fn validate_trigger_side(
     Ok(())
 }
 
-/// The venue's minimum order value: a perp order's notional (size × the
-/// limit, else the mark) is at least $10. The refusal is the venue's own
-/// string from the exchange docs' error sample ("Order must have minimum
-/// value of $10."), so a client matching on it sees the real message.
-pub(crate) fn validate_min_notional(feed: &MarketFeed, req: &Order) -> Result<()> {
-    let notional = if let Some(px) = req.limit_px {
-        super::account::mul(req.size, px, "order notional")?
-    } else {
-        let mark = feed.mark(&req.coin).ok_or(Error::Warming)?;
-        super::account::mul(req.size, mark, "order notional")?
+/// The venue's refusal of an order under the minimum value. The string is the
+/// venue's own (the exchange docs' error sample) with the order's asset index
+/// appended, as the live venue answers it (measured on testnet: "Order must
+/// have minimum value of $10. asset=4" for ETH), so a client matching on it
+/// sees the real message. The index is the coin's place in the venue's asset
+/// numbering (0 is the first coin of the default dex, a builder dex's coins
+/// start at 110000).
+pub(crate) fn min_notional_refusal(feed: &MarketFeed, coin: &str) -> String {
+    match feed.asset_id(coin) {
+        Some(asset) => format!("Order must have minimum value of $10. asset={asset}"),
+        None => "Order must have minimum value of $10.".to_owned(),
+    }
+}
+
+/// The venue's minimum order value, in USD.
+const MIN_NOTIONAL: Decimal = Decimal::TEN;
+
+/// The order's value as the venue measures it against the minimum: the size at
+/// the coin's mark, never at the order's own limit (measured on testnet: a buy
+/// of 0.0059 ETH with a limit 2 % above the mark, so $10.08 at the limit and
+/// $9.88 at the mark, was refused). The limit stands in only while no mark has
+/// landed; with neither, the market is warming.
+pub(crate) fn order_notional(feed: &MarketFeed, req: &Order) -> Result<Decimal> {
+    let px = match (feed.mark(&req.coin), req.limit_px) {
+        (Some(mark), _) => mark,
+        (None, Some(limit)) => limit,
+        (None, None) => return Err(Error::Warming),
     };
-    if notional < Decimal::from(10) {
-        return Err(Error::bad_request("Order must have minimum value of $10."));
+    super::account::mul(req.size, px, "order notional")
+}
+
+/// The venue's minimum order value: an order is worth at least $10. A
+/// reduce-only order is exempt only when it closes the whole position, which
+/// needs the account's position, so it is the lane's stateful gate
+/// (`Sim::reduce_only_minimum_refusal`) and is skipped here (measured on
+/// testnet: a reduce-only sell of $5 against a $10.2 position was refused, the
+/// close of a $0.17 position was filled).
+pub(crate) fn validate_min_notional(feed: &MarketFeed, req: &Order) -> Result<()> {
+    if req.reduce_only {
+        return Ok(());
+    }
+    if order_notional(feed, req)? < MIN_NOTIONAL {
+        return Err(Error::bad_request(min_notional_refusal(feed, &req.coin)));
     }
     Ok(())
+}
+
+/// Whether a reduce-only order is under the minimum value; the caller decides
+/// whether it closes the whole position and so escapes it.
+pub(crate) fn reduce_only_under_minimum(feed: &MarketFeed, req: &Order) -> Result<bool> {
+    Ok(req.reduce_only && order_notional(feed, req)? < MIN_NOTIONAL)
 }
 
 /// A price's significant digits (trailing zeros are not significant —
