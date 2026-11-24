@@ -15,7 +15,7 @@
 //! already consumed, so a second order sees the first one's impact).
 use super::ledger::{FillLiquidation, FillRecord, LiquidationMethod, Liquidity};
 use super::validate::{
-    reduce_only_under_minimum, validate_order, validate_trigger_side, MIN_NOTIONAL_REFUSAL,
+    min_notional_refusal, reduce_only_under_minimum, validate_order, validate_trigger_side,
 };
 use super::Sim;
 use crate::error::{Error, Result};
@@ -718,7 +718,7 @@ impl Sim {
         feed: &MarketFeed,
         address: Address,
         req: &Order,
-    ) -> Result<Option<&'static str>> {
+    ) -> Result<Option<String>> {
         if !reduce_only_under_minimum(feed, req)? {
             return Ok(None);
         }
@@ -726,7 +726,7 @@ impl Sim {
             .account(address)?
             .and_then(|a| a.positions.get(&req.coin).map(|p| p.szi.abs()))
             .unwrap_or(Decimal::ZERO);
-        Ok((req.size < position).then_some(MIN_NOTIONAL_REFUSAL))
+        Ok((req.size < position).then(|| min_notional_refusal(feed, &req.coin)))
     }
 
     /// The match-time re-margin: the maker's *current* available
@@ -2361,6 +2361,26 @@ mod tests {
         // A plain order of the same $1 is not.
         let err = sim.place(&feed, a, &ioc(Side::Sell, "0.01")).unwrap_err();
         assert!(format!("{err}").contains("minimum value of $10"), "{err}");
+    }
+
+    /// The refusal carries the order's asset index, as the live venue's does
+    /// ("Order must have minimum value of $10. asset=4" for ETH on testnet).
+    #[test]
+    fn the_minimum_refusal_names_the_asset_index() {
+        let feed = feed_with_book(
+            book("ETH", &[("100", "5")], &[("101", "5")]),
+            meta_with("ETH", 4),
+        );
+        let (sim, a) = funded_sim(&feed, "1000");
+        let asset = feed.asset_id("ETH").expect("ETH is in the meta");
+        let want = format!("Order must have minimum value of $10. asset={asset}");
+        let err = sim.place(&feed, a, &ioc(Side::Buy, "0.05")).unwrap_err();
+        assert!(format!("{err}").contains(&want), "{err}");
+        sim.place(&feed, a, &ioc(Side::Buy, "0.11")).unwrap();
+        let err = sim
+            .place(&feed, a, &reduce(Side::Sell, "0.05"))
+            .unwrap_err();
+        assert!(format!("{err}").contains(&want), "{err}");
     }
 
     /// Every refusal is by name: resting orders, reduce-only that would not

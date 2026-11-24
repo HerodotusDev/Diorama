@@ -199,9 +199,18 @@ pub(crate) fn validate_trigger_side(
 }
 
 /// The venue's refusal of an order under the minimum value. The string is the
-/// venue's own (the exchange docs' error sample), so a client matching on it
-/// sees the real message.
-pub(crate) const MIN_NOTIONAL_REFUSAL: &str = "Order must have minimum value of $10.";
+/// venue's own (the exchange docs' error sample) with the order's asset index
+/// appended, as the live venue answers it (measured on testnet: "Order must
+/// have minimum value of $10. asset=4" for ETH), so a client matching on it
+/// sees the real message. The index is the coin's place in the venue's asset
+/// numbering (0 is the first coin of the default dex, a builder dex's coins
+/// start at 110000).
+pub(crate) fn min_notional_refusal(feed: &MarketFeed, coin: &str) -> String {
+    match feed.asset_id(coin) {
+        Some(asset) => format!("Order must have minimum value of $10. asset={asset}"),
+        None => "Order must have minimum value of $10.".to_owned(),
+    }
+}
 
 /// The venue's minimum order value, in USD.
 const MIN_NOTIONAL: Decimal = Decimal::TEN;
@@ -231,7 +240,7 @@ pub(crate) fn validate_min_notional(feed: &MarketFeed, req: &Order) -> Result<()
         return Ok(());
     }
     if order_notional(feed, req)? < MIN_NOTIONAL {
-        return Err(Error::bad_request(MIN_NOTIONAL_REFUSAL));
+        return Err(Error::bad_request(min_notional_refusal(feed, &req.coin)));
     }
     Ok(())
 }
